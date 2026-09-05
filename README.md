@@ -21,7 +21,7 @@ Then, in SRE Agent, open Integrations, the repository's settings, and set Fix ru
 1. SRE Agent finds or opens a tracking issue in the repository, titled with the card key and the request's title and labelled `sre-agent`. The body holds the fix brief and a marker line, `<!-- sre-agent:remediation:<id> -->`, that ties the run to the card.
 2. SRE Agent comments `/opencode` on the issue. Your workflow starts on that comment, on your runner, with a checkout of the default branch.
 3. The workflow installs this package's configuration and its `sre-fix` agent into the job. Nothing is committed to your repository: the configuration is passed to opencode through its environment, and the agent file is written into the checkout and excluded from git for the length of the job.
-4. The agent reads the brief, makes the smallest change that addresses it, and runs your build and tests. When they pass, the opencode action commits the working tree to a branch named `opencode/issue<number>-<timestamp>` and opens a pull request whose body is the agent's own summary of what it changed, why, and what it ran. The workflow then marks the pull request for SRE Agent: it makes it a draft, prefixes the title with the card key, and appends the marker line from the issue and the version stamp `<!-- sre-agent-opencode:vX.Y.Z -->` to the body.
+4. The agent reads the brief, makes the smallest change that addresses it, and runs your build and tests. When they pass, the opencode action commits the working tree to a branch named `opencode/issue<number>-<timestamp>` and opens a pull request whose body is the agent's own summary of what it changed, why, and what it ran. The workflow then checks the pull request's file list against the protected paths (see below) and marks it for SRE Agent: it prefixes the title with the card key, makes sure the body contains the marker line from the issue and the version stamp `<!-- sre-agent-opencode:vX.Y.Z -->` (the agent's own message usually carries both, so their position in the body is not fixed), and makes it a draft where your plan supports draft pull requests.
 5. SRE Agent's webhook links the pull request to the card, reviews it the way it reviews a pull request its own agent opened, and posts the outcome on the card and in Slack with a link to the workflow run.
 6. When no safe change exists, or the tests cannot be made to pass, the agent changes nothing and its answer is posted as a comment on the issue, beginning with `Declined:` and the reason. SRE Agent records the decline on the card. A run that ends with neither a pull request nor a decline is recorded as failed once the workflow's time bound has passed.
 
@@ -29,13 +29,19 @@ The branch name is the opencode action's, not SRE Agent's: the action, not the a
 
 ## What the agent may and may not do
 
-The fences live in [`config/opencode.json`](config/opencode.json) and [`agents/sre-fix.md`](agents/sre-fix.md). The workflow passes the configuration to opencode after any configuration in your repository, so a repository can add to it but cannot loosen it.
+The configuration in [`config/opencode.json`](config/opencode.json) is a set of opencode's own permission gates, and [`agents/sre-fix.md`](agents/sre-fix.md) is the agent's prompt. The workflow passes the configuration to opencode after any configuration in your repository, so a repository can add to it but cannot loosen it.
 
-- It may edit any file except those under `.github/`, env files (`*.env*`), anything named `secrets*`, and `*.pem` keys. It may not read env files either.
-- It may run shell commands, including your build and test commands. It may not run `git push`, `git remote`, `curl`, `wget`, `ssh`, `scp`, `rm -rf` or `sudo`.
-- It has no web fetch, no web search, no subagents, and no access outside the checkout. Repeating the same tool call in a loop is refused, and so is asking a question, since nobody is there to answer.
-- It never commits, pushes or opens a pull request itself: the opencode action does that once, after the agent finishes, from the working tree. It never merges and never touches the default branch.
-- Session sharing is disabled: the transcript is not uploaded to opencode's site.
+- The edit gate refuses writes under `.github/` and to any path matching `*.env*`, `*secrets*` or `*.pem`, and the read gate refuses env files. Both apply to opencode's file tools.
+- The bash gate refuses `git push`, `git remote`, `curl`, `wget`, `ssh`, `scp`, `rm -rf` and `sudo`. Each pattern is matched against the whole command string as written, so this is a guard against a careless step, not a sandbox: the agent runs with a shell on your runner, and a shell can reach the network or write a file without any tool.
+- Web fetch, web search, subagents and questions are off, the file tools cannot leave the checkout, and repeating the same tool call in a loop is refused. Session sharing is disabled, so the transcript is not uploaded to opencode's site.
+- The agent never commits, pushes or opens a pull request itself: the opencode action does that once, after the agent finishes, from the working tree. It never merges and never touches the default branch.
+
+What holds regardless of anything the agent does in that shell:
+
+- The diff gate. After the action has pushed, the workflow reads the pull request's own file list. A pull request that touched `.github/`, an env file, a `secrets*` path or a `.pem` key is closed with a comment saying which paths, and the job fails.
+- The draft pull request, SRE Agent's review, and your own CI on the pull request. Nothing merges without a person.
+
+The provider key and the job's token exist in the runner's environment while the agent runs. The log masks them, which is not the same as keeping them out of a shell's reach. For a repository whose CI holds production secrets, run this workflow on a dedicated runner or in a dedicated environment.
 
 ## Cost
 
@@ -44,12 +50,13 @@ You pay for the runner minutes the workflow uses and for the tokens your provide
 ## Maintenance
 
 - Pin `@v1` to receive fixes and additions as they are released; pin `@v1.2.0` to freeze a version. The major moves only on a breaking change, and the [CHANGELOG](CHANGELOG.md) says what to change in your workflow when it does.
-- [`examples/dependabot.yml`](examples/dependabot.yml) keeps the pin current in a repository that uses Dependabot for GitHub Actions.
+- [`examples/dependabot.yml`](examples/dependabot.yml) proposes a bump for a frozen pin such as `@v1.2.0` and for the other actions your workflows use; a `@v1` pin has nothing to move until a v2 exists.
 - Every pull request the workflow marks carries the stamp `<!-- sre-agent-opencode:vX.Y.Z -->`. SRE Agent records the version with the link, so the Integrations page can say which version of this package a repository ran.
+- The workflow pins the opencode action at a release tag, and a bump of that pin is recorded in the [CHANGELOG](CHANGELOG.md). The pin covers the action only, not the opencode binary: the action's first step reads the latest opencode release and its install step runs opencode's install script, so the binary that enforces the gates is whatever is current. The install script accepts a version, but the action does not expose it and puts its own bin directory first on PATH, so this package cannot pin the binary from outside.
 
 ## Security
 
-The brief on the tracking issue comes from alerts, investigations and cards, so it can carry text an attacker wrote, and the agent reads it as data. The fences in this package's configuration are the first line: no network tools, no pushes, no edits to workflows or secrets, no access outside the checkout. The draft pull request, SRE Agent's review and your own CI on the pull request are the second line: nothing merges without a person. The issue is readable by everyone who can read the repository's issues, and it holds the same brief an operator sees on the card. Enable the runner per repository, as an administrator, and restrict who can start a run: the example workflow accepts comments from SRE Agent's login and from repository owners, members and collaborators only. The provider key is a secret of your repository; SRE Agent never holds it and never runs opencode.
+The brief on the tracking issue comes from alerts, investigations and cards, so it can carry text an attacker wrote, and the agent reads it as data. The gates in this package's configuration raise the cost of a careless or injected step: no web tools, no subagents, no file-tool writes to workflows, env files, secrets or keys, and the listed shell commands refused as written. They are opencode's tool gates, not a sandbox: the agent has a shell on your runner, where the provider key and the job's token exist in the environment. The controls that hold regardless are the diff gate (a pull request that touched a protected path is closed and the job fails), the draft pull request, SRE Agent's review, and your own CI on the pull request. In token mode (`use_github_token: true`) the pull request is opened with `GITHUB_TOKEN`, and by GitHub's rule it starts none of your other workflows, so that last line of defence is gone in that mode; the review and the draft remain. For a repository whose CI holds production secrets, run the workflow on a dedicated runner or in a dedicated environment. The issue is readable by everyone who can read the repository's issues, and it holds the same brief an operator sees on the card. Enable the runner per repository, as an administrator, and restrict who can start a run: the example workflow accepts comments from SRE Agent's login and from repository owners, members and collaborators only. The provider key is a secret of your repository; SRE Agent never holds it and never runs opencode.
 
 ## Inputs and secrets
 
@@ -70,6 +77,8 @@ The reusable workflow is `segfaultpw/sre-agent-opencode/.github/workflows/fix.ym
 | --- | --- | --- |
 | `provider_key` | yes | The provider API key. |
 | `token` | no | A token to use in place of `GITHUB_TOKEN` when `use_github_token` is set, for example a fine-grained token whose pull requests do start your workflows. GitHub reserves the name `github_token` inside a called workflow, hence the short name. |
+
+The job's `permissions` block is fixed at `id-token`, `contents`, `pull-requests` and `issues`, because GitHub does not evaluate expressions in `permissions`. App mode uses `id-token` for the OIDC exchange and `pull-requests` for the diff gate and the marking step; token mode uses `contents`, `pull-requests` and `issues` for the push, the pull request and the comments.
 
 Provider prefixes the workflow maps: `anthropic`, `openai`, `google`, `openrouter`, `xai`, `groq`, `mistral`, `deepseek`, `togetherai`, `fireworks-ai`, `cerebras`, `moonshotai`, `deepinfra`, `huggingface`, `zai`, `minimax`, `nvidia`, `opencode`, `vercel`. The variable names come from [models.dev](https://models.dev), the registry opencode reads providers from. A model with another prefix fails the run with a clear message before opencode starts.
 
