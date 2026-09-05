@@ -46,7 +46,8 @@ on:
       provider_key:
         description: "The provider API key."
         required: true
-      github_token:
+      # Not github_token: GitHub reserves that name inside workflow_call.
+      token:
         description: "A token to use in place of GITHUB_TOKEN when use_github_token is set."
         required: false
 
@@ -141,7 +142,7 @@ jobs:
         if: ${{ !inputs.dry_run }}
         uses: anomalyco/opencode/github@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.github_token || github.token }}
+          GITHUB_TOKEN: ${{ secrets.token || github.token }}
         with:
           model: ${{ inputs.model }}
           agent: ${{ inputs.agent }}
