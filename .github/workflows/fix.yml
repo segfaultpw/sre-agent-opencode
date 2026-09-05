@@ -1,0 +1,207 @@
+name: SRE Agent fix (opencode)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: "provider/model, for example anthropic/claude-sonnet-4-5. The provider prefix chooses the variable that receives provider_key."
+        required: true
+        type: string
+      prompt:
+        description: "An instruction that replaces the comment. Empty for the comment door: the action reads the comment and the issue itself."
+        required: false
+        type: string
+        default: ""
+      agent:
+        description: "The primary agent opencode runs, set as its default_agent."
+        required: false
+        type: string
+        default: sre-fix
+      variant:
+        description: "The provider's reasoning effort, for example high."
+        required: false
+        type: string
+        default: ""
+      use_github_token:
+        description: "Act as github-actions[bot] with GITHUB_TOKEN instead of the opencode App. Pull requests it opens do not start your other workflows."
+        required: false
+        type: boolean
+        default: false
+      runner:
+        description: "The runs-on label."
+        required: false
+        type: string
+        default: ubuntu-latest
+      timeout_minutes:
+        description: "The job's time bound in minutes."
+        required: false
+        type: number
+        default: 30
+      dry_run:
+        description: "Install the configuration and map the provider secret, then stop. The package's own CI uses it."
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      provider_key:
+        description: "The provider API key."
+        required: true
+      github_token:
+        description: "A token to use in place of GITHUB_TOKEN when use_github_token is set."
+        required: false
+
+jobs:
+  fix:
+    name: opencode fix
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # One run per issue at a time: a second comment while the first run is
+    # still open would otherwise race it on the same issue.
+    concurrency:
+      group: sre-agent-opencode-${{ github.repository }}-${{ github.event.issue.number || github.run_id }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      # The action pushes with its own credentials, so the checkout keeps none.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # The package's own files, at the commit this workflow was called at,
+      # so the fences and the agent always match the workflow that runs them
+      # and nothing has to be committed in the caller's repository. The
+      # configuration travels through OPENCODE_CONFIG_CONTENT, which opencode
+      # merges after the repository's own opencode.json, so the fences win;
+      # only the agent file is written into the checkout, and it is excluded
+      # from git because the action stages the whole tree with "git add .".
+      - name: Install the SRE Agent opencode configuration
+        shell: bash
+        env:
+          # job.workflow_sha is the called workflow's commit (github.job_workflow_sha
+          # is never set in a called workflow). actionlint's job context type
+          # predates the property, so it is read out of the serialized context.
+          JOB_CONTEXT: ${{ toJSON(job) }}
+          AGENT: ${{ inputs.agent }}
+        run: |
+          set -euo pipefail
+          ref="$(jq -r '.workflow_sha // empty' <<<"$JOB_CONTEXT")"
+          if [ -z "$ref" ]; then
+            echo "::error::job.workflow_sha is empty; this workflow needs GitHub.com, where a called workflow knows its own commit"
+            exit 1
+          fi
+          base="https://raw.githubusercontent.com/segfaultpw/sre-agent-opencode/${ref}"
+          version="$(curl -fsSL "$base/VERSION" | tr -d '[:space:]')"
+          curl -fsSL "$base/config/opencode.json" -o /tmp/sre-agent-opencode.json
+          curl -fsSL "$base/agents/sre-fix.md" -o /tmp/sre-agent-agent.md
+          curl -fsSL "$base/scripts/provider_env.sh" -o /tmp/sre-agent-provider_env.sh
+          if git ls-files --error-unmatch .opencode/agents/sre-fix.md >/dev/null 2>&1; then
+            echo "::error::.opencode/agents/sre-fix.md is tracked in this repository; the package writes its own agent there, remove or rename yours"
+            exit 1
+          fi
+          mkdir -p .opencode/agents
+          sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" /tmp/sre-agent-agent.md > .opencode/agents/sre-fix.md
+          echo ".opencode/" >> .git/info/exclude
+          config="$(jq -c --arg agent "$AGENT" '.default_agent = $agent' /tmp/sre-agent-opencode.json)"
+          {
+            echo "OPENCODE_CONFIG_CONTENT=${config}"
+            echo "SRE_AGENT_OPENCODE_VERSION=v${version}"
+            echo "SRE_AGENT_RUN_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_ENV"
+          echo "installed sre-agent-opencode v${version} from ${ref} with agent ${AGENT}"
+
+      # GitHub evaluates expressions in env values, never in env names, so the
+      # secret cannot be mapped in the action's env block; it is exported into
+      # the job under the provider's own variable instead. The value is a
+      # registered secret, so the log masks it.
+      - name: Name the provider secret
+        shell: bash
+        env:
+          MODEL: ${{ inputs.model }}
+          PROVIDER_KEY: ${{ secrets.provider_key }}
+        run: |
+          set -euo pipefail
+          var="$(bash /tmp/sre-agent-provider_env.sh "$MODEL")"
+          if [ -z "$PROVIDER_KEY" ]; then
+            echo "::error::the provider_key secret is empty; pass the ${var} secret of this repository"
+            exit 1
+          fi
+          {
+            echo "${var}<<__SRE_AGENT_EOF__"
+            echo "$PROVIDER_KEY"
+            echo "__SRE_AGENT_EOF__"
+          } >> "$GITHUB_ENV"
+          echo "provider_key exported as ${var} for ${MODEL}"
+
+      - name: Run opencode
+        if: ${{ !inputs.dry_run }}
+        uses: anomalyco/opencode/github@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.github_token || github.token }}
+        with:
+          model: ${{ inputs.model }}
+          agent: ${{ inputs.agent }}
+          prompt: ${{ inputs.prompt }}
+          variant: ${{ inputs.variant }}
+          share: false
+          use_github_token: ${{ inputs.use_github_token }}
+
+      # The action opens the pull request itself, from a branch it names, with
+      # a title of its own and the agent's answer as the body. The platform's
+      # contract (a draft, the card key first in the title, the marker and the
+      # version stamp last in the body) is applied here so it never depends on
+      # the model obeying its prompt. The issue's text reaches the script only
+      # through the environment.
+      - name: Mark the pull request for SRE Agent
+        if: ${{ !inputs.dry_run && github.event.issue.number }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          key="$(grep -oE '^[A-Z][A-Z0-9]*-[0-9]+' <<<"$ISSUE_TITLE" || true)"
+          marker="$(grep -oE '<!-- sre-agent:remediation:[^>]*-->' <<<"$ISSUE_BODY" | head -n 1 || true)"
+          stamp="<!-- sre-agent-opencode:${SRE_AGENT_OPENCODE_VERSION} -->"
+          [ -n "$key" ] || echo "no card key at the start of the issue title; the title is left as the action wrote it"
+          [ -n "$marker" ] || echo "no marker line in the issue body; the body gets the version stamp only"
+          prs="$(gh pr list --state open --limit 100 --json number,title,body,headRefName,createdAt,isDraft \
+            | jq -c --arg prefix "opencode/issue${ISSUE_NUMBER}-" --arg since "$SRE_AGENT_RUN_STARTED" \
+                '.[] | select((.headRefName | startswith($prefix)) and .createdAt >= $since)')"
+          if [ -z "$prs" ]; then
+            echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
+            exit 0
+          fi
+          while IFS= read -r pr; do
+            number="$(jq -r '.number' <<<"$pr")"
+            title="$(jq -r '.title' <<<"$pr")"
+            body="$(jq -r '.body' <<<"$pr")"
+            draft="$(jq -r '.isDraft' <<<"$pr")"
+            args=()
+            if [ -n "$key" ] && [[ "$title" != "$key"* ]]; then
+              args+=(--title "${key}: ${title}")
+            fi
+            tail=""
+            if [ -n "$marker" ] && [[ "$body" != *"$marker"* ]]; then
+              tail="${tail}${marker}"$'\n'
+            fi
+            if [[ "$body" != *"$stamp"* ]]; then
+              tail="${tail}${stamp}"$'\n'
+            fi
+            if [ -n "$tail" ]; then
+              args+=(--body "${body}"$'\n\n'"${tail}")
+            fi
+            if [ "${#args[@]}" -gt 0 ]; then
+              gh pr edit "$number" "${args[@]}"
+            fi
+            if [ "$draft" != "true" ]; then
+              gh pr ready "$number" --undo
+            fi
+            echo "marked pull request #${number} for SRE Agent"
+          done <<<"$prs"
