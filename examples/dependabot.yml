@@ -1,0 +1,9 @@
+# Merge this into .github/dependabot.yml (or copy it there) so Dependabot
+# proposes a pull request when a new release of this package, or of any
+# other action your workflows pin, is published.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

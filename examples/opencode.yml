@@ -1,0 +1,37 @@
+# Copy this file to .github/workflows/opencode.yml, set model, and point
+# provider_key at the repository secret that matches it (step 2 of the
+# README's install). A fix request from SRE Agent arrives as a /opencode
+# comment on a tracking issue; this workflow hands it to the package's
+# reusable workflow, which runs opencode on your runner.
+#
+# vars.SRE_AGENT_BOT_LOGIN is a repository or organization variable holding
+# the login SRE Agent comments with, shown on the Integrations page:
+# sreagent-app[bot] for the hosted platform, or your own App's login for a
+# self-hosted install. Without it only members can start a run.
+name: opencode
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  fix:
+    # Only SRE Agent's App and this repository's own members may start a run:
+    # anyone able to comment could otherwise spend your minutes and tokens.
+    if: |
+      (contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')) &&
+      (github.event.comment.user.login == vars.SRE_AGENT_BOT_LOGIN ||
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    # A called workflow can only keep or reduce what its caller grants, and
+    # GITHUB_TOKEN is read-only by default, so the grant has to be here.
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: segfaultpw/sre-agent-opencode/.github/workflows/fix.yml@v1
+    with:
+      model: anthropic/claude-sonnet-4-5
+      # use_github_token: true   # skip the opencode App; see the README's first install step
+    secrets:
+      provider_key: ${{ secrets.ANTHROPIC_API_KEY }}
