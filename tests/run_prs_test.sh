@@ -2,8 +2,9 @@
 # The run's pull requests are found by branch prefix and creation time, with
 # gh replaced by a script that answers from fixtures, so the lookup is pinned
 # without a repository: a branch whose pull request predates the run is
-# skipped, a branch without one is skipped, and the author is logged but
-# never used to filter.
+# skipped, a branch without one is skipped, the author is logged but never
+# used to filter, and a gh failure anywhere in the lookup fails the script,
+# since a partial list read as complete would leave a pull request uninspected.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/../scripts/run_prs.sh"
@@ -18,10 +19,14 @@ export FAKE_GH_DIR="$work/fixtures" FAKE_GH_LOG="$work/gh.log"
 
 cat > "$work/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# Stands in for gh: records the call, answers the two requests run_prs.sh makes.
+# Stands in for gh: records the call, answers the two requests run_prs.sh
+# makes, and fails on demand: FAKE_GH_FAIL=api fails the ref listing,
+# FAKE_GH_FAIL=prlist fails every pull request listing, and
+# FAKE_GH_FAIL=prlist:<branch> fails only that branch's.
 printf '%s\n' "$*" >> "$FAKE_GH_LOG"
 case "$1 $2" in
   "api repos/acme/app/git/matching-refs/heads/opencode/issue7-")
+    if [ "${FAKE_GH_FAIL:-}" = "api" ]; then echo "gh: HTTP 502" >&2; exit 1; fi
     cat "$FAKE_GH_DIR/refs.txt"
     ;;
   "pr list")
@@ -30,6 +35,7 @@ case "$1 $2" in
       if [ "$1" = "--head" ]; then head="$2"; fi
       shift
     done
+    if [ "${FAKE_GH_FAIL:-}" = "prlist" ] || [ "${FAKE_GH_FAIL:-}" = "prlist:${head}" ]; then echo "gh: HTTP 502" >&2; exit 1; fi
     file="$FAKE_GH_DIR/prs-${head//\//_}.json"
     if [ -f "$file" ]; then cat "$file"; else echo "[]"; fi
     ;;
@@ -66,6 +72,20 @@ if [ "$(grep -c '^pr list --repo acme/app --state open --head opencode/issue7-' 
 rc=0
 out="$(env -u ISSUE_NUMBER bash "$script" 2>/dev/null)" || rc=$?
 if [ "$rc" -ne 0 ]; then echo "ok   a missing issue number is refused"; else echo "FAIL a missing issue number was accepted"; fail=1; fi
+
+rc=0
+out="$(FAKE_GH_FAIL=api bash "$script" 2>/dev/null)" || rc=$?
+if [ "$rc" -ne 0 ]; then echo "ok   a failed ref listing fails the script"; else echo "FAIL a failed ref listing exited 0 with: $out"; fail=1; fi
+
+rc=0
+out="$(FAKE_GH_FAIL=prlist bash "$script" 2>/dev/null)" || rc=$?
+if [ "$rc" -ne 0 ]; then echo "ok   a failed pull request listing fails the script"; else echo "FAIL a failed pull request listing exited 0 with: $out"; fail=1; fi
+
+# The first branch answers, the second fails: a line may have been printed,
+# but the status must say the list is not complete.
+rc=0
+out="$(FAKE_GH_FAIL=prlist:opencode/issue7-20260905T230000 bash "$script" 2>/dev/null)" || rc=$?
+if [ "$rc" -ne 0 ]; then echo "ok   a failure on the second branch fails the script"; else echo "FAIL a failure on the second branch exited 0 with: $out"; fail=1; fi
 
 : > "$work/fixtures/refs.txt"
 out="$(bash "$script" 2>/dev/null)"

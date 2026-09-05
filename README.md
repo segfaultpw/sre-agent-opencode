@@ -51,7 +51,7 @@ The configuration in [`config/opencode.json`](config/opencode.json) is a set of 
 
 What holds regardless of anything the agent does in that shell:
 
-- The diff gate. After the action has pushed, the workflow reads the pull request's own file list. A pull request that touched `.github/`, an env file, a `secrets*` path or a `.pem` key is closed with a comment saying which paths, and the job fails.
+- The diff gate. After the action has pushed, the workflow reads the pull request's own file list. A pull request that touched `.github/`, an env file, a path containing `secrets` or a `.pem` key is closed with a comment saying which paths, and the job fails.
 - The draft pull request, SRE Agent's review, and your own CI on the pull request. Nothing merges without a person.
 
 The provider key and the job's token exist in the runner's environment while the agent runs. The log masks them, which is not the same as keeping them out of a shell's reach. For a repository whose CI holds production secrets, run this workflow on a dedicated runner or in a dedicated environment.

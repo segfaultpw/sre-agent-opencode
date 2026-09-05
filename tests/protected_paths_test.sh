@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The diff gate judges what a pull request actually changed, so its verdict
 # is pinned path by path: a flagged path is printed and fails the gate, a
-# clean list passes, and an empty list passes.
+# clean list passes, and an empty list passes. The shapes are the edit
+# fence's, matched against the whole path, so anything the fence would have
+# refused the file tools is refused here after the fact as well.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/../scripts/protected_paths.sh"
@@ -26,6 +28,12 @@ flagged .env
 flagged src/.env.production
 flagged config/secrets/x
 flagged config/secrets.yml
+flagged config/app-secrets.json
+flagged my_secrets_dir/x.txt
+flagged app.secrets.yml
+flagged values-secrets.yaml
+# It merely contains "secrets", but the fence denies it, so the gate does too.
+flagged docs/secretsauce.md
 flagged deploy.pem
 flagged a/b/key.pem
 

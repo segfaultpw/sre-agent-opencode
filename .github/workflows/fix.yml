@@ -169,13 +169,18 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          mapfile -t prs < <(bash /tmp/sre-agent-run_prs.sh)
-          if [ "${#prs[@]}" -eq 0 ]; then
+          # The lookup's exit status is the gate's first verdict: a failed
+          # listing must fail the job, not read as "no pull requests".
+          if ! bash /tmp/sre-agent-run_prs.sh > "$RUNNER_TEMP/prs.jsonl"; then
+            echo "::error::could not list this run's pull requests; failing rather than leaving one uninspected"
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/prs.jsonl" ]; then
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
           fi
           failed=0
-          for pr in "${prs[@]}"; do
+          while IFS= read -r -u 9 pr; do
             number="$(jq -r '.number' <<<"$pr")"
             files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}/files" --paginate --jq '.[].filename')"
             flagged=""
@@ -188,7 +193,7 @@ jobs:
             gh pr close "$number" --repo "$GITHUB_REPOSITORY"
             echo "::error::pull request #${number} changed a protected path (${list}) and was closed"
             failed=1
-          done
+          done 9< "$RUNNER_TEMP/prs.jsonl"
           exit "$failed"
 
       # The action opens the pull request itself, from a branch it names, with
@@ -214,12 +219,15 @@ jobs:
           stamp="<!-- sre-agent-opencode:${SRE_AGENT_OPENCODE_VERSION} -->"
           [ -n "$key" ] || echo "no card key at the start of the issue title; the title is left as the action wrote it"
           [ -n "$marker" ] || echo "no marker line in the issue body; the body gets the version stamp only"
-          mapfile -t prs < <(bash /tmp/sre-agent-run_prs.sh)
-          if [ "${#prs[@]}" -eq 0 ]; then
+          if ! bash /tmp/sre-agent-run_prs.sh > "$RUNNER_TEMP/prs.jsonl"; then
+            echo "::error::could not list this run's pull requests; failing rather than leaving one unmarked"
+            exit 1
+          fi
+          if [ ! -s "$RUNNER_TEMP/prs.jsonl" ]; then
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
           fi
-          for pr in "${prs[@]}"; do
+          while IFS= read -r -u 9 pr; do
             number="$(jq -r '.number' <<<"$pr")"
             title="$(jq -r '.title' <<<"$pr")"
             body="$(jq -r '.body' <<<"$pr")"
@@ -246,4 +254,4 @@ jobs:
                 || echo "::warning::could not convert #${number} to a draft; draft pull requests need a plan that supports them"
             fi
             echo "marked pull request #${number} for SRE Agent"
-          done
+          done 9< "$RUNNER_TEMP/prs.jsonl"

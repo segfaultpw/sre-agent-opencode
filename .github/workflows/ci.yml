@@ -28,6 +28,7 @@ jobs:
       - run: bash tests/pattern_probe_test.sh
       - run: bash tests/provider_env_test.sh
       - run: bash tests/protected_paths_test.sh
+      - run: bash tests/gate_agreement_test.sh
       - run: bash tests/run_prs_test.sh
       - run: bash tests/changelog_section_test.sh
 

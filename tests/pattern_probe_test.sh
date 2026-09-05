@@ -1,54 +1,25 @@
 #!/usr/bin/env bash
 # Resolves probe paths against the config's edit rules the way opencode does,
 # so a pattern that looks right but never fires is caught here rather than in
-# a customer's pull request. The translation is the one in opencode's
-# packages/core/src/util/wildcard.ts: regex metacharacters escaped, "*" to
-# ".*", "?" to ".", a trailing " *" to "( .*)?", the whole thing anchored, and
-# "/" left literal. The resource an edit is judged by is the path relative to
-# the checkout, and the last matching rule wins, in the object's file order.
+# a customer's pull request. The translation and the resolver live in
+# tests/lib/fence.sh, which names the opencode source they follow.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cfg="$here/../config/opencode.json"
 fail=0
-
-compile() {
-  local pattern="${1//\\//}" escaped="" c i
-  for ((i = 0; i < ${#pattern}; i++)); do
-    c="${pattern:i:1}"
-    case "$c" in
-      '*') escaped+='.*' ;;
-      '?') escaped+='.' ;;
-      '.' | '+' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | "\\") escaped+="\\$c" ;;
-      *) escaped+="$c" ;;
-    esac
-  done
-  if [[ "$escaped" == *" .*" ]]; then
-    escaped="${escaped% .*}( .*)?"
-  fi
-  printf '^%s$' "$escaped"
-}
-
-resolve() {
-  local path="$1" action="ask" pattern value regex
-  while IFS=$'\t' read -r pattern value; do
-    regex="$(compile "$pattern")"
-    if printf '%s' "$path" | grep -qE -- "$regex"; then
-      action="$value"
-    fi
-  done < <(jq -r '.permission.edit | to_entries[] | "\(.key)\t\(.value)"' "$cfg")
-  printf '%s' "$action"
-}
+# shellcheck source=tests/lib/fence.sh
+. "$here/lib/fence.sh"
 
 probe() {
   local path="$1" want="$2" got
-  got="$(resolve "$path")"
+  got="$(fence_resolve "$cfg" "$path")"
   if [ "$got" = "$want" ]; then echo "ok   edit $path -> $want"; else echo "FAIL edit $path: expected $want, got $got"; fail=1; fi
 }
 
 # The translation itself, pinned on the shapes the fences rely on.
 check_regex() {
   local pattern="$1" want="$2" got
-  got="$(compile "$pattern")"
+  got="$(fence_compile "$pattern")"
   if [ "$got" = "$want" ]; then echo "ok   $pattern compiles to $want"; else echo "FAIL $pattern compiled to $got, expected $want"; fail=1; fi
 }
 check_regex '*.env*' '^.*\.env.*$'
