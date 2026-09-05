@@ -21,9 +21,16 @@ expect '.default_agent' sre-fix
 expect '.instructions | join(",")' 'AGENTS.md,CONTRIBUTING.md'
 expect '.permission.edit["*"]' allow
 expect '.permission.edit[".github/**"]' deny
-expect '.permission.edit["**/*.env*"]' deny
-expect '.permission.edit["**/secrets*"]' deny
-expect '.permission.edit["**/*.pem"]' deny
+expect '.permission.edit["*.env*"]' deny
+expect '.permission.edit["*secrets*"]' deny
+expect '.permission.edit["*.pem"]' deny
+# opencode compiles a pattern to an anchored regex with "*" as ".*" and "/"
+# literal, so a "**/" prefix demands a slash and skips the repository root.
+if jq -e '.permission.edit | keys | map(select(startswith("**/"))) | length == 0' "$cfg" >/dev/null; then
+  echo "ok   no edit pattern starts with **/"
+else
+  echo "FAIL an edit pattern starts with **/ and cannot match a root-level file"; fail=1
+fi
 expect '.permission.read["*"]' allow
 expect '.permission.read["*.env"]' deny
 expect '.permission.read["*.env.*"]' deny

@@ -47,7 +47,9 @@ rule() {
   fi
 }
 rule edit '.github/**' deny
-rule edit '**/*.env*' deny
+rule edit '*.env*' deny
+rule edit '*secrets*' deny
+rule edit '*.pem' deny
 rule read '*.env' deny
 rule bash 'git push*' deny
 rule bash 'curl *' deny

@@ -7,9 +7,9 @@
     "edit": {
       "*": "allow",
       ".github/**": "deny",
-      "**/*.env*": "deny",
-      "**/secrets*": "deny",
-      "**/*.pem": "deny"
+      "*.env*": "deny",
+      "*secrets*": "deny",
+      "*.pem": "deny"
     },
     "read": {
       "*": "allow",
