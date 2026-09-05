@@ -100,6 +100,8 @@ jobs:
           curl -fsSL "$base/config/opencode.json" -o /tmp/sre-agent-opencode.json
           curl -fsSL "$base/agents/sre-fix.md" -o /tmp/sre-agent-agent.md
           curl -fsSL "$base/scripts/provider_env.sh" -o /tmp/sre-agent-provider_env.sh
+          curl -fsSL "$base/scripts/protected_paths.sh" -o /tmp/sre-agent-protected_paths.sh
+          curl -fsSL "$base/scripts/run_prs.sh" -o /tmp/sre-agent-run_prs.sh
           if git ls-files --error-unmatch .opencode/agents/sre-fix.md >/dev/null 2>&1; then
             echo "::error::.opencode/agents/sre-fix.md is tracked in this repository; the package writes its own agent there, remove or rename yours"
             exit 1
@@ -153,12 +155,50 @@ jobs:
           share: false
           use_github_token: ${{ inputs.use_github_token }}
 
+      # The fences in the configuration are opencode's own tool gates, and the
+      # agent also runs a shell, which can write a file without any tool. The
+      # pull request's file list is what actually pushed, so it is judged here,
+      # after the action, where nothing the agent does can walk around it: a
+      # pull request that touched .github/, an env file, a secrets path or a
+      # key is closed with a comment and the job fails.
+      - name: Close a pull request that touched a protected path
+        if: ${{ !inputs.dry_run && github.event.issue.number }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          mapfile -t prs < <(bash /tmp/sre-agent-run_prs.sh)
+          if [ "${#prs[@]}" -eq 0 ]; then
+            echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
+            exit 0
+          fi
+          failed=0
+          for pr in "${prs[@]}"; do
+            number="$(jq -r '.number' <<<"$pr")"
+            files="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${number}/files" --paginate --jq '.[].filename')"
+            flagged=""
+            if flagged="$(bash /tmp/sre-agent-protected_paths.sh <<<"$files")"; then
+              echo "pull request #${number} changed no protected path"
+              continue
+            fi
+            list="$(paste -sd ',' <<<"$flagged" | sed 's/,/, /g')"
+            gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "Closed by the SRE Agent fix runner: it changed a protected path (${list})"
+            gh pr close "$number" --repo "$GITHUB_REPOSITORY"
+            echo "::error::pull request #${number} changed a protected path (${list}) and was closed"
+            failed=1
+          done
+          exit "$failed"
+
       # The action opens the pull request itself, from a branch it names, with
       # a title of its own and the agent's answer as the body. The platform's
       # contract (a draft, the card key first in the title, the marker and the
-      # version stamp last in the body) is applied here so it never depends on
-      # the model obeying its prompt. The issue's text reaches the script only
-      # through the environment.
+      # version stamp somewhere in the body) is applied here so it never
+      # depends on the model obeying its prompt. The issue's text reaches the
+      # script only through the environment. Draft pull requests need a plan
+      # that supports them, so the conversion is allowed to fail with a warning
+      # rather than fail a run whose pull request is already open.
       - name: Mark the pull request for SRE Agent
         if: ${{ !inputs.dry_run && github.event.issue.number }}
         shell: bash
@@ -174,14 +214,12 @@ jobs:
           stamp="<!-- sre-agent-opencode:${SRE_AGENT_OPENCODE_VERSION} -->"
           [ -n "$key" ] || echo "no card key at the start of the issue title; the title is left as the action wrote it"
           [ -n "$marker" ] || echo "no marker line in the issue body; the body gets the version stamp only"
-          prs="$(gh pr list --state open --limit 100 --json number,title,body,headRefName,createdAt,isDraft \
-            | jq -c --arg prefix "opencode/issue${ISSUE_NUMBER}-" --arg since "$SRE_AGENT_RUN_STARTED" \
-                '.[] | select((.headRefName | startswith($prefix)) and .createdAt >= $since)')"
-          if [ -z "$prs" ]; then
+          mapfile -t prs < <(bash /tmp/sre-agent-run_prs.sh)
+          if [ "${#prs[@]}" -eq 0 ]; then
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
           fi
-          while IFS= read -r pr; do
+          for pr in "${prs[@]}"; do
             number="$(jq -r '.number' <<<"$pr")"
             title="$(jq -r '.title' <<<"$pr")"
             body="$(jq -r '.body' <<<"$pr")"
@@ -201,10 +239,11 @@ jobs:
               args+=(--body "${body}"$'\n\n'"${tail}")
             fi
             if [ "${#args[@]}" -gt 0 ]; then
-              gh pr edit "$number" "${args[@]}"
+              gh pr edit "$number" --repo "$GITHUB_REPOSITORY" "${args[@]}"
             fi
             if [ "$draft" != "true" ]; then
-              gh pr ready "$number" --undo
+              gh pr ready "$number" --repo "$GITHUB_REPOSITORY" --undo \
+                || echo "::warning::could not convert #${number} to a draft; draft pull requests need a plan that supports them"
             fi
             echo "marked pull request #${number} for SRE Agent"
-          done <<<"$prs"
+          done
