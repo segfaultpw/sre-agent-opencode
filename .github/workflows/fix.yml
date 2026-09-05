@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       model:
-        description: "provider/model, for example anthropic/claude-sonnet-4-5. The provider prefix chooses the variable that receives provider_key."
+        description: "provider/model, for example openrouter/deepseek/deepseek-v4-pro or anthropic/claude-sonnet-4-5. The provider prefix chooses the variable that receives provider_key."
         required: true
         type: string
       prompt:

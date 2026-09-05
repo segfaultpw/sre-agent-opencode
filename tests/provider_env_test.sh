@@ -25,6 +25,7 @@ expect anthropic/claude-sonnet-4-5 ANTHROPIC_API_KEY
 expect openai/gpt-5 OPENAI_API_KEY
 expect google/gemini-2.5-pro GOOGLE_GENERATIVE_AI_API_KEY
 expect openrouter/anthropic/claude-sonnet-4-5 OPENROUTER_API_KEY
+expect openrouter/deepseek/deepseek-v4-pro OPENROUTER_API_KEY
 expect xai/grok-4 XAI_API_KEY
 expect groq/llama-3.3-70b-versatile GROQ_API_KEY
 expect mistral/devstral-medium MISTRAL_API_KEY

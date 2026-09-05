@@ -31,7 +31,7 @@ jobs:
       issues: write
     uses: segfaultpw/sre-agent-opencode/.github/workflows/fix.yml@v1
     with:
-      model: anthropic/claude-sonnet-4-5
+      model: openrouter/deepseek/deepseek-v4-pro
       # use_github_token: true   # skip the opencode App; see the README's first install step
     secrets:
-      provider_key: ${{ secrets.ANTHROPIC_API_KEY }}
+      provider_key: ${{ secrets.OPENROUTER_API_KEY }}

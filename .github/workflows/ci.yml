@@ -58,7 +58,7 @@ jobs:
       issues: write
     uses: ./.github/workflows/fix.yml
     with:
-      model: anthropic/claude-sonnet-4-5
+      model: openrouter/deepseek/deepseek-v4-pro
       dry_run: true
     secrets:
       provider_key: not-a-key-the-dry-run-stops-before-opencode
