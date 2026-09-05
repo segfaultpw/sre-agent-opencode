@@ -5,3 +5,5 @@ Versions follow semantic versioning. The major tag (`v1`) moves to every release
 ## Unreleased
 
 Initial package: the reusable workflow, the configuration, the sre-fix agent, the example.
+
+The opencode GitHub action is pinned at `anomalyco/opencode/github@v1.18.29`; a bump is recorded here.

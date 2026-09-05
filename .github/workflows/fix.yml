@@ -138,9 +138,11 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "provider_key exported as ${var} for ${MODEL}"
 
+      # Pinned to a release tag: anomalyco/opencode has no major tag, only
+      # releases and a moving "latest". Bumps go through the CHANGELOG.
       - name: Run opencode
         if: ${{ !inputs.dry_run }}
-        uses: anomalyco/opencode/github@v1
+        uses: anomalyco/opencode/github@v1.18.29
         env:
           GITHUB_TOKEN: ${{ secrets.token || github.token }}
         with:
