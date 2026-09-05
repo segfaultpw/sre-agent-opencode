@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # A tag that does not match VERSION would stamp pull requests with a
+      # version the release does not carry.
+      - name: Check the tag against VERSION
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [ "$TAG" != "v${version}" ]; then
+            echo "::error::tag ${TAG} does not match VERSION ${version}"
+            exit 1
+          fi
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "PRERELEASE=false" >> "$GITHUB_ENV"
+          else
+            echo "PRERELEASE=true" >> "$GITHUB_ENV"
+          fi
+          echo "MAJOR=${TAG%%.*}" >> "$GITHUB_ENV"
+
+      - name: Cut the release notes from the CHANGELOG
+        env:
+          TAG: ${{ github.ref_name }}
+        run: bash scripts/changelog_section.sh CHANGELOG.md "$TAG" > notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          args=(--title "$TAG" --notes-file notes.md --verify-tag)
+          if [ "$PRERELEASE" = "true" ]; then args+=(--prerelease); fi
+          gh release create "$TAG" "${args[@]}"
+
+      # The major tag follows every release of that major, so a customer
+      # pinned to @v1 receives fixes. A prerelease does not move it.
+      - name: Move the major tag
+        if: env.PRERELEASE == 'false'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$MAJOR" "$TAG"
+          git push -f origin "$MAJOR"
+          echo "${MAJOR} now points at ${TAG}"

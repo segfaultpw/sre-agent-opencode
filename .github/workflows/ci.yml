@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install actionlint
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
+      - name: Lint the workflows and the example
+        run: ./actionlint -color .github/workflows/*.yml examples/opencode.yml
+
+  tests:
+    name: config, provider mapping and changelog tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: bash tests/config_test.sh
+      - run: bash tests/provider_env_test.sh
+      - run: bash tests/changelog_section_test.sh
+
+  dry-run:
+    name: opencode loads the config and the agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install opencode
+        run: |
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+      - run: opencode --version
+      - run: bash tests/dry_run_test.sh
+
+  # The reusable workflow called the way a customer calls it, stopped after
+  # the install and the secret mapping: proof on GitHub itself that a called
+  # workflow resolves its own commit and fetches the package's files at it.
+  # A pull request's merge commit is not fetchable from raw.githubusercontent.com,
+  # so this runs on pushes only.
+  smoke:
+    name: reusable workflow dry run
+    if: github.event_name == 'push'
+    permissions:
+      id-token: write
+      contents: write
+      pull-requests: write
+      issues: write
+    uses: ./.github/workflows/fix.yml
+    with:
+      model: anthropic/claude-sonnet-4-5
+      dry_run: true
+    secrets:
+      provider_key: not-a-key-the-dry-run-stops-before-opencode
