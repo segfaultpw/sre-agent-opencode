@@ -25,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: bash tests/config_test.sh
+      - run: bash tests/workflow_test.sh
       - run: bash tests/pattern_probe_test.sh
       - run: bash tests/provider_env_test.sh
       - run: bash tests/protected_paths_test.sh

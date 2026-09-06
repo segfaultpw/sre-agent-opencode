@@ -67,11 +67,15 @@ jobs:
       pull-requests: write
       issues: write
     steps:
-      # The action pushes with its own credentials, so the checkout keeps none.
+      # In App mode the action sets its own push credential and identity, so
+      # the checkout keeps none. In token mode the action pushes with whatever
+      # git holds, so the checkout keeps the token the pull request is opened
+      # with.
       - uses: actions/checkout@v6
         with:
           fetch-depth: 1
-          persist-credentials: false
+          token: ${{ secrets.token || github.token }}
+          persist-credentials: ${{ inputs.use_github_token }}
 
       # The package's own files, at the commit this workflow was called at,
       # so the fences and the agent always match the workflow that runs them
@@ -88,7 +92,6 @@ jobs:
           # predates the property, so it is read out of the serialized context.
           JOB_CONTEXT: ${{ toJSON(job) }}
           AGENT: ${{ inputs.agent }}
-          USE_GITHUB_TOKEN: ${{ inputs.use_github_token }}
         run: |
           set -euo pipefail
           ref="$(jq -r '.workflow_sha // empty' <<<"$JOB_CONTEXT")"
@@ -110,14 +113,6 @@ jobs:
           mkdir -p .opencode/agents
           sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" /tmp/sre-agent-agent.md > .opencode/agents/sre-fix.md
           echo ".opencode/" >> .git/info/exclude
-          # The action sets a commit identity only in App mode; in token mode
-          # git refuses the commit with "empty ident name", after the agent has
-          # already done its work.
-          if [ "$USE_GITHUB_TOKEN" = "true" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            echo "commit identity set to github-actions[bot] for token mode"
-          fi
           config="$(jq -c --arg agent "$AGENT" '.default_agent = $agent' /tmp/sre-agent-opencode.json)"
           {
             echo "OPENCODE_CONFIG_CONTENT=${config}"
@@ -148,6 +143,21 @@ jobs:
             echo "__SRE_AGENT_EOF__"
           } >> "$GITHUB_ENV"
           echo "provider_key exported as ${var} for ${MODEL}"
+
+      # The action configures a git identity only in App mode; in token mode
+      # the commit fails with "empty ident name" after the agent has done its
+      # work. This is the identity GitHub attributes to GITHUB_TOKEN, so the
+      # pull request author stays github-actions[bot]. It runs in token mode
+      # only: a local identity takes precedence over the global one the action
+      # sets in App mode and would change who authors those commits.
+      - name: Give the token an identity
+        if: ${{ inputs.use_github_token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          echo "commit identity set to github-actions[bot] for token mode"
 
       # Pinned to a release tag: anomalyco/opencode has no major tag, only
       # releases and a moving "latest". Bumps go through the CHANGELOG.
