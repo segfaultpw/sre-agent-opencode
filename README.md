@@ -253,6 +253,7 @@ Every other ending reports the same outcome with what happened: the agent declin
 - **A request collected by a runner that then dies** is failed by SRE Agent 45 minutes after it was queued, and the handoff is closed with it, so a runner that wakes up late cannot report into a request that already has an answer. Nothing reaches your default branch, and nothing is reported. A runner that died in the seconds between its push and the pull request can leave a branch named `sre-agent/<handoff id>` behind with no pull request on it, which is the one artefact of a dead run and is safe to delete.
 - **A restart mid-poll** loses nothing: the next poll collects the same request.
 - **A key the queue refuses** stops the runner instead of retrying: HTTP 401 or 403 exits with a message naming `SRE_API_KEY` and the scope it needs.
+- **A runner you switch off** in SRE Agent is not that. The queue refuses it with a `runner_disabled` code, and the runner says so, says the key is not the problem, and polls once a minute until you switch it back on. Nothing restarts and nothing is lost.
 
 ### What it can reach, and what actually bounds it
 

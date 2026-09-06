@@ -70,7 +70,11 @@ const server = http.createServer((request, response) => {
       const status = statuses[Math.min(queueCalls, statuses.length - 1)];
       queueCalls += 1;
       if (status !== 200) {
-        send(response, status, 'application/json', JSON.stringify({ error: 'fixture' }));
+        // FIXTURE_QUEUE_CODE is the stable code the platform sends with a
+        // refusal, and it is how the runner tells an operator switching this
+        // runner off from a key that is wrong.
+        const code = process.env.FIXTURE_QUEUE_CODE || '';
+        send(response, status, 'application/json', JSON.stringify(code ? { error: { code } } : { error: 'fixture' }));
         return;
       }
       if (authorization !== `Bearer ${apiKey}`) {

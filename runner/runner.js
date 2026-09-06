@@ -31,6 +31,10 @@ const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 const REPORT_ATTEMPTS = 3;
 const HTTP_TIMEOUT_MS = 30_000;
+// How long to wait between polls while an operator has this runner switched
+// off in SRE Agent, and the code the queue says so with.
+const DISABLED_POLL_MS = 60_000;
+const RUNNER_DISABLED_CODE = 'runner_disabled';
 
 // A git or gh call that hangs would wedge the runner for ever, so every child
 // has a bound. Only the agent's is the operator's to set.
@@ -272,6 +276,22 @@ async function git(args) {
 // retrying a key the platform has already refused produces nothing but a
 // warning every 25 seconds in somebody's logs, which is the shape that reached
 // production once already.
+// The platform answers a refusal with a stable code in the body. Both shapes
+// are read, because the one thing that must not happen here is mistaking a
+// switched-off runner for a bad key, and a body that is not JSON at all still
+// gets the substring check rather than the wrong verdict.
+function switchedOff(body) {
+  if (!body) return false;
+  try {
+    const payload = JSON.parse(body);
+    const code = payload.code || (payload.error && payload.error.code) || '';
+    if (code === RUNNER_DISABLED_CODE) return true;
+  } catch {
+    // Not JSON; the check below is the answer.
+  }
+  return String(body).includes(RUNNER_DISABLED_CODE);
+}
+
 async function poll(config) {
   const url = `${config.serverUrl}/api/fix-runner/queue`;
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
@@ -284,6 +304,20 @@ async function poll(config) {
       });
     } catch (error) {
       failure = error.message;
+    }
+
+    // An operator switching this runner off in SRE Agent is a 403 as well, and
+    // treating it as a bad key is how a customer gets a restart loop into
+    // failed while being told to check a credential that is fine. It is not an
+    // error at all: wait, ask again, and start working the moment it is
+    // switched back on.
+    if (response && response.status === 403 && switchedOff(response.body)) {
+      log(
+        'warn',
+        `this runner is switched off in SRE Agent, so the queue is refusing it; asking again in ${DISABLED_POLL_MS} ms. SRE_API_KEY is not the problem.`
+      );
+      if (!config.once) await sleep(DISABLED_POLL_MS);
+      return [];
     }
 
     if (response && (response.status === 401 || response.status === 403)) {

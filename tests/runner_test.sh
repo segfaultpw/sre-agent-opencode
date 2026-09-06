@@ -307,6 +307,32 @@ if ! grep -qi 'handoff' "$out"; then echo "ok   the message does not blame the h
 if [ "$(count_path /api/fix-runner/queue)" -eq 1 ]; then echo "ok   a refused key is not retried"; else echo "FAIL queue calls: $(count_path /api/fix-runner/queue)"; fail=1; fi
 stop_fixture
 
+echo "--- 21. a runner switched off in SRE Agent waits rather than exiting ---"
+# The queue answers 403 with a stable code when an operator switches the
+# runner off. Treating that as a bad key exits, and under Restart=always the
+# customer gets a restart loop into failed while being told to check a
+# credential that is fine.
+queue_none
+export FIXTURE_QUEUE_STATUSES=403 FIXTURE_QUEUE_CODE=runner_disabled
+start_fixture disabled
+run_once disabled
+unset FIXTURE_QUEUE_CODE
+export FIXTURE_QUEUE_STATUSES=200
+if [ "$rc" -eq 0 ]; then echo "ok   a switched off runner exits 0 rather than failing"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if grep -q 'switched off in SRE Agent' "$out"; then echo "ok   the log says the runner is switched off"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
+if grep -q 'SRE_API_KEY is not the problem' "$out"; then echo "ok   the log says the key is not the problem"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
+if [ "$(count_path /report)" -eq 0 ]; then echo "ok   nothing is reported while it is switched off"; else echo "FAIL a report was posted"; fail=1; fi
+stop_fixture
+
+echo "--- 9b. a 403 that is not the switch is still fatal ---"
+export FIXTURE_QUEUE_STATUSES=403
+start_fixture forbidden
+run_once forbidden
+export FIXTURE_QUEUE_STATUSES=200
+if [ "$rc" -ne 0 ]; then echo "ok   a refusal with no code exits non-zero"; else echo "FAIL a plain 403 exited 0: $(cat "$out")"; fail=1; fi
+if grep -q 'SRE_API_KEY' "$out"; then echo "ok   the message names SRE_API_KEY"; else echo "FAIL message: $(cat "$out")"; fail=1; fi
+stop_fixture
+
 echo "--- 10. a 500 from the queue is retried with backoff ---"
 export FIXTURE_QUEUE_STATUSES=500,200
 start_fixture retried
