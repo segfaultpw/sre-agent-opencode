@@ -195,7 +195,14 @@ An `emptyDir` workspace means a pod that moves re-clones; give it a PersistentVo
 
 ### Install: systemd
 
-Install node 20 or newer, git, `gh` and opencode first. Then, from a clone of this package:
+Install node 20 or newer, git, `gh` and opencode first, and put them on the system PATH rather than under a home directory: the unit sets `ProtectHome=yes`, so every home directory is empty to the service, and opencode's own installer writes to `~/.opencode/bin`.
+
+```bash
+curl -fsSL https://opencode.ai/install | bash
+sudo install -m 0755 "$HOME/.opencode/bin/opencode" /usr/local/bin/opencode
+```
+
+The installer refuses while any of the four is inside a home directory and prints the copy that moves it, rather than installing cleanly and leaving the unit to fail its first start. Then, from a clone of this package:
 
 ```bash
 git clone https://github.com/segfaultpw/sre-agent-opencode
@@ -203,7 +210,7 @@ cd sre-agent-opencode
 sudo bash runner/install-runner.sh
 ```
 
-It checks every prerequisite before the first write and prints the command that closes each gap, then creates a system account, copies the package to `/opt/sre-agent-opencode` root-owned, installs the unit, and writes `/etc/sre-agent-fix-runner/env` as a template, mode 0600. It writes no credential: the values are yours to paste in.
+It checks every prerequisite before the first write and prints the command that closes each gap, then creates a system account, installs the package to `/opt/sre-agent-opencode` root-owned, installs the unit, and writes `/etc/sre-agent-fix-runner/env` as a template, mode 0600. It writes no credential: the values are yours to paste in. Run it again to upgrade: the new tree is assembled beside the old one and swapped into place, so a copy that fails leaves the working install untouched, and a runner that was already running is restarted onto what was just installed.
 
 ```bash
 sudoedit /etc/sre-agent-fix-runner/env

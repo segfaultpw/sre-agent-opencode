@@ -43,6 +43,12 @@ RestartSec=15s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+# Every home directory is empty to this service, so node, git, gh and opencode
+# have to be on the system PATH rather than in the ~/.opencode/bin that
+# opencode's own installer writes to. install-runner.sh refuses to install
+# while one of the four sits inside a home directory, and prints the copy that
+# moves it, because the alternative is an install that reports success and a
+# unit that fails its first start on a command not found.
 ProtectHome=yes
 # The only writable path. It holds the checkouts, the agent's own state and
 # nothing else; /opt/sre-agent-opencode stays read-only, so a run cannot edit

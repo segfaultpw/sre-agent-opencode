@@ -130,7 +130,7 @@ bash_bin="$(command -v bash)"
 # to copy a file. Without this, "opencode is missing" could only be tested on a
 # machine that happens not to have opencode.
 mkdir -p "$work/coreutils"
-for c in dirname install cp rm chmod cat; do ln -s "$(command -v "$c")" "$work/coreutils/$c"; done
+for c in dirname install cp rm mv find chmod cat bash; do ln -s "$(command -v "$c")" "$work/coreutils/$c"; done
 
 root=""
 out=""
@@ -240,6 +240,61 @@ if [ "$rc" -ne 0 ]; then echo "ok   an incomplete clone refuses"; else echo "FAI
 if [ -z "$(find "$root" -mindepth 1 -print -quit)" ]; then echo "ok   an incomplete clone writes nothing"; else echo "FAIL it wrote $(find "$root" -mindepth 1 | head -n 3)"; fail=1; fi
 if grep -qF 'not a complete clone' <<<"$out"; then echo "ok   the refusal says the clone is incomplete"; else echo "FAIL output: $out"; fail=1; fi
 if grep -qF 'runner/runner.js' <<<"$out"; then echo "ok   the refusal names a file that is missing"; else echo "FAIL output: $out"; fail=1; fi
+
+# ProtectHome=yes in the unit, so a tool that is on PATH here but lives inside
+# a home directory is invisible to the service: the install reports success and
+# the unit lands in failed on its first start.
+mkdir -p "$work/home/operator/bin" "$work/bin-home-hidden"
+for tool in id systemctl groupadd useradd chown getent node git gh; do
+  cp "$work/bin/$tool" "$work/bin-home-hidden/$tool"
+done
+cp "$work/bin/opencode" "$work/home/operator/bin/opencode"
+refusal hidden-opencode PATH="$work/bin-home-hidden:$work/home/operator/bin:$work/coreutils" HOME="$work/home/operator"
+if grep -qF 'inside a home directory' <<<"$out"; then echo "ok   a tool inside a home directory refuses, because ProtectHome hides it from the service"; else echo "FAIL output: $out"; fail=1; fi
+if grep -qF '/usr/local/bin/opencode' <<<"$out"; then echo "ok   the refusal carries the copy that puts it on the system PATH"; else echo "FAIL output: $out"; fail=1; fi
+
+echo "--- an argument it cannot use is refused out loud ---"
+rc=0
+out="$(bash "$script" --prefix 2>&1)" || rc=$?
+if [ "$rc" -eq 2 ]; then echo "ok   --prefix with nothing after it exits 2, the usage status"; else echo "FAIL exited $rc rather than 2: $out"; fail=1; fi
+if grep -qF -- '--prefix needs a directory' <<<"$out"; then echo "ok   it says which argument was wrong"; else echo "FAIL it said nothing about the argument: $out"; fail=1; fi
+
+echo "--- an upgrade restarts a runner that is already running ---"
+install_into upgraded
+if grep -q "^systemctl try-restart ${service}" "$STUB_LOG"; then
+  echo "ok   systemd is asked to restart a running runner, so what is running is what was installed"
+else
+  echo "FAIL no try-restart, so an upgraded runner keeps running the replaced tree: $(grep '^systemctl' "$STUB_LOG")"; fail=1
+fi
+
+echo "--- a copy that fails leaves the working install alone ---"
+# Each directory used to be deleted and then copied, so a copy that died on a
+# full disk or a bad clone left a runner with no package to load. The tree is
+# staged beside the target and swapped, so a failure changes nothing.
+install_into fragile
+before="$(cat "${root}/opt/sre-agent-opencode/VERSION")"
+mkdir -p "$work/failing-cp"
+for tool in id systemctl groupadd useradd chown getent node git gh opencode; do
+  cp "$work/bin/$tool" "$work/failing-cp/$tool"
+done
+cat > "$work/failing-cp/cp" <<EOF
+#!/usr/bin/env bash
+# Fails on the scripts directory, which is neither the first copied nor the
+# last, so the failure lands with the tree half assembled.
+for arg in "\$@"; do
+  case "\$arg" in */scripts) echo "cp: no space left on device" >&2; exit 1 ;; esac
+done
+exec "$(command -v cp)" "\$@"
+EOF
+chmod +x "$work/failing-cp/cp"
+rc=0
+out="$(env PATH="$work/failing-cp:$work/coreutils" "$bash_bin" "$script" --prefix "$root" 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ]; then echo "ok   a failing copy fails the install"; else echo "FAIL the install reported success: $out"; fail=1; fi
+for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh runner/runner.js; do
+  if [ -s "${root}/opt/sre-agent-opencode/${relative}" ]; then echo "ok   ${relative} survived the failed upgrade"; else echo "FAIL the failed upgrade destroyed ${relative}"; fail=1; fi
+done
+if [ "$(cat "${root}/opt/sre-agent-opencode/VERSION")" = "$before" ]; then echo "ok   the installed version is still the one that was working"; else echo "FAIL VERSION changed on a failed install"; fail=1; fi
+if [ -z "$(find "${root}/opt" -maxdepth 1 -name 'sre-agent-opencode.staging.*' -print -quit)" ]; then echo "ok   the staged tree is cleaned up rather than left beside the package"; else echo "FAIL a staging directory was left behind"; fail=1; fi
 
 if grep -qF 'bash tests/install_runner_test.sh' "$pkg/.github/workflows/ci.yml"; then
   echo "ok   CI runs this test"

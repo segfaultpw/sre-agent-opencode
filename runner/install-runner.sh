@@ -40,7 +40,18 @@ USAGE
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prefix) prefix="${2:-}"; shift 2 ;;
+    --prefix)
+      # Checked rather than defaulted. "--prefix" with nothing after it used to
+      # die on the shift, and set -e turned that into a bare exit 1 with not a
+      # word about which argument was wrong.
+      if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "--prefix needs a directory after it" >&2
+        usage >&2
+        exit 2
+      fi
+      prefix="$2"
+      shift 2
+      ;;
     -h | --help) usage; exit 0 ;;
     *) echo "unknown option ${1}" >&2; usage >&2; exit 2 ;;
   esac
@@ -75,16 +86,35 @@ for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected
   fi
 done
 
+# The unit sets ProtectHome=yes, so a tool that lives under a home directory
+# is on PATH here and invisible to the service. That combination installs
+# cleanly and then leaves the unit in failed on its first start, which is the
+# shape an operator cannot diagnose from the outside, so it is refused here
+# with the one command that fixes it.
+home_hidden() {
+  case "$1" in
+    /home/* | /root/*) return 0 ;;
+  esac
+  if [ -n "${HOME:-}" ] && [ "$HOME" != "/" ]; then
+    case "$1" in "${HOME%/}"/*) return 0 ;; esac
+  fi
+  return 1
+}
+
 # The same four the entrypoint checks for at start, checked here as well so
 # they are reported while the operator is still installing.
 for tool in node git gh opencode; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  if [ -z "$tool_path" ]; then
     case "$tool" in
       node) lack "node is not on PATH, and the runner is a Node program" "install Node 20 or newer from your distribution or from https://nodejs.org" ;;
       git) lack "git is not on PATH, and the runner clones the repository it is asked to fix" "install git from your distribution" ;;
       gh) lack "gh is not on PATH, and the runner opens the pull request with it" "install the GitHub CLI from https://github.com/cli/cli/releases" ;;
-      opencode) lack "opencode is not on PATH, and it is what answers the fix request" "curl -fsSL https://opencode.ai/install | bash" ;;
+      opencode) lack "opencode is not on PATH, and it is what answers the fix request" "curl -fsSL https://opencode.ai/install | bash && install -m 0755 \"\$HOME/.opencode/bin/opencode\" /usr/local/bin/opencode" ;;
     esac
+  elif home_hidden "$tool_path"; then
+    lack "${tool} is at ${tool_path}, inside a home directory, and the unit sets ProtectHome=yes, so the service would start without it" \
+      "install -m 0755 ${tool_path} /usr/local/bin/${tool}"
   fi
 done
 
@@ -120,16 +150,42 @@ install -d -m 0750 "$(at "$ENV_DIR")"
 chown "${SERVICE}:${SERVICE}" "$state_path" "$workspace_path"
 
 # The package is root-owned and not writable by the account the agent runs
-# under, so a run cannot edit the fences the next run will load. Each directory
-# is removed before it is copied, because copying a directory onto itself
-# nests it rather than replacing it.
+# under, so a run cannot edit the fences the next run will load.
+#
+# Staged and swapped rather than deleted and copied. Deleting each directory
+# before copying it means a copy that fails half way, on a full disk or a bad
+# clone, leaves a working install destroyed and the next start with a package
+# that is missing files. The whole tree is assembled beside the target first,
+# so anything that goes wrong here leaves what is already installed running,
+# and the swap is two renames.
+staging="${package_path}.staging.$$"
+previous="${package_path}.previous.$$"
+cleanup_staging() { rm -rf "$staging"; }
+trap cleanup_staging EXIT
+rm -rf "$staging"
+install -d -m 0755 "$staging"
 for relative in VERSION config agents scripts runner; do
-  rm -rf "${package_path:?}/${relative:?}"
-  cp -R "${source_root}/${relative}" "${package_path}/${relative}"
+  cp -R "${source_root}/${relative}" "${staging}/${relative}"
 done
-chown -R root:root "$package_path"
-chmod -R go-w "$package_path"
-chmod 0755 "${package_path}/runner/entrypoint.sh"
+chown -R root:root "$staging"
+chmod -R go-w "$staging"
+chmod 0755 "${staging}/runner/entrypoint.sh"
+# What the runner opens on its first job, checked in the staged tree while the
+# old one is still in place.
+for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
+  scripts/strip_repo_config.sh runner/runner.js runner/entrypoint.sh; do
+  if [ ! -f "${staging}/${relative}" ]; then
+    echo "the staged package is missing ${relative}; nothing was replaced" >&2
+    exit 1
+  fi
+done
+rm -rf "$previous"
+if [ -d "$package_path" ]; then
+  mv "$package_path" "$previous"
+fi
+mv "$staging" "$package_path"
+trap - EXIT
+rm -rf "$previous"
 
 # Present on any systemd machine; created here so that a prefixed install has
 # somewhere to put the unit as well.
@@ -184,6 +240,15 @@ TEMPLATE
 fi
 
 systemctl daemon-reload
+# An upgrade replaced the tree under a running runner and left it running the
+# old code out of a directory that no longer exists, which is the failure where
+# an operator swears they upgraded and the logs disagree. try-restart restarts
+# it only if it is running, so a first install still starts nothing.
+if systemctl try-restart "$SERVICE" 2>/dev/null; then
+  echo "restarted ${SERVICE} if it was running, so a running runner is the version just installed"
+else
+  echo "could not ask systemd to restart ${SERVICE}; restart it yourself if it was already running" >&2
+fi
 
 cat <<NEXT
 
