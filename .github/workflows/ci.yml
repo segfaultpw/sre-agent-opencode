@@ -32,6 +32,7 @@ jobs:
       - run: bash tests/gate_agreement_test.sh
       - run: bash tests/run_prs_test.sh
       - run: bash tests/decline_comment_test.sh
+      - run: bash tests/install_test.sh
       - run: bash tests/changelog_section_test.sh
 
   dry-run:
