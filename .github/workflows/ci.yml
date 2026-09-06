@@ -34,6 +34,11 @@ jobs:
       - run: bash tests/decline_comment_test.sh
       - run: bash tests/install_test.sh
       - run: bash tests/changelog_section_test.sh
+      # The runner is the only Node file in the package, so its syntax gate is
+      # the one lint it gets; the test that follows runs it for real against a
+      # fixture platform.
+      - run: node --check runner/runner.js
+      - run: bash tests/runner_test.sh
 
   dry-run:
     name: opencode loads the config and the agent

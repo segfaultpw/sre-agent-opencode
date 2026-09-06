@@ -19,8 +19,11 @@ fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-cp -R "$here/fixture" "$work/repo"
+# tests/fixture also holds the runner test's fixture platform and its stubs,
+# which are not part of the repository the dry run points opencode at, so the
+# two files that are get copied by name rather than the directory wholesale.
 mkdir -p "$work/repo/.opencode/agents" "$work/home"
+cp "$here/fixture/README.md" "$here/fixture/test.sh" "$work/repo/"
 version="$(tr -d '[:space:]' < "$pkg/VERSION")"
 sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" "$pkg/agents/sre-fix.md" > "$work/repo/.opencode/agents/sre-fix.md"
 
