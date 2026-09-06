@@ -58,9 +58,25 @@ expect '.permission.bash["*wget *"]' deny
 expect '.permission.bash["*ssh *"]' deny
 expect '.permission.bash["*scp *"]' deny
 expect '.permission.bash["*rm -rf *"]' deny
-# The same careless step with its flags transposed.
+# The same careless step with its flags transposed, split, or spelled out.
 expect '.permission.bash["*rm -fr *"]' deny
+expect '.permission.bash["*rm -r *"]' deny
+expect '.permission.bash["*rm -f *"]' deny
+expect '.permission.bash["*rm --recursive*"]' deny
+expect '.permission.bash["*rm --force*"]' deny
 expect '.permission.bash["*sudo *"]' deny
+# The ninth, and on the CI door it is a privilege escalation rather than a
+# convenience: fix.yml puts GITHUB_TOKEN in the agent's environment, so
+# "gh pr merge" and "gh api -X PUT" walk around the git push deny and the
+# protected paths gate both, and the agent could merge its own pull request.
+# Three patterns rather than one "*gh *", which would deny "echo high five":
+# the bare form, one with the space an environment prefix or a wrapper leaves
+# in front of it, and one for an absolute path. On the runner door this is the
+# second line, the first being that the runner deletes GH_TOKEN and
+# GITHUB_TOKEN from the environment it starts the agent in.
+expect '.permission.bash["gh *"]' deny
+expect '.permission.bash["* gh *"]' deny
+expect '.permission.bash["*/gh *"]' deny
 # The mutating denies matter to a runner on a customer's machine, where the
 # role the machine holds can reach live systems. They are a second line: the
 # boundary is that role, and the read-only posture comes from granting one.

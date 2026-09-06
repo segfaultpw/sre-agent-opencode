@@ -437,6 +437,11 @@ async function runAgent(config, workspace, brief) {
     // enforcing the fences than the one the release was tested against.
     OPENCODE_DISABLE_AUTOUPDATE: '1',
   };
+  // The first line, and the one that holds: the agent has a shell, so a
+  // credential left here is a credential it can use. The config's gh deny is
+  // the second line and matters most on the CI door, where the job's token is
+  // in the environment by construction and "gh pr merge" would walk around
+  // both the git push deny and the protected paths gate.
   delete env.SRE_API_KEY;
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;

@@ -148,6 +148,29 @@ cmd_probe '/usr/bin/sudo apt-get install -y jq' deny
 cmd_probe 'sudo rm -rf /var/lib/app' deny
 cmd_probe 'env rm -rf /var/lib/app' deny
 cmd_probe 'rm -fr /var/lib/app' deny
+cmd_probe 'rm -r -f /var/lib/app' deny
+cmd_probe 'rm -f -r /var/lib/app' deny
+cmd_probe 'rm --recursive --force /var/lib/app' deny
+cmd_probe 'rm --force --recursive /var/lib/app' deny
+
+# gh, the ninth. In CI the agent's environment holds GITHUB_TOKEN, so this is
+# not a convenience: it is the way around the git push deny and the protected
+# paths gate both, since the agent could merge its own pull request. On the
+# runner door the deny is the second line, the first being that the runner
+# deletes GH_TOKEN and GITHUB_TOKEN from the environment it starts it in.
+cmd_probe 'gh pr merge 7 --squash' deny
+cmd_probe 'gh api -X PUT repos/acme/app/branches/main/protection' deny
+cmd_probe 'GH_TOKEN=x gh pr merge 7' deny
+cmd_probe 'env gh pr merge 7' deny
+cmd_probe '/usr/bin/gh pr merge 7' deny
+cmd_probe 'sudo gh pr merge 7' deny
+# The other direction, which is why it is not written "*gh *": those two
+# letters sit inside ordinary words an agent has every reason to type.
+cmd_probe 'echo high five' allow
+cmd_probe 'grep -r highlight src' allow
+cmd_probe 'npm run build:gh-pages' allow
+cmd_probe 'mix test --only ghost' allow
+
 # The same words inside another command's arguments, which this shape has to
 # leave alone or an ordinary build would be refused.
 cmd_probe 'npm install curl-loader' allow
