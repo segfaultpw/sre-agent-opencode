@@ -32,6 +32,22 @@ else
   echo "FAIL the identity step is not guarded by inputs.use_github_token (got '${guard}')"; fail=1
 fi
 
+check 'id: opencode' 'the action step is addressable by the diagnostic step'
+check '- name: Explain a refused pull request' 'the diagnostic step exists'
+check 'GitHub Actions is not permitted to create or approve pull requests' 'the diagnostic step knows the policy message'
+check 'Allow GitHub Actions to create and approve pull requests' 'the diagnostic step names the setting'
+
+# The diagnostic step runs only after the action failed in token mode, so a
+# green run never pays for it and an App-mode failure is not mislabelled.
+diag="$(awk '/- name: Explain a refused pull request/ { found = 1; next } found && /^ *if:/ { print; exit }' "$wf")"
+for needle in 'failure()' "steps.opencode.outcome == 'failure'" 'inputs.use_github_token' 'github.event.issue.number'; do
+  if [[ "$diag" == *"$needle"* ]]; then
+    echo "ok   the diagnostic step's guard names $needle"
+  else
+    echo "FAIL the diagnostic step's guard is missing $needle (got '${diag}')"; fail=1
+  fi
+done
+
 # The identity must not be set anywhere unguarded, such as the install step.
 if [ "$(grep -c 'git config user.name' "$wf")" -eq 1 ]; then
   echo "ok   the identity is set in one place"
