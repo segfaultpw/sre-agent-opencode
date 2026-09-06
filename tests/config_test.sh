@@ -52,7 +52,6 @@ expect '.permission.bash["kubectl apply*"]' deny
 expect '.permission.bash["kubectl edit*"]' deny
 expect '.permission.bash["kubectl patch*"]' deny
 expect '.permission.bash["kubectl scale*"]' deny
-expect '.permission.bash["kubectl rollout*"]' deny
 expect '.permission.bash["kubectl exec*"]' deny
 expect '.permission.bash["kubectl cordon*"]' deny
 expect '.permission.bash["kubectl drain*"]' deny
@@ -83,48 +82,66 @@ expect '.permission.bash["aws ecs execute-command*"]' deny
 # "kubectl -n prod delete pod x", and a command often carries an environment
 # prefix; both resolved to allow. The shape below is immune to each: the
 # leading "*" absorbs the prefix and the "*" after the binary absorbs the
-# flags. The anchored patterns stay as well, since a redundant deny costs
-# nothing and "kubectl scale" with no argument is caught by that one alone.
-expect '.permission.bash["*kubectl *delete*"]' deny
-expect '.permission.bash["*kubectl *apply*"]' deny
-expect '.permission.bash["*kubectl *edit*"]' deny
-expect '.permission.bash["*kubectl *patch*"]' deny
-expect '.permission.bash["*kubectl *rollout*"]' deny
-expect '.permission.bash["*kubectl *exec*"]' deny
-expect '.permission.bash["*kubectl *cordon*"]' deny
-expect '.permission.bash["*kubectl *drain*"]' deny
-expect '.permission.bash["*kubectl *create*"]' deny
-expect '.permission.bash["*kubectl *replace*"]' deny
-expect '.permission.bash["*kubectl *annotate*"]' deny
-expect '.permission.bash["*kubectl *expose*"]' deny
-expect '.permission.bash["*kubectl *taint*"]' deny
-expect '.permission.bash["*kubectl *attach*"]' deny
-expect '.permission.bash["*kubectl *port-forward*"]' deny
-# A verb that is also a substring of a common read carries the space that
-# follows it, so "kubectl get statefulset", "--show-labels", "--sort-by=cpu",
-# a cluster-autoscaler pod and a runner pod all stay readable.
+# flags. A leading "*" is safe here because opencode asks about each command
+# in the line separately, so it cannot reach across a "&&" into another one.
+# The anchored patterns stay as well, since a redundant deny costs nothing.
+#
+# The verb carries the space that follows it, which is what keeps the reads
+# open: "kubectl get volumeattachments", "kubectl get statefulset",
+# "--show-labels", "--sort-by=cpu", a cluster-autoscaler and a runner pod all
+# contain a verb as a substring and none of them is a mutation. A trailing
+# " *" compiles to "( .*)?", so the bare verb is still denied.
+expect '.permission.bash["*kubectl *delete *"]' deny
+expect '.permission.bash["*kubectl *apply *"]' deny
+expect '.permission.bash["*kubectl *edit *"]' deny
+expect '.permission.bash["*kubectl *patch *"]' deny
+expect '.permission.bash["*kubectl *exec *"]' deny
+expect '.permission.bash["*kubectl *cordon *"]' deny
+expect '.permission.bash["*kubectl *drain *"]' deny
+expect '.permission.bash["*kubectl *create *"]' deny
+expect '.permission.bash["*kubectl *replace *"]' deny
+expect '.permission.bash["*kubectl *annotate *"]' deny
+expect '.permission.bash["*kubectl *expose *"]' deny
+expect '.permission.bash["*kubectl *taint *"]' deny
+expect '.permission.bash["*kubectl *attach *"]' deny
+expect '.permission.bash["*kubectl *debug *"]' deny
+expect '.permission.bash["*kubectl *port-forward *"]' deny
 expect '.permission.bash["*kubectl *scale *"]' deny
 expect '.permission.bash["*kubectl *label *"]' deny
 expect '.permission.bash["*kubectl *run *"]' deny
 expect '.permission.bash["*kubectl *cp *"]' deny
-expect '.permission.bash["*kubectl *proxy"]' deny
-expect '.permission.bash["*kubectl *proxy -*"]' deny
+expect '.permission.bash["*kubectl *certificate approve *"]' deny
+# "kubectl proxy" needs no wildcard between the words, and must not have one:
+# with one it denies "kubectl logs deploy/kube-proxy -n kube-system".
+expect '.permission.bash["*kubectl proxy*"]' deny
+# rollout by mutating subcommand, because "rollout status" and
+# "rollout history" are reads and are how a deploy is watched.
+expect '.permission.bash["*kubectl *rollout restart*"]' deny
+expect '.permission.bash["*kubectl *rollout undo*"]' deny
+expect '.permission.bash["*kubectl *rollout pause*"]' deny
+expect '.permission.bash["*kubectl *rollout resume*"]' deny
 # "kubectl set" by subcommand, because "*set*" denies every read of a
-# statefulset, a replicaset or a daemonset.
-expect '.permission.bash["*kubectl *set image*"]' deny
-expect '.permission.bash["*kubectl *set env*"]' deny
-expect '.permission.bash["*kubectl *set resources*"]' deny
-expect '.permission.bash["*kubectl *set selector*"]' deny
-expect '.permission.bash["*kubectl *set serviceaccount*"]' deny
-expect '.permission.bash["*kubectl *set subject*"]' deny
-expect '.permission.bash["*helm *upgrade*"]' deny
-expect '.permission.bash["*helm *install*"]' deny
-expect '.permission.bash["*helm *uninstall*"]' deny
-expect '.permission.bash["*helm *rollback*"]' deny
-expect '.permission.bash["*terraform *apply*"]' deny
-expect '.permission.bash["*terraform *destroy*"]' deny
-expect '.permission.bash["*terraform *import*"]' deny
-expect '.permission.bash["*terraform *state*"]' deny
+# statefulset, a replicaset or a daemonset. "set sa" is the documented alias
+# of "set serviceaccount".
+expect '.permission.bash["*kubectl *set image *"]' deny
+expect '.permission.bash["*kubectl *set env *"]' deny
+expect '.permission.bash["*kubectl *set resources *"]' deny
+expect '.permission.bash["*kubectl *set selector *"]' deny
+expect '.permission.bash["*kubectl *set serviceaccount *"]' deny
+expect '.permission.bash["*kubectl *set sa *"]' deny
+expect '.permission.bash["*kubectl *set subject *"]' deny
+expect '.permission.bash["*helm *upgrade *"]' deny
+expect '.permission.bash["*helm *install *"]' deny
+expect '.permission.bash["*helm *uninstall *"]' deny
+expect '.permission.bash["*helm *rollback *"]' deny
+expect '.permission.bash["*terraform *apply *"]' deny
+expect '.permission.bash["*terraform *destroy *"]' deny
+expect '.permission.bash["*terraform *import *"]' deny
+# terraform state by mutating subcommand: list, show and pull are reads.
+expect '.permission.bash["*terraform *state rm*"]' deny
+expect '.permission.bash["*terraform *state mv*"]' deny
+expect '.permission.bash["*terraform *state push*"]' deny
+expect '.permission.bash["*terraform *state replace-provider*"]' deny
 for verb in create delete put update modify terminate start stop reboot attach detach \
             associate disassociate register deregister enable disable add remove reset \
             restore import copy cancel accept reject replace revoke authorize tag untag \
@@ -155,15 +172,38 @@ expect '.permission.bash["*aws *execute-policy*"]' deny
 expect '.permission.bash["*aws *suspend-processes*"]' deny
 expect '.permission.bash["*aws *release-address*"]' deny
 expect '.permission.bash["*aws *request-spot-instances*"]' deny
-# Four reads the verb families catch whose data has no other read path: a
-# Logs Insights query is the only aggregating read of a log group, and a Lake
-# query is the only read of an event data store. They are anchored and
-# narrow on purpose. That asymmetry is the rule this file keeps: a deny may
-# over-reach, an allow may not.
-expect '.permission.bash["aws logs start-query*"]' allow
-expect '.permission.bash["aws logs stop-query*"]' allow
-expect '.permission.bash["aws cloudtrail start-query*"]' allow
-expect '.permission.bash["aws cloudtrail cancel-query*"]' allow
+# The reads the verbs above take with them, allowed back after the deny
+# block. These cannot re-allow a mutation: get, describe, logs, top, explain
+# and can-i are reads by definition, and a mutation chained after one of them
+# is a second command, which opencode asks about separately.
+expect '.permission.bash["kubectl get *"]' allow
+expect '.permission.bash["kubectl describe *"]' allow
+expect '.permission.bash["kubectl logs *"]' allow
+expect '.permission.bash["kubectl top *"]' allow
+expect '.permission.bash["kubectl explain *"]' allow
+expect '.permission.bash["kubectl api-resources*"]' allow
+expect '.permission.bash["kubectl auth can-i*"]' allow
+expect '.permission.bash["kubectl version*"]' allow
+expect '.permission.bash["kubectl cluster-info*"]' allow
+expect '.permission.bash["terraform plan*"]' allow
+expect '.permission.bash["terraform show*"]' allow
+expect '.permission.bash["terraform output*"]' allow
+expect '.permission.bash["terraform validate*"]' allow
+expect '.permission.bash["terraform state list*"]' allow
+expect '.permission.bash["terraform state show*"]' allow
+expect '.permission.bash["terraform state pull*"]' allow
+# Those sixteen are anchored, because the resource for a command carrying a
+# substitution is the whole text including the substitution: a leading
+# wildcard would let "kubectl delete pod $(kubectl get pod -o name)" reach
+# the read re-allow. The four AWS ones cannot be anchored, because every AWS
+# command in this organisation is written with a profile, inline or before
+# the service, and an anchored allow would be dead in that form. There the
+# same substitution shape would have to carry a Logs Insights query inside a
+# mutating AWS command, which is not a shape anything writes.
+expect '.permission.bash["*aws *logs start-query*"]' allow
+expect '.permission.bash["*aws *logs stop-query*"]' allow
+expect '.permission.bash["*aws *cloudtrail start-query*"]' allow
+expect '.permission.bash["*aws *cloudtrail cancel-query*"]' allow
 # Last match wins, so a deny placed before the catch-all would not fire, and
 # a re-allow placed before a deny would be overruled by it.
 if jq -e '.permission.bash | keys_unsorted | index("*") == 0' "$cfg" >/dev/null; then

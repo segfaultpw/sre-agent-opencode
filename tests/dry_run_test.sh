@@ -70,12 +70,13 @@ rule bash 'curl *' deny
 rule bash 'kubectl delete*' deny
 rule bash 'aws * delete-*' deny
 rule bash 'aws ecs execute-command*' deny
-# The flag-immune shapes, and one of the four reads allowed back after the
-# deny block, so the real binary witnesses the ordering the gate depends on
-# as well as the patterns themselves.
-rule bash '*kubectl *delete*' deny
+# The flag-immune shapes, and two of the reads allowed back after the deny
+# block, so the real binary witnesses the ordering the gate depends on as
+# well as the patterns themselves.
+rule bash '*kubectl *delete *' deny
 rule bash '*aws *delete-*' deny
-rule bash 'aws logs start-query*' allow
+rule bash 'kubectl get *' allow
+rule bash '*aws *logs start-query*' allow
 rule webfetch '*' deny
 rule websearch '*' deny
 rule task '*' deny
@@ -85,6 +86,17 @@ rule question '*' deny
 # opencode's own defaults ask for doom loops, external directories and env
 # files; the package's later rules override them because the last match wins,
 # so the check is on the last rule of every permission and pattern pair.
+# A bash rule is not matched against the command line as one string: the
+# binary parses it and asks about each command in it, denying the call when
+# any one of them denies. tests/lib/fence.sh models that, and the whole shape
+# of the deny list depends on it, so this is the witness that the installed
+# binary still does it. It witnesses the mechanism, not a verdict: driving a
+# real tool call needs a working provider key, which this run does not have.
+if grep -aq 'descendantsOfType("command")' "$(command -v opencode)"; then
+  echo "ok   the binary collects one resource per command in the line"
+else
+  echo "FAIL the binary no longer parses the command line into commands; re-derive tests/lib/fence.sh before trusting a probe"; fail=1
+fi
 if jq -e 'group_by([.permission, .pattern]) | map(last) | map(select(.action == "ask")) | length == 0' <<<"$rules" >/dev/null 2>&1; then
   echo "ok   no permission is left at ask"
 else
