@@ -78,11 +78,106 @@ expect '.permission.bash["aws s3 rm*"]' deny
 expect '.permission.bash["aws s3 sync*"]' deny
 expect '.permission.bash["aws ssm start-session*"]' deny
 expect '.permission.bash["aws ecs execute-command*"]' deny
-# Last match wins, so a deny placed before the catch-all would not fire.
+# Every pattern above anchors at the first character, so it sees only a
+# command whose binary comes first and whose verb comes second. An SRE types
+# "kubectl -n prod delete pod x", and a command often carries an environment
+# prefix; both resolved to allow. The shape below is immune to each: the
+# leading "*" absorbs the prefix and the "*" after the binary absorbs the
+# flags. The anchored patterns stay as well, since a redundant deny costs
+# nothing and "kubectl scale" with no argument is caught by that one alone.
+expect '.permission.bash["*kubectl *delete*"]' deny
+expect '.permission.bash["*kubectl *apply*"]' deny
+expect '.permission.bash["*kubectl *edit*"]' deny
+expect '.permission.bash["*kubectl *patch*"]' deny
+expect '.permission.bash["*kubectl *rollout*"]' deny
+expect '.permission.bash["*kubectl *exec*"]' deny
+expect '.permission.bash["*kubectl *cordon*"]' deny
+expect '.permission.bash["*kubectl *drain*"]' deny
+expect '.permission.bash["*kubectl *create*"]' deny
+expect '.permission.bash["*kubectl *replace*"]' deny
+expect '.permission.bash["*kubectl *annotate*"]' deny
+expect '.permission.bash["*kubectl *expose*"]' deny
+expect '.permission.bash["*kubectl *taint*"]' deny
+expect '.permission.bash["*kubectl *attach*"]' deny
+expect '.permission.bash["*kubectl *port-forward*"]' deny
+# A verb that is also a substring of a common read carries the space that
+# follows it, so "kubectl get statefulset", "--show-labels", "--sort-by=cpu",
+# a cluster-autoscaler pod and a runner pod all stay readable.
+expect '.permission.bash["*kubectl *scale *"]' deny
+expect '.permission.bash["*kubectl *label *"]' deny
+expect '.permission.bash["*kubectl *run *"]' deny
+expect '.permission.bash["*kubectl *cp *"]' deny
+expect '.permission.bash["*kubectl *proxy"]' deny
+expect '.permission.bash["*kubectl *proxy -*"]' deny
+# "kubectl set" by subcommand, because "*set*" denies every read of a
+# statefulset, a replicaset or a daemonset.
+expect '.permission.bash["*kubectl *set image*"]' deny
+expect '.permission.bash["*kubectl *set env*"]' deny
+expect '.permission.bash["*kubectl *set resources*"]' deny
+expect '.permission.bash["*kubectl *set selector*"]' deny
+expect '.permission.bash["*kubectl *set serviceaccount*"]' deny
+expect '.permission.bash["*kubectl *set subject*"]' deny
+expect '.permission.bash["*helm *upgrade*"]' deny
+expect '.permission.bash["*helm *install*"]' deny
+expect '.permission.bash["*helm *uninstall*"]' deny
+expect '.permission.bash["*helm *rollback*"]' deny
+expect '.permission.bash["*terraform *apply*"]' deny
+expect '.permission.bash["*terraform *destroy*"]' deny
+expect '.permission.bash["*terraform *import*"]' deny
+expect '.permission.bash["*terraform *state*"]' deny
+for verb in create delete put update modify terminate start stop reboot attach detach \
+            associate disassociate register deregister enable disable add remove reset \
+            restore import copy cancel accept reject replace revoke authorize tag untag \
+            publish upload invoke run send set; do
+  expect ".permission.bash[\"*aws *${verb}-*\"]" deny
+done
+expect '.permission.bash["*aws *s3 cp*"]' deny
+expect '.permission.bash["*aws *s3 mv*"]' deny
+expect '.permission.bash["*aws *s3 rm*"]' deny
+expect '.permission.bash["*aws *s3 sync*"]' deny
+expect '.permission.bash["*aws *s3 mb*"]' deny
+expect '.permission.bash["*aws *s3 rb*"]' deny
+expect '.permission.bash["*aws *start-session*"]' deny
+expect '.permission.bash["*aws *execute-command*"]' deny
+# The mutating AWS calls the families structurally cannot see: the verb
+# carries no hyphen, or its first word is not one of the family verbs.
+expect '.permission.bash["*aws *configure set*"]' deny
+expect '.permission.bash["*aws *lambda *invoke*"]' deny
+expect '.permission.bash["*aws *sns *publish*"]' deny
+expect '.permission.bash["*aws *cloudformation *deploy*"]' deny
+expect '.permission.bash["*aws *execute-change-set*"]' deny
+expect '.permission.bash["*aws *change-resource-record-sets*"]' deny
+expect '.permission.bash["*aws *schedule-key-deletion*"]' deny
+expect '.permission.bash["*aws *purge-queue*"]' deny
+expect '.permission.bash["*aws *batch-write-item*"]' deny
+expect '.permission.bash["*aws *failover-db-cluster*"]' deny
+expect '.permission.bash["*aws *execute-policy*"]' deny
+expect '.permission.bash["*aws *suspend-processes*"]' deny
+expect '.permission.bash["*aws *release-address*"]' deny
+expect '.permission.bash["*aws *request-spot-instances*"]' deny
+# Four reads the verb families catch whose data has no other read path: a
+# Logs Insights query is the only aggregating read of a log group, and a Lake
+# query is the only read of an event data store. They are anchored and
+# narrow on purpose. That asymmetry is the rule this file keeps: a deny may
+# over-reach, an allow may not.
+expect '.permission.bash["aws logs start-query*"]' allow
+expect '.permission.bash["aws logs stop-query*"]' allow
+expect '.permission.bash["aws cloudtrail start-query*"]' allow
+expect '.permission.bash["aws cloudtrail cancel-query*"]' allow
+# Last match wins, so a deny placed before the catch-all would not fire, and
+# a re-allow placed before a deny would be overruled by it.
 if jq -e '.permission.bash | keys_unsorted | index("*") == 0' "$cfg" >/dev/null; then
   echo "ok   the bash catch-all comes before every deny"
 else
   echo "FAIL the bash catch-all is not the first rule, so a later allow would win"; fail=1
+fi
+if jq -e '.permission.bash | [to_entries[].value] as $v
+          | ($v | to_entries | map(select(.value == "deny")) | last | .key) as $lastdeny
+          | ($v | to_entries | map(select(.value == "allow" and .key > 0)) | first | .key) as $firstallow
+          | $firstallow > $lastdeny' "$cfg" >/dev/null; then
+  echo "ok   every re-allow comes after every deny"
+else
+  echo "FAIL a re-allow sits before a deny, which overrules it"; fail=1
 fi
 expect '.permission.webfetch' deny
 expect '.permission.websearch' deny

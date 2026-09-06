@@ -67,6 +67,12 @@ rule bash 'curl *' deny
 rule bash 'kubectl delete*' deny
 rule bash 'aws * delete-*' deny
 rule bash 'aws ecs execute-command*' deny
+# The flag-immune shapes, and one of the four reads allowed back after the
+# deny block, so the real binary witnesses the ordering the gate depends on
+# as well as the patterns themselves.
+rule bash '*kubectl *delete*' deny
+rule bash '*aws *delete-*' deny
+rule bash 'aws logs start-query*' allow
 rule webfetch '*' deny
 rule websearch '*' deny
 rule task '*' deny

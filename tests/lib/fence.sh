@@ -34,7 +34,13 @@ fence_resolve() {
   local cfg="$1" path="$2" permission="${3:-edit}" action="ask" pattern value regex
   while IFS=$'\t' read -r pattern value; do
     regex="$(fence_compile "$pattern")"
-    if printf '%s' "$path" | grep -qE -- "$regex"; then
+    # bash compiles a regex without REG_NEWLINE, so "." matches a newline and
+    # the anchors bind to the ends of the whole string, which is what the
+    # JavaScript "s" flag with "^" and "$" does. This was grep, which is line
+    # oriented: it answered deny for a two-line command whose second line
+    # alone matched an anchored rule, where the real matcher answers allow.
+    # The one file whose job is fidelity cannot carry that difference.
+    if [[ "$path" =~ $regex ]]; then
       action="$value"
     fi
   done < <(jq -r --arg p "$permission" '.permission[$p] | to_entries[] | "\(.key)\t\(.value)"' "$cfg")
