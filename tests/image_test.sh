@@ -43,6 +43,27 @@ check "$dockerfile" 'aws --version' 'the AWS CLI is installed and proved at buil
 check "$dockerfile" 'gh --version' 'gh is installed and proved at build time'
 check "$dockerfile" 'opencode --version' 'opencode is installed and proved at build time'
 check "$dockerfile" 'sha256sum -c -' 'a download is checked against a digest rather than taken on its name'
+check "$dockerfile" 'ENV OPENCODE_DISABLE_AUTOUPDATE=1' 'no opencode in the image can replace the binary that enforces the fences'
+check "$dockerfile" '        bash \' 'bash is installed by name rather than inherited from the base'
+
+# Two builds of one VERSION have to be the same binaries, because the version
+# the image carries is stamped into every pull request body it opens. So the
+# base is pinned by digest and every client by version and by content.
+if grep -qE '^FROM .*@sha256:[0-9a-f]{64}$' "$dockerfile"; then
+  echo "ok   the base image is pinned by digest rather than by a tag that moves"
+else
+  echo "FAIL the base image is pinned by tag, so two builds of one VERSION are not the same image"; fail=1
+fi
+downloads="$(grep -cE 'curl -fsSL -o' "$dockerfile" || true)"
+digests="$(grep -cE 'sha256sum -c -' "$dockerfile" || true)"
+if [ "$digests" -ge 4 ]; then
+  echo "ok   opencode, kubectl, the AWS CLI and gh are each checked against a digest (${digests} checks over ${downloads} downloads)"
+else
+  echo "FAIL only ${digests} downloads are digest checked; one of the four clients is taken on its name alone"; fail=1
+fi
+for pinned in OPENCODE KUBECTL AWSCLI GH; do
+  check "$dockerfile" "ARG ${pinned}_VERSION=" "${pinned} is pinned to a version rather than to whatever is current"
+done
 
 # The stamp on a pull request says which fences answered the request, so the
 # binary in the image and the binary the reusable workflow's action installs

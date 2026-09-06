@@ -8,7 +8,12 @@
 # because the runner reads them from its parent directory and stamps pull
 # requests with what it read. A version passed in at run time could disagree
 # with the fences that are actually enforcing, so the stamp is the image's own.
-FROM node:22-bookworm-slim
+# Pinned by digest rather than by tag. The image stamps the version it carries
+# into every pull request body, so two builds of one VERSION have to be the
+# same binaries, and node:22-bookworm-slim moves under its tag every time the
+# base is rebuilt. This is the multi-architecture index digest, so each leg
+# still resolves its own manifest. A bump belongs in the CHANGELOG.
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
 # Set by buildx from the platform being built. Each architecture is built on a
 # runner of that architecture, so nothing here is ever cross-compiled and this
@@ -27,12 +32,24 @@ ARG KUBECTL_VERSION=v1.37.0
 ARG GH_VERSION=2.100.0
 ARG AWSCLI_VERSION=2.36.40
 
-# git and gh are what the runner publishes with, jq is what the package's own
-# scripts parse with, and less is the pager the AWS CLI reaches for. curl,
-# unzip and tar serve the installs below and are kept: an operator who execs in
-# to diagnose the runner itself has nothing else to fetch with.
+# git and gh are what the runner publishes with, bash is what every script in
+# this package is written in, jq is what those scripts parse with, and less is
+# the pager the AWS CLI reaches for. curl, unzip and tar serve the installs
+# below and are kept: an operator who execs in to diagnose the runner itself
+# has nothing else to fetch with. bash is Essential in Debian and so is already
+# here, and it is named anyway, because a package this image depends on should
+# not be present by inheritance alone.
+#
+# These are the one thing here not pinned, and deliberately. Debian's mirror
+# serves only the current point release of bookworm, so an exact version holds
+# until the next security update and then fails the build outright, which
+# trades a reproducible image for one that cannot be built at all. The base
+# digest above fixes which apt snapshot this starts from; a rebuild months
+# later can still pick up a patched git within bookworm, and that is the right
+# direction for the one package here that talks to a network.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        bash \
         ca-certificates \
         curl \
         git \
@@ -75,14 +92,20 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/kubectl; \
     kubectl version --client
 
+# Pinned by content like opencode and kubectl. AWS publishes a PGP signature
+# rather than a checksum file, and carrying their public key here to check it
+# would pin nothing this does not: the digest below is the artifact this image
+# was built and tested against, and a build that fetches a different one under
+# the same version number should stop rather than ship it.
 RUN set -eux; \
     case "$TARGETARCH" in \
-      amd64) arch=x86_64 ;; \
-      arm64) arch=aarch64 ;; \
+      amd64) arch=x86_64; sha=a904e314340ad4c4b62beb50e9259d4becb2acf3dffc86c96c553c834d7fdf7a ;; \
+      arm64) arch=aarch64; sha=f26e08d0d64d9f35f304a9df94d63cbd11ffe8881c8b4bf60be934cf9e4d13a9 ;; \
       *) echo "no AWS CLI build for ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/awscli.zip \
       "https://awscli.amazonaws.com/awscli-exe-linux-${arch}-${AWSCLI_VERSION}.zip"; \
+    echo "${sha}  /tmp/awscli.zip" | sha256sum -c -; \
     unzip -q /tmp/awscli.zip -d /tmp; \
     /tmp/aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli; \
     rm -rf /tmp/aws /tmp/awscli.zip; \
@@ -124,6 +147,11 @@ RUN chown -R root:root /opt/sre-agent-opencode \
 # was collected and lost is failed by the platform's sweep.
 RUN mkdir -p /workspace && chown runner:runner /workspace
 ENV SRE_WORKSPACE=/workspace
+# For every opencode in this image, not only the one the runner starts for the
+# agent. The pinned binary is what enforces the fences, and an update that
+# replaced it would replace them too; the account cannot write to
+# /usr/local/bin either, so this is the second of the two locks.
+ENV OPENCODE_DISABLE_AUTOUPDATE=1
 VOLUME ["/workspace"]
 
 # GHCR reads this to attach the package to the repository, which is what makes
