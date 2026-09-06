@@ -192,18 +192,27 @@ expect '.permission.bash["terraform validate*"]' allow
 expect '.permission.bash["terraform state list*"]' allow
 expect '.permission.bash["terraform state show*"]' allow
 expect '.permission.bash["terraform state pull*"]' allow
-# Those sixteen are anchored, because the resource for a command carrying a
-# substitution is the whole text including the substitution: a leading
-# wildcard would let "kubectl delete pod $(kubectl get pod -o name)" reach
-# the read re-allow. The four AWS ones cannot be anchored, because every AWS
-# command in this organisation is written with a profile, inline or before
-# the service, and an anchored allow would be dead in that form. There the
-# same substitution shape would have to carry a Logs Insights query inside a
-# mutating AWS command, which is not a shape anything writes.
-expect '.permission.bash["*aws *logs start-query*"]' allow
-expect '.permission.bash["*aws *logs stop-query*"]' allow
-expect '.permission.bash["*aws *cloudtrail start-query*"]' allow
-expect '.permission.bash["*aws *cloudtrail cancel-query*"]' allow
+expect '.permission.bash["aws logs start-query*"]' allow
+expect '.permission.bash["aws logs stop-query*"]' allow
+expect '.permission.bash["aws cloudtrail start-query*"]' allow
+expect '.permission.bash["aws cloudtrail cancel-query*"]' allow
+# Every re-allow is anchored at its verb, and that is the rule this block
+# lives by. The resource for a command carrying a substitution is that
+# command's whole text, substitution included, so a re-allow with a wildcard
+# before the verb is reachable from inside one: both
+# "kubectl delete pod $(kubectl get pod -o name)" and
+# "aws ec2 delete-security-group --group-id $(aws logs start-query ...)"
+# would match the read re-allow, and findLast takes the allow over the deny.
+# An anchored pattern cannot be reached that way. The cost is that the same
+# read behind an inline credential prefix stays denied, which is a
+# workstation habit rather than what a runner does: there the credentials
+# come from the process environment or the task role, so the bare form is
+# what gets typed.
+if jq -e '.permission.bash | to_entries | map(select(.value == "allow" and .key != "*")) | map(select(.key | startswith("*"))) | length == 0' "$cfg" >/dev/null; then
+  echo "ok   no re-allow starts with a wildcard"
+else
+  echo "FAIL a re-allow starts with a wildcard, which a command substitution can reach"; fail=1
+fi
 # Last match wins, so a deny placed before the catch-all would not fire, and
 # a re-allow placed before a deny would be overruled by it.
 if jq -e '.permission.bash | keys_unsorted | index("*") == 0' "$cfg" >/dev/null; then

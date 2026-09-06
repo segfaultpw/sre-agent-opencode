@@ -633,6 +633,13 @@ async function handleJob(config, job) {
     repo_full_name: job.repo_full_name || null,
   });
 
+  // not_validated is the only outcome this runner ever sends. The platform's
+  // vocabulary also holds validated_fixed and false_positive: the first
+  // belongs to a door that verified the fix in the running system, which this
+  // runner cannot do because it cannot deploy, and the second is a judgement
+  // about the request that the agent is not asked to make. Reporting
+  // validated_fixed for an unmerged draft pull request put "reported
+  // validated fixed for this card" on the card for a change nothing had run.
   const result = {
     outcome: 'not_validated',
     summary: '',
@@ -705,10 +712,12 @@ async function handleJob(config, job) {
 
     result.pr_url = await publish(config, workspace, agent.finalMessage, brief, result);
     result.actions.push(`opened ${result.pr_url}`);
-    // The agent's contract is to leave no change in place that does not build
-    // or pass, and to decline instead when it cannot get there, so a pull
-    // request from a run that did not decline is the run claiming it did.
-    result.outcome = 'validated_fixed';
+    // The outcome stays not_validated and carries the pull request. The
+    // agent's contract is to leave no change in place that does not build or
+    // pass, so its own message says what it ran; that is a claim about the
+    // checkout, not about the running system, and the change is an unmerged
+    // draft until a person merges it.
+    result.summary = `${result.summary}\n\nThis is an unmerged draft pull request, ${result.pr_url}. Nothing has verified the change in a running system.`;
     log('info', `opened ${result.pr_url} for handoff ${job.handoff_id}`);
   } catch (error) {
     result.summary = `The runner could not complete this request: ${redact(error.message)}`;

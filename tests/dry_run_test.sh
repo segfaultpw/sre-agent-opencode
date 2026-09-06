@@ -76,7 +76,7 @@ rule bash 'aws ecs execute-command*' deny
 rule bash '*kubectl *delete *' deny
 rule bash '*aws *delete-*' deny
 rule bash 'kubectl get *' allow
-rule bash '*aws *logs start-query*' allow
+rule bash 'aws logs start-query*' allow
 rule webfetch '*' deny
 rule websearch '*' deny
 rule task '*' deny

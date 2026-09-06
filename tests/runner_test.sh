@@ -220,7 +220,8 @@ if branch_exists sre-agent/h-targeted; then echo "ok   the branch is pushed to t
 if grep -q 'pr create --repo acme/app --base main --head sre-agent/h-targeted' "$gh_log" && grep -q -- '--draft' "$gh_log"; then echo "ok   a draft pull request is opened against the default branch"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the pull request body carries the marker from the brief and the version stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the report's pr_url is the pull request gh opened"; else echo "FAIL report: $report"; fail=1; fi
-if [ "$(jq -r '.outcome' <<<"$report")" = "validated_fixed" ]; then echo "ok   a delivered pull request is reported as validated_fixed"; else echo "FAIL outcome: $report"; fail=1; fi
+if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a delivered pull request is reported as not_validated, carrying the pull request"; else echo "FAIL outcome: $report"; fail=1; fi
+if jq -e '.summary | test("unmerged draft pull request")' <<<"$report" >/dev/null; then echo "ok   the summary says the change is an unmerged draft nothing has verified"; else echo "FAIL summary: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the report names what changed"; else echo "FAIL evidence: $report"; fail=1; fi
 
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"
@@ -349,6 +350,12 @@ if jq -e '.evidence.agent_errors | index("User not found.")' <<<"$report" >/dev/
 if jq -e '.summary | test("exited 1")' <<<"$report" >/dev/null; then echo "ok   the summary names the exit status"; else echo "FAIL summary: $report"; fail=1; fi
 if ! grep -q ' push ' "$git_log"; then echo "ok   a failed agent pushes nothing"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
 stop_fixture
+
+echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
+# The runner cannot deploy, so it cannot verify a fix in a running system. The
+# scan is over every report every case posted rather than over one of them,
+# because the overclaim was on one path and the point is that no path has it.
+if ! grep -qF 'validated_fixed' "$work"/*.requests.jsonl; then echo "ok   no report from any case claimed validated_fixed"; else echo "FAIL a report claimed validated_fixed"; fail=1; fi
 
 echo "--- 11 and 12. no credential appears in any line the runner wrote ---"
 if ! grep -qF "$api_key" "$work"/*.out; then echo "ok   the API key appears in no log line"; else echo "FAIL the API key was logged"; fail=1; fi

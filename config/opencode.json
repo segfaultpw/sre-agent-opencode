@@ -201,10 +201,10 @@
       "terraform state list*": "allow",
       "terraform state show*": "allow",
       "terraform state pull*": "allow",
-      "*aws *logs start-query*": "allow",
-      "*aws *logs stop-query*": "allow",
-      "*aws *cloudtrail start-query*": "allow",
-      "*aws *cloudtrail cancel-query*": "allow"
+      "aws logs start-query*": "allow",
+      "aws logs stop-query*": "allow",
+      "aws cloudtrail start-query*": "allow",
+      "aws cloudtrail cancel-query*": "allow"
     },
     "webfetch": "deny",
     "websearch": "deny",

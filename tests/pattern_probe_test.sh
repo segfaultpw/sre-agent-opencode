@@ -162,27 +162,31 @@ cmd_probe 'aws s3 ls s3://bucket/prefix' allow
 cmd_probe 'mix test' allow
 cmd_probe 'git status' allow
 
-# The four reads allowed back after the deny block, in the three forms this
-# organisation's own runbook produces. They carry the leading wildcard the
-# denies carry, or the profile prefix every AWS command here is written with
-# would leave them dead.
+# The four AWS reads allowed back after the deny block, whose data has no
+# other read path.
 cmd_probe 'aws logs start-query --log-group-name /ecs/app --query-string fields' allow
-cmd_probe 'aws --region us-east-1 logs start-query --log-group-name /ecs/app' allow
-cmd_probe 'AWS_PROFILE=sreagent aws logs start-query --log-group-name /ecs/app' allow
 cmd_probe 'aws logs stop-query --query-id q' allow
-cmd_probe 'AWS_PROFILE=sreagent aws logs stop-query --query-id q' allow
 cmd_probe 'aws cloudtrail start-query --query-statement select' allow
-cmd_probe 'AWS_PROFILE=sreagent aws cloudtrail start-query --query-statement select' allow
 cmd_probe 'aws cloudtrail cancel-query --query-id q' allow
-cmd_probe 'AWS_PROFILE=sreagent aws cloudtrail cancel-query --query-id q' allow
 
-# The kubectl and terraform read re-allows are anchored instead, so that a
-# mutation carrying a read inside a command substitution cannot reach them:
-# the binary judges the outer command by its whole text, substitution
-# included. The cost is that the same read behind an inline environment
-# prefix stays denied when a deny caught it, which is the second case here.
-cmd_probe 'kubectl delete pod $(kubectl get pod -o name -n prod)' deny
+# Every re-allow is anchored at its verb, because the binary judges a command
+# carrying a substitution by that command's whole text: a wildcard before the
+# verb is reachable from inside one, and findLast then takes the allow over
+# the deny. The cost is in the open here rather than left to be discovered:
+# the same read behind an inline credential prefix, or behind a flag before
+# the service, stays denied. On a runner the credentials come from the
+# process environment or the task role, so the bare form above is what gets
+# typed; the prefixed form is a workstation habit.
+cmd_probe 'AWS_PROFILE=sreagent aws logs start-query --log-group-name /ecs/app' deny
+cmd_probe 'aws --profile sreagent logs start-query --log-group-name /ecs/app' deny
+cmd_probe 'AWS_PROFILE=sreagent aws cloudtrail start-query --query-statement select' deny
 cmd_probe 'KUBECONFIG=/tmp/kc kubectl get clusterrole edit' deny
+# The shape the anchoring closes. This model splits a substitution into its
+# own segment and so answers deny either way; what proves the anchoring is
+# config_test.sh asserting that no re-allow begins with a wildcard, and these
+# two cases are what that assertion is about.
+cmd_probe 'kubectl delete pod $(kubectl get pod -o name -n prod)' deny
+cmd_probe 'aws ec2 delete-security-group --group-id $(aws logs start-query --log-group-name /app)' deny
 
 # What the parse buys: a denied command chained after an allowed one is still
 # denied, because each command in the line is asked about separately.
