@@ -17,11 +17,19 @@ check() {
 
 repo="$work/repo"
 git init -q -b main "$repo"
-mkdir -p "$repo/.opencode/plugin" "$repo/.opencode/command" "$repo/.opencode/agents" "$repo/src"
+# Every directory opencode is known to load from, both spellings of each, two
+# nobody has checked, and one invented name. The strip does not consult this
+# list, which is the point: it removes the directory they all live in. A list
+# was wrong twice, and the next opencode release can add a name nobody here
+# will hear about.
+loaded_dirs="plugin plugins agent agents command commands skill skills tool tools somewhere-nobody-named"
+mkdir -p "$repo/src"
+for d in $loaded_dirs; do
+  mkdir -p "$repo/.opencode/$d"
+  printf 'export const Evil = async () => ({});\n' > "$repo/.opencode/$d/evil.js"
+done
 printf '{ "permission": { "bash": { "*": "allow" } } }\n' > "$repo/opencode.json"
 printf '{ "permission": { "bash": { "*": "allow" } } }\n' > "$repo/.opencode/opencode.json"
-printf 'export const Evil = async () => ({});\n' > "$repo/.opencode/plugin/evil.js"
-printf 'run anything\n' > "$repo/.opencode/command/evil.md"
 printf 'defmodule App do\nend\n' > "$repo/src/app.ex"
 printf 'the repository\n' > "$repo/README.md"
 git -C "$repo" add -A
@@ -29,10 +37,10 @@ git -C "$repo" -c user.name=t -c user.email=t@example.invalid commit -qm seed
 
 out="$(bash "$strip" "$repo")"
 check 'the root configuration is removed' "$([ ! -e "$repo/opencode.json" ] && echo yes || echo no)"
-check 'the .opencode configuration is removed' "$([ ! -e "$repo/.opencode/opencode.json" ] && echo yes || echo no)"
-check 'the plugin directory is removed' "$([ ! -e "$repo/.opencode/plugin" ] && echo yes || echo no)"
-check 'the command directory is removed' "$([ ! -e "$repo/.opencode/command" ] && echo yes || echo no)"
-check 'the agents directory is left alone, since the package writes its agent there' "$([ -d "$repo/.opencode/agents" ] && echo yes || echo no)"
+check 'the whole .opencode directory is removed' "$([ ! -e "$repo/.opencode" ] && echo yes || echo no)"
+left=""
+for d in $loaded_dirs; do [ -e "$repo/.opencode/$d" ] && left="${left}${d} "; done
+check "nothing the loader might read is left, named or not (${left:-none left})" "$([ -z "$left" ] && echo yes || echo no)"
 check 'the repository itself is untouched' "$([ -f "$repo/src/app.ex" ] && [ -f "$repo/README.md" ] && echo yes || echo no)"
 check 'it says what it removed and why' "$(printf '%s' "$out" | grep -q 'opencode loads it from the repository' && echo yes || echo no)"
 
@@ -43,6 +51,7 @@ git -C "$repo" add -A
 staged="$(git -C "$repo" diff --cached --name-only)"
 check 'a tracked configuration file leaves no deletion to stage' "$(printf '%s' "$staged" | grep -qx 'opencode.json' && echo no || echo yes)"
 check 'a tracked plugin leaves no deletion to stage' "$(printf '%s' "$staged" | grep -q '.opencode/plugin' && echo no || echo yes)"
+check 'no part of a tracked .opencode leaves a deletion to stage' "$(printf '%s' "$staged" | grep -q '.opencode/' && echo no || echo yes)"
 check "the agent's own change is still staged" "$(printf '%s' "$staged" | grep -qx 'src/app.ex' && echo yes || echo no)"
 
 # An untracked file, which is what a previous run or the agent itself could

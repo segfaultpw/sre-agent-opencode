@@ -372,12 +372,13 @@ async function prepareCheckout(config, job, repo) {
   await git(['-C', dir, 'checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
   await git(['-C', dir, 'clean', '-fd']);
 
-  // opencode reads configuration and plugins out of the repository it runs in
-  // and merges ours over that rather than replacing it, so a checkout can
-  // reorder our fences into uselessness, and a file under .opencode/plugin
-  // runs before any gate is consulted. The checkout loses those paths before
-  // the agent starts. This runs after the clean, or the clean would restore
-  // them.
+  // opencode reads configuration, plugins and agent definitions out of the
+  // repository it runs in and merges ours over that rather than replacing it,
+  // so a checkout can reorder our fences into uselessness, run its own code
+  // before any gate, or replace the prompt. The whole .opencode directory and
+  // the root configuration leave the checkout here, and writeAgent puts the
+  // package's own agent back into an empty tree. This runs after the clean, or
+  // the clean would restore them.
   const stripped = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'strip_repo_config.sh'), dir], {
     env: gitEnv(),
   });
@@ -386,15 +387,6 @@ async function prepareCheckout(config, job, repo) {
   }
   for (const line of stripped.stdout.split('\n')) {
     if (line.trim().startsWith('removed ')) log('warn', `${repo.fullName}: ${line.trim()}`);
-  }
-
-  const tracked = await runProcess('git', ['-C', dir, 'ls-files', '--error-unmatch', '.opencode/agents/sre-fix.md'], {
-    env: gitEnv(),
-  });
-  if (tracked.code === 0) {
-    throw new Error(
-      `${repo.fullName} tracks .opencode/agents/sre-fix.md; the package writes its own agent there, so remove or rename that file`
-    );
   }
 
   // The action stages the whole tree in CI and this runner stages the whole

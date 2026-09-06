@@ -125,16 +125,17 @@ jobs:
           curl -fsSL "$base/scripts/decline_comment.sh" -o /tmp/sre-agent-decline_comment.sh
           curl -fsSL "$base/scripts/strip_repo_config.sh" -o /tmp/sre-agent-strip_repo_config.sh
           # opencode merges this repository's own configuration with the
-          # package's rather than being replaced by it, and the merge keeps
-          # the repository's key order, so a tracked opencode.json can hold
-          # our denies at its own positions and let its catch-all win. A file
-          # under .opencode/plugin is imported before any gate is consulted.
-          # Both leave the checkout here, before opencode runs.
+          # package's rather than being replaced by it, and the merge keeps the
+          # repository's key order, so a tracked opencode.json can hold our
+          # denies at its own positions and let its catch-all win. What it
+          # loads out of .opencode/ is worse: a plugin runs before any gate,
+          # and an agent definition replaces this prompt and its permissions.
+          # The whole directory and the root configuration leave the checkout
+          # here, and the package's own agent is written into the empty tree
+          # below, so what opencode finds is what this workflow put there. A
+          # repository that tracks its own .opencode/agents/sre-fix.md is no
+          # longer refused, because it no longer collides with anything.
           bash /tmp/sre-agent-strip_repo_config.sh .
-          if git ls-files --error-unmatch .opencode/agents/sre-fix.md >/dev/null 2>&1; then
-            echo "::error::.opencode/agents/sre-fix.md is tracked in this repository; the package writes its own agent there, remove or rename yours"
-            exit 1
-          fi
           mkdir -p .opencode/agents
           sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" /tmp/sre-agent-agent.md > .opencode/agents/sre-fix.md
           echo ".opencode/" >> .git/info/exclude
