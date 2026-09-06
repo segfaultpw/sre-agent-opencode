@@ -56,4 +56,33 @@ else
   echo "FAIL git config user.name appears more than once in fix.yml"; fail=1
 fi
 
+# The decline path: the marking step publishes how many pull requests the run
+# opened, and the decline step runs only when that number is zero, so a run
+# that ended in a pull request never edits a comment as well.
+check 'curl -fsSL "$base/scripts/decline_comment.sh"' 'the decline script is fetched at the workflow commit'
+check 'id: mark' 'the marking step is addressable by the decline step'
+check 'pull_requests=0' 'the marking step reports a run that opened none'
+check '- name: Mark the decline comment for SRE Agent' 'the decline step exists'
+check 'bash /tmp/sre-agent-decline_comment.sh' 'the decline step runs the fetched script'
+
+decline="$(awk '/- name: Mark the decline comment for SRE Agent/ { found = 1; next } found && /^ *if:/ { print; exit }' "$wf")"
+for needle in '!inputs.dry_run' 'github.event.issue.number' "steps.mark.outputs.pull_requests == '0'"; do
+  if [[ "$decline" == *"$needle"* ]]; then
+    echo "ok   the decline step's guard names $needle"
+  else
+    echo "FAIL the decline step's guard is missing $needle (got '${decline}')"; fail=1
+  fi
+done
+
+# The issue's text reaches both post-steps through the environment only, never
+# through an expression inside the script the runner executes.
+for step in 'Mark the pull request for SRE Agent' 'Mark the decline comment for SRE Agent'; do
+  passed="$(awk -v step="- name: $step" 'index($0, step) { found = 1 } found && /ISSUE_BODY:/ { print; exit }' "$wf")"
+  if [[ "$passed" == *'ISSUE_BODY: ${{ github.event.issue.body }}'* ]]; then
+    echo "ok   the step \"$step\" reads the issue body from the environment"
+  else
+    echo "FAIL the step \"$step\" does not pass ISSUE_BODY (got '${passed}')"; fail=1
+  fi
+done
+
 exit $fail

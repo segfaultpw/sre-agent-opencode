@@ -122,6 +122,7 @@ jobs:
           curl -fsSL "$base/scripts/provider_env.sh" -o /tmp/sre-agent-provider_env.sh
           curl -fsSL "$base/scripts/protected_paths.sh" -o /tmp/sre-agent-protected_paths.sh
           curl -fsSL "$base/scripts/run_prs.sh" -o /tmp/sre-agent-run_prs.sh
+          curl -fsSL "$base/scripts/decline_comment.sh" -o /tmp/sre-agent-decline_comment.sh
           if git ls-files --error-unmatch .opencode/agents/sre-fix.md >/dev/null 2>&1; then
             echo "::error::.opencode/agents/sre-fix.md is tracked in this repository; the package writes its own agent there, remove or rename yours"
             exit 1
@@ -260,6 +261,7 @@ jobs:
       # that supports them, so the conversion is allowed to fail with a warning
       # rather than fail a run whose pull request is already open.
       - name: Mark the pull request for SRE Agent
+        id: mark
         if: ${{ !inputs.dry_run && github.event.issue.number }}
         shell: bash
         env:
@@ -278,10 +280,15 @@ jobs:
             echo "::error::could not list this run's pull requests; failing rather than leaving one unmarked"
             exit 1
           fi
+          # The count is this step's verdict on which outcome the run had, and
+          # the decline step reads it: a run that opened a pull request has
+          # nothing to mark on the issue.
           if [ ! -s "$RUNNER_TEMP/prs.jsonl" ]; then
+            echo "pull_requests=0" >> "$GITHUB_OUTPUT"
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
           fi
+          echo "pull_requests=$(grep -c '' "$RUNNER_TEMP/prs.jsonl")" >> "$GITHUB_OUTPUT"
           while IFS= read -r -u 9 pr; do
             number="$(jq -r '.number' <<<"$pr")"
             title="$(jq -r '.title' <<<"$pr")"
@@ -310,3 +317,20 @@ jobs:
             fi
             echo "marked pull request #${number} for SRE Agent"
           done 9< "$RUNNER_TEMP/prs.jsonl"
+
+      # A decline is the run's other ending: no pull request, and the agent's
+      # answer posted as a comment beginning "Declined:". SRE Agent ends the
+      # remediation row the marker names, so the comment carries the same
+      # marker the pull request body would have carried; without it a decline
+      # that lands after the request was superseded ends the newest dispatched
+      # row instead, which is the wrong one. It runs only when the marking
+      # step found no pull request, so a run never both delivers one and
+      # declines.
+      - name: Mark the decline comment for SRE Agent
+        if: ${{ !inputs.dry_run && github.event.issue.number && steps.mark.outputs.pull_requests == '0' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: bash /tmp/sre-agent-decline_comment.sh
