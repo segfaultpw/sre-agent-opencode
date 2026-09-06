@@ -58,6 +58,9 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -f "$MAJOR" "$TAG"
+          # Point the major tag at the commit, not at the release's annotated
+          # tag object: a caller pinned at the major gets that sha as
+          # job.workflow_sha, and only a commit is fetchable from the raw host.
+          git tag -f "$MAJOR" "${TAG}^{commit}"
           git push -f origin "$MAJOR"
-          echo "${MAJOR} now points at ${TAG}"
+          echo "${MAJOR} now points at $(git rev-parse "${TAG}^{commit}")"

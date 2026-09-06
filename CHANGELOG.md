@@ -4,6 +4,10 @@ Versions follow semantic versioning. The major tag (`v1`) moves to every release
 
 ## Unreleased
 
+## v1.0.1
+
+A workflow pinned at a tag now installs the package. `job.workflow_sha` carries the annotated tag object's sha when the caller pins `@v1` or `@v1.0.0`, and the raw host serves commits only, so every fetch answered 404 and the run stopped at the install step. The workflow dereferences such a sha through the API before fetching, and the release workflow now points the major tag at the commit rather than at the release's tag object, so the common case needs no API call at all. Pins at a branch or a commit were never affected.
+
 ## v1.0.0
 
 Initial package: the reusable workflow, the configuration, the sre-fix agent, the example.

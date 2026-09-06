@@ -32,6 +32,7 @@ else
   echo "FAIL the identity step is not guarded by inputs.use_github_token (got '${guard}')"; fail=1
 fi
 
+check 'repos/segfaultpw/sre-agent-opencode/git/tags/${ref}' 'an annotated tag is dereferenced to its commit'
 check 'id: opencode' 'the action step is addressable by the diagnostic step'
 check '- name: Explain a refused pull request' 'the diagnostic step exists'
 check 'GitHub Actions is not permitted to create or approve pull requests' 'the diagnostic step knows the policy message'

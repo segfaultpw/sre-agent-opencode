@@ -92,6 +92,7 @@ jobs:
           # predates the property, so it is read out of the serialized context.
           JOB_CONTEXT: ${{ toJSON(job) }}
           AGENT: ${{ inputs.agent }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ref="$(jq -r '.workflow_sha // empty' <<<"$JOB_CONTEXT")"
@@ -99,8 +100,23 @@ jobs:
             echo "::error::job.workflow_sha is empty; this workflow needs GitHub.com, where a called workflow knows its own commit"
             exit 1
           fi
-          base="https://raw.githubusercontent.com/segfaultpw/sre-agent-opencode/${ref}"
-          version="$(curl -fsSL "$base/VERSION" | tr -d '[:space:]')"
+          raw="https://raw.githubusercontent.com/segfaultpw/sre-agent-opencode"
+          base="${raw}/${ref}"
+          # A caller pinned at an annotated tag, such as @v1 or @v1.0.0, gets
+          # that tag object's sha here, and the raw host serves commits only.
+          # Dereferencing it costs one API call, and only in that case.
+          if ! curl -fsSL "$base/VERSION" -o /tmp/sre-agent-VERSION; then
+            commit="$(gh api "repos/segfaultpw/sre-agent-opencode/git/tags/${ref}" --jq '.object.sha' 2>/dev/null || true)"
+            if [ -z "$commit" ]; then
+              echo "::error::the package's files are not at ${ref}; it is neither a commit nor a tag of segfaultpw/sre-agent-opencode"
+              exit 1
+            fi
+            echo "resolved the annotated tag ${ref} to commit ${commit}"
+            ref="$commit"
+            base="${raw}/${ref}"
+            curl -fsSL "$base/VERSION" -o /tmp/sre-agent-VERSION
+          fi
+          version="$(tr -d '[:space:]' < /tmp/sre-agent-VERSION)"
           curl -fsSL "$base/config/opencode.json" -o /tmp/sre-agent-opencode.json
           curl -fsSL "$base/agents/sre-fix.md" -o /tmp/sre-agent-agent.md
           curl -fsSL "$base/scripts/provider_env.sh" -o /tmp/sre-agent-provider_env.sh
