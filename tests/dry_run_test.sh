@@ -61,6 +61,12 @@ rule edit '*.pem' deny
 rule read '*.env' deny
 rule bash 'git push*' deny
 rule bash 'curl *' deny
+# One of each mutating family, read back out of the real binary, so the
+# pattern probe's re-implementation of the matcher is not the only thing
+# saying the runner's denies are loaded.
+rule bash 'kubectl delete*' deny
+rule bash 'aws * delete-*' deny
+rule bash 'aws ecs execute-command*' deny
 rule webfetch '*' deny
 rule websearch '*' deny
 rule task '*' deny

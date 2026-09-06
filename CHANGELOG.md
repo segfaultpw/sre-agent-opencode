@@ -4,6 +4,10 @@ Versions follow semantic versioning. The major tag (`v1`) moves to every release
 
 ## Unreleased
 
+One agent prompt now serves both doors. It no longer says it is running inside a repository's own CI, because a runner started on a machine you own runs the same agent under the same fences, and two copies of the prompt would drift. It also gains a step for a request that resolved no repository: investigate with the read-only commands available, answer with a diagnosis, the evidence for it and the repository the change probably belongs in, and change nothing.
+
+The bash gate refuses the mutating cloud and cluster commands as well: `kubectl delete`, `apply`, `edit`, `patch`, `scale`, `rollout`, `exec`, `cordon` and `drain`; `helm upgrade`, `install` and `uninstall`; `terraform apply` and `destroy`; the AWS CLI's 37 mutating verb families, written as `aws * <verb>-*` so a service the CLI adds later is covered without a new rule; `aws s3 cp`, `mv`, `rm` and `sync`; `aws ssm start-session` and `aws ecs execute-command`. Read calls are untouched, so a diagnosis still has `describe-`, `get-` and `list-`; `aws logs start-query` is the one read the verb families catch, and the same logs are readable with `get-log-events` or `filter-log-events`. These denies are a second line and not the control: the matching is against the whole command string as written, the agent has a shell, and what holds is the role granted to the machine the agent runs on.
+
 ## v1.1.0
 
 A run that declines now marks its comment. When the action opened no pull request and left a comment beginning `Declined:` on the tracking issue, the workflow appends the issue's marker line and the version stamp to that comment, as it already does to a pull request body. SRE Agent ends the remediation the marker names; a decline without one fell back to the most recently dispatched request, which is the wrong one when a request was superseded while the run was going. An issue body carrying no marker leaves the comment as the action wrote it.

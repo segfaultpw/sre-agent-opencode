@@ -25,15 +25,18 @@ fence_compile() {
   printf '^%s$' "$escaped"
 }
 
-# fence_resolve <config> <path>: prints the action the config's edit rules
-# give the path, "ask" when no rule matches.
+# fence_resolve <config> <resource> [permission]: prints the action the
+# config's rules for that permission give the resource, "ask" when no rule
+# matches. The permission defaults to edit, where the resource is a path.
+# A bash rule resolves the same way because opencode matches it against the
+# whole command string as written, unparsed, so the command is the resource.
 fence_resolve() {
-  local cfg="$1" path="$2" action="ask" pattern value regex
+  local cfg="$1" path="$2" permission="${3:-edit}" action="ask" pattern value regex
   while IFS=$'\t' read -r pattern value; do
     regex="$(fence_compile "$pattern")"
     if printf '%s' "$path" | grep -qE -- "$regex"; then
       action="$value"
     fi
-  done < <(jq -r '.permission.edit | to_entries[] | "\(.key)\t\(.value)"' "$cfg")
+  done < <(jq -r --arg p "$permission" '.permission[$p] | to_entries[] | "\(.key)\t\(.value)"' "$cfg")
   printf '%s' "$action"
 }
