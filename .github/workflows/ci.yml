@@ -60,6 +60,7 @@ jobs:
     uses: ./.github/workflows/fix.yml
     with:
       model: openrouter/deepseek/deepseek-v4-pro
+      use_github_token: true
       dry_run: true
     secrets:
       provider_key: not-a-key-the-dry-run-stops-before-opencode

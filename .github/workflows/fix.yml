@@ -88,6 +88,7 @@ jobs:
           # predates the property, so it is read out of the serialized context.
           JOB_CONTEXT: ${{ toJSON(job) }}
           AGENT: ${{ inputs.agent }}
+          USE_GITHUB_TOKEN: ${{ inputs.use_github_token }}
         run: |
           set -euo pipefail
           ref="$(jq -r '.workflow_sha // empty' <<<"$JOB_CONTEXT")"
@@ -109,6 +110,14 @@ jobs:
           mkdir -p .opencode/agents
           sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" /tmp/sre-agent-agent.md > .opencode/agents/sre-fix.md
           echo ".opencode/" >> .git/info/exclude
+          # The action sets a commit identity only in App mode; in token mode
+          # git refuses the commit with "empty ident name", after the agent has
+          # already done its work.
+          if [ "$USE_GITHUB_TOKEN" = "true" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            echo "commit identity set to github-actions[bot] for token mode"
+          fi
           config="$(jq -c --arg agent "$AGENT" '.default_agent = $agent' /tmp/sre-agent-opencode.json)"
           {
             echo "OPENCODE_CONFIG_CONTENT=${config}"
