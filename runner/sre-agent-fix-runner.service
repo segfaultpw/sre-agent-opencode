@@ -1,0 +1,61 @@
+[Unit]
+Description=SRE Agent fix runner (opencode)
+Documentation=https://github.com/segfaultpw/sre-agent-opencode
+# The first thing the runner does is a long poll, so it waits for a route
+# rather than for the network stack to exist.
+After=network-online.target
+Wants=network-online.target
+# Restart=always would otherwise poll a refused API key for ever, which is the
+# shape that put an invalid-key warning every few seconds into production logs.
+# Five failures inside five minutes leave the unit in failed, where an operator
+# sees it; a runner that has been up and crashes once still restarts.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# exec rather than simple: a unit whose ExecStart cannot be executed then fails
+# its start instead of reporting active and dying.
+Type=exec
+User=sre-agent-fix-runner
+Group=sre-agent-fix-runner
+WorkingDirectory=/var/lib/sre-agent-fix-runner
+
+# Above EnvironmentFile so an operator can override either of these in the file
+# without editing the unit. HOME has to be inside the one writable path,
+# because ProtectHome below hides /home entirely and opencode keeps state in it.
+Environment=HOME=/var/lib/sre-agent-fix-runner
+Environment=SRE_WORKSPACE=/var/lib/sre-agent-fix-runner/workspace
+
+# Root-owned and 0600: it holds the poll credential, and the account this unit
+# runs as never needs to read it, since systemd reads it as root and passes the
+# values in.
+EnvironmentFile=/etc/sre-agent-fix-runner/env
+
+# The same entrypoint the container image starts through, so a plain machine
+# and a container refuse to start for the same reasons and with the same words.
+ExecStart=/opt/sre-agent-opencode/runner/entrypoint.sh
+
+# A fix request that arrives while the runner is down waits in the queue, so
+# coming back is always right.
+Restart=always
+RestartSec=15s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# The only writable path. It holds the checkouts, the agent's own state and
+# nothing else; /opt/sre-agent-opencode stays read-only, so a run cannot edit
+# the fences the next run will load.
+ReadWritePaths=/var/lib/sre-agent-fix-runner
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# A checkout is the customer's own source, and it is nobody else's business on
+# the machine.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

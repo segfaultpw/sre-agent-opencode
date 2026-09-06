@@ -48,6 +48,7 @@ jobs:
       - run: node --check runner/runner.js
       - run: bash tests/runner_test.sh
       - run: bash tests/image_test.sh
+      - run: bash tests/install_runner_test.sh
 
   dry-run:
     name: opencode loads the config and the agent
