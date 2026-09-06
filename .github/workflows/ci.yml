@@ -8,10 +8,18 @@ on:
 permissions:
   contents: read
 
+# Every runs-on below reads the organization's runner switch
+# (segfaultpw/runner-switch), which sets RUNNER_X64 and RUNNER_ARM64 to
+# GitHub-hosted labels while the month's included Actions minutes last and to
+# Blacksmith labels once they are nearly spent. The fallback in each expression
+# is the Blacksmith label, so an unset variable changes nothing. fix.yml is
+# deliberately not part of this: it runs in a customer's repository, where
+# these variables do not exist, and its runner input defaults to a label
+# GitHub itself provides.
 jobs:
   lint:
     name: actionlint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v6
       - name: Install actionlint
@@ -21,7 +29,7 @@ jobs:
 
   tests:
     name: config, provider mapping and changelog tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v6
       - run: bash tests/config_test.sh
@@ -39,10 +47,11 @@ jobs:
       # fixture platform.
       - run: node --check runner/runner.js
       - run: bash tests/runner_test.sh
+      - run: bash tests/image_test.sh
 
   dry-run:
     name: opencode loads the config and the agent
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v6
       - name: Install opencode
@@ -51,6 +60,100 @@ jobs:
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
       - run: opencode --version
       - run: bash tests/dry_run_test.sh
+
+  # The image is built on every push and pull request and published only from a
+  # release tag. A Dockerfile that built for the first time at release time
+  # would be found broken at the one moment there is no room to fix it.
+  runner-image:
+    name: runner image ${{ matrix.suffix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each architecture on a runner of that architecture. The image
+          # installs a prebuilt opencode, kubectl, gh and AWS CLI per
+          # architecture, so an emulated build would take far longer and prove
+          # less than a native one.
+          - platform: linux/amd64
+            runner: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ${{ vars.RUNNER_ARM64 || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the runner image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: runner/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          # Into the local daemon, so the checks below run the image that was
+          # just built rather than reading the Dockerfile a second time.
+          load: true
+          tags: sre-agent-opencode-runner:ci
+
+      - name: The image carries what the runner shells out to
+        env:
+          IMAGE: sre-agent-opencode-runner:ci
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint bash "$IMAGE" -c '
+            set -eux
+            node --version
+            git --version
+            gh --version
+            opencode --version
+            kubectl version --client
+            aws --version
+            test "$(id -u)" -ne 0
+            node --check /opt/sre-agent-opencode/runner/runner.js
+            # Every file the runner reads out of the package at run time. A
+            # build context rule that excluded one of these would produce an
+            # image that builds and then fails its first job.
+            test -s /opt/sre-agent-opencode/VERSION
+            test -s /opt/sre-agent-opencode/agents/sre-fix.md
+            test -s /opt/sre-agent-opencode/config/opencode.json
+            test -s /opt/sre-agent-opencode/scripts/protected_paths.sh
+            # The agent runs under this account and must not be able to edit
+            # the fences the next run will load.
+            ! test -w /opt/sre-agent-opencode/config/opencode.json
+          '
+
+      - name: The stamp the image writes is its own version
+        env:
+          IMAGE: sre-agent-opencode-runner:ci
+        run: |
+          set -euo pipefail
+          in_image="$(docker run --rm --entrypoint cat "$IMAGE" /opt/sre-agent-opencode/VERSION | tr -d '[:space:]')"
+          in_tree="$(tr -d '[:space:]' < VERSION)"
+          if [ "$in_image" != "$in_tree" ]; then
+            echo "::error::the image carries VERSION ${in_image} and the tree says ${in_tree}"
+            exit 1
+          fi
+          echo "the image carries VERSION ${in_image}"
+
+      - name: The image refuses to start without its configuration
+        env:
+          IMAGE: sre-agent-opencode-runner:ci
+        run: |
+          set -euo pipefail
+          if out="$(docker run --rm "$IMAGE" 2>&1)"; then
+            echo "::error::the runner started with no configuration"
+            exit 1
+          fi
+          echo "$out"
+          for name in SRE_SERVER_URL SRE_API_KEY SRE_MODEL; do
+            if ! grep -qF "${name} is not set" <<<"$out"; then
+              echo "::error::the refusal did not name ${name}"
+              exit 1
+            fi
+          done
 
   # The reusable workflow called the way a customer calls it, stopped after
   # the install and the secret mapping: proof on GitHub itself that a called

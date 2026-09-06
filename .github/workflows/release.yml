@@ -5,18 +5,25 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
+# The runner switch, as in ci.yml: an unset variable falls back to the
+# Blacksmith label and changes nothing.
 jobs:
-  release:
-    name: release ${{ github.ref_name }}
-    runs-on: ubuntu-latest
+  # The tag check gates everything, image included: an image tagged v1.2.0 and
+  # built from a tree whose VERSION says something else would stamp pull
+  # requests with a version that does not exist.
+  check:
+    name: check the tag
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    outputs:
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      major: ${{ steps.tag.outputs.major }}
     steps:
       - uses: actions/checkout@v6
 
-      # A tag that does not match VERSION would stamp pull requests with a
-      # version the release does not carry.
       - name: Check the tag against VERSION
+        id: tag
         env:
           TAG: ${{ github.ref_name }}
         run: |
@@ -27,11 +34,102 @@ jobs:
             exit 1
           fi
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "PRERELEASE=false" >> "$GITHUB_ENV"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           else
-            echo "PRERELEASE=true" >> "$GITHUB_ENV"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "MAJOR=${TAG%%.*}" >> "$GITHUB_ENV"
+          echo "major=${TAG%%.*}" >> "$GITHUB_OUTPUT"
+
+  # One tag per architecture, merged below. Both are built on a runner of that
+  # architecture, the way the platform repository builds its own images.
+  image:
+    name: runner image ${{ matrix.suffix }}
+    needs: check
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ${{ vars.RUNNER_ARM64 || 'blacksmith-4vcpu-ubuntu-2404-arm' }}
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (${{ matrix.suffix }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: runner/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/sre-agent-opencode-runner:${{ github.ref_name }}-${{ matrix.suffix }}
+
+  image-manifest:
+    name: runner image manifest
+    needs: [check, image]
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # imagetools retags by manifest reference, so the multi-architecture tag
+      # points at the images that were just built rather than at a rebuild.
+      - name: Merge the per-architecture images into one manifest
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/sre-agent-opencode-runner
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:$TAG" \
+            "$IMAGE:$TAG-amd64" \
+            "$IMAGE:$TAG-arm64"
+          docker buildx imagetools inspect "$IMAGE:$TAG"
+
+      # The moving major is what an operator following "the current v1" pulls,
+      # so a prerelease leaves it where it is, exactly as the git tag does.
+      - name: Move the moving major image tag
+        if: needs.check.outputs.prerelease != 'true'
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/sre-agent-opencode-runner
+          TAG: ${{ github.ref_name }}
+          MAJOR: ${{ needs.check.outputs.major }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:$MAJOR" "$IMAGE:$TAG"
+          echo "${IMAGE}:${MAJOR} now points at ${TAG}"
+
+  # Last, so a release never announces a version whose image failed to build.
+  release:
+    name: release ${{ github.ref_name }}
+    needs: [check, image-manifest]
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
 
       - name: Cut the release notes from the CHANGELOG
         env:
@@ -42,6 +140,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
         run: |
           set -euo pipefail
           args=(--title "$TAG" --notes-file notes.md --verify-tag)
@@ -51,9 +150,10 @@ jobs:
       # The major tag follows every release of that major, so a customer
       # pinned to @v1 receives fixes. A prerelease does not move it.
       - name: Move the major tag
-        if: env.PRERELEASE == 'false'
+        if: needs.check.outputs.prerelease == 'false'
         env:
           TAG: ${{ github.ref_name }}
+          MAJOR: ${{ needs.check.outputs.major }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"

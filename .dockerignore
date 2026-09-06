@@ -1,0 +1,14 @@
+# The build context is the repository root, because the image carries the
+# package's own config, agent, scripts and VERSION. Nothing below is copied
+# into the image, and keeping it out of the context keeps a test fixture or a
+# local note from ever being in reach of a COPY.
+#
+# Deliberately no *.md rule: agents/sre-fix.md is the agent the runner writes
+# into every checkout, and an exclusion that reached it would leave an image
+# that builds and then fails its first job.
+.git
+.github
+.gitignore
+.superpowers
+tests
+examples
