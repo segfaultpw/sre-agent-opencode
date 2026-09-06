@@ -125,6 +125,35 @@ cmd_probe 'terraform import aws_instance.web i-0' deny
 cmd_probe 'git push origin HEAD' deny
 cmd_probe 'curl https://example.invalid' deny
 
+# The eight the package started with, in the four forms an anchored pattern
+# misses: an environment prefix, an env wrapper, an absolute path, and for
+# git the flag that sits between the binary and the verb. curl and git push
+# are the two that the claim about the runner being the only thing which
+# touches git or the network rests on, so they are probed hardest.
+cmd_probe 'HTTPS_PROXY=http://p:3128 curl https://example.invalid' deny
+cmd_probe 'env curl https://example.invalid' deny
+cmd_probe '/usr/bin/curl https://example.invalid' deny
+cmd_probe 'curl' deny
+cmd_probe 'git -C /tmp/r push origin HEAD' deny
+cmd_probe 'GIT_DIR=/tmp/r/.git git push origin HEAD' deny
+cmd_probe '/usr/bin/git push origin HEAD' deny
+cmd_probe 'git -C /tmp/r remote add mirror https://example.invalid' deny
+cmd_probe 'HTTPS_PROXY=http://p:3128 wget https://example.invalid' deny
+cmd_probe '/usr/bin/wget https://example.invalid' deny
+cmd_probe 'env ssh deploy@example.invalid' deny
+cmd_probe '/usr/bin/ssh deploy@example.invalid' deny
+cmd_probe 'env scp file deploy@example.invalid:/tmp' deny
+cmd_probe 'DEBIAN_FRONTEND=noninteractive sudo apt-get install -y jq' deny
+cmd_probe '/usr/bin/sudo apt-get install -y jq' deny
+cmd_probe 'sudo rm -rf /var/lib/app' deny
+cmd_probe 'env rm -rf /var/lib/app' deny
+cmd_probe 'rm -fr /var/lib/app' deny
+# The same words inside another command's arguments, which this shape has to
+# leave alone or an ordinary build would be refused.
+cmd_probe 'npm install curl-loader' allow
+cmd_probe 'cat /home/runner/.ssh/config' allow
+cmd_probe 'mix deps.get' allow
+
 # The reads an operator runs while diagnosing. Every one of these was denied
 # by some earlier shape of this list, which is why each is pinned.
 cmd_probe 'kubectl get pods -n prod' allow

@@ -44,6 +44,23 @@ expect '.permission.bash["ssh *"]' deny
 expect '.permission.bash["scp *"]' deny
 expect '.permission.bash["rm -rf *"]' deny
 expect '.permission.bash["sudo *"]' deny
+# Those eight anchor at the first character, so they saw only the bare form.
+# "curl x" was denied while "env curl x", "/usr/bin/curl x" and
+# "HTTPS_PROXY=y curl x" were allowed, and "git push origin HEAD" was denied
+# while "git -C /tmp/r push origin HEAD" was allowed. Those two are the denies
+# that the claim about the runner being the only thing which touches git or
+# the network rests on, so they take the same shape as every other family: a
+# leading wildcard for a prefix, a wildcard after the binary for the flags.
+expect '.permission.bash["*git *push *"]' deny
+expect '.permission.bash["*git *remote *"]' deny
+expect '.permission.bash["*curl *"]' deny
+expect '.permission.bash["*wget *"]' deny
+expect '.permission.bash["*ssh *"]' deny
+expect '.permission.bash["*scp *"]' deny
+expect '.permission.bash["*rm -rf *"]' deny
+# The same careless step with its flags transposed.
+expect '.permission.bash["*rm -fr *"]' deny
+expect '.permission.bash["*sudo *"]' deny
 # The mutating denies matter to a runner on a customer's machine, where the
 # role the machine holds can reach live systems. They are a second line: the
 # boundary is that role, and the read-only posture comes from granting one.
