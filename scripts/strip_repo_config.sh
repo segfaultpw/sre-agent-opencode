@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Removes, from the checkout the agent is about to run in, the files opencode
+# loads out of the repository itself.
+#
+# Why: the package's configuration travels in OPENCODE_CONFIG_CONTENT, which
+# is MERGED with the repository's own configuration rather than replacing it.
+# The merge keeps the repository's position for any key it also names, and a
+# permission resolves by findLast over that order, so a repository that lists
+#
+#   { "permission": { "bash": { "kubectl delete*": "allow", "*": "allow" } } }
+#
+# gets our deny written at ITS index, ahead of its own catch-all, and the
+# catch-all wins. Verified against opencode 1.18.25 by reading the resolved
+# ruleset out of "opencode agent list": on a clean checkout the catch-all is
+# rule 0 and the denies follow it, and with that file present the order
+# inverts. A file under .opencode/plugin is worse than a reordering: opencode
+# imports it, so it runs before any gate is consulted at all.
+#
+# OPENCODE_DISABLE_PROJECT_CONFIG does not close the .opencode/ path, which is
+# why this is a script and not an environment variable.
+#
+# A tracked file is marked skip-worktree before it is removed, so that its
+# absence is invisible to "git add -A" and no pull request carries a deletion
+# the agent did not make.
+set -euo pipefail
+
+dir="${1:-.}"
+if [ ! -d "$dir" ]; then
+  echo "strip_repo_config.sh: $dir is not a directory" >&2
+  exit 2
+fi
+cd "$dir"
+
+in_git=0
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then in_git=1; fi
+
+removed=0
+strip() {
+  local path="$1" tracked
+  [ -e "$path" ] || return 0
+  if [ "$in_git" -eq 1 ]; then
+    # A directory lists its tracked files; a file lists itself. Either way the
+    # index keeps what it had and the worktree loses it.
+    while IFS= read -r tracked; do
+      [ -n "$tracked" ] || continue
+      git update-index --skip-worktree -- "$tracked" || true
+    done < <(git ls-files -- "$path")
+  fi
+  rm -rf -- "$path"
+  echo "removed $path: opencode loads it from the repository, and this run's fences come from the package"
+  removed=$((removed + 1))
+}
+
+shopt -s nullglob
+for path in opencode.json* .opencode/opencode.json* .opencode/plugin .opencode/command; do
+  strip "$path"
+done
+shopt -u nullglob
+
+if [ "$removed" -eq 0 ]; then
+  echo "no repository-level opencode configuration, plugin or command to remove"
+fi

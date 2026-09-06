@@ -56,6 +56,21 @@ else
   echo "FAIL git config user.name appears more than once in fix.yml"; fail=1
 fi
 
+# The checkout's own opencode configuration is merged with the package's and
+# keeps its key order, so it can hold the package's denies at its own indexes
+# and let its catch-all win, and a file under .opencode/plugin runs before any
+# gate. Both doors strip those paths, and the CI door fetches the script at
+# the workflow's own commit like every other one.
+check 'curl -fsSL "$base/scripts/strip_repo_config.sh"' 'the strip script is fetched at the workflow commit'
+check 'bash /tmp/sre-agent-strip_repo_config.sh .' 'the checkout is stripped before opencode runs'
+strip_line="$(grep -n 'bash /tmp/sre-agent-strip_repo_config.sh' "$wf" | cut -d: -f1 | head -1)"
+agent_line="$(grep -n 'SRE_AGENT_OPENCODE_VERSION}}/v' "$wf" | cut -d: -f1 | head -1)"
+if [ -n "$strip_line" ] && [ -n "$agent_line" ] && [ "$strip_line" -lt "$agent_line" ]; then
+  echo "ok   the strip runs before the package writes its own agent into .opencode"
+else
+  echo "FAIL the strip runs after the agent is written, where it would delete it"; fail=1
+fi
+
 # The decline path: the marking step publishes how many pull requests the run
 # opened, and the decline step runs only when that number is zero, so a run
 # that ended in a pull request never edits a comment as well.

@@ -123,6 +123,14 @@ jobs:
           curl -fsSL "$base/scripts/protected_paths.sh" -o /tmp/sre-agent-protected_paths.sh
           curl -fsSL "$base/scripts/run_prs.sh" -o /tmp/sre-agent-run_prs.sh
           curl -fsSL "$base/scripts/decline_comment.sh" -o /tmp/sre-agent-decline_comment.sh
+          curl -fsSL "$base/scripts/strip_repo_config.sh" -o /tmp/sre-agent-strip_repo_config.sh
+          # opencode merges this repository's own configuration with the
+          # package's rather than being replaced by it, and the merge keeps
+          # the repository's key order, so a tracked opencode.json can hold
+          # our denies at its own positions and let its catch-all win. A file
+          # under .opencode/plugin is imported before any gate is consulted.
+          # Both leave the checkout here, before opencode runs.
+          bash /tmp/sre-agent-strip_repo_config.sh .
           if git ls-files --error-unmatch .opencode/agents/sre-fix.md >/dev/null 2>&1; then
             echo "::error::.opencode/agents/sre-fix.md is tracked in this repository; the package writes its own agent there, remove or rename yours"
             exit 1

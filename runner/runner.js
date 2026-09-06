@@ -345,6 +345,22 @@ async function prepareCheckout(config, job, repo) {
   await git(['-C', dir, 'checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
   await git(['-C', dir, 'clean', '-fd']);
 
+  // opencode reads configuration and plugins out of the repository it runs in
+  // and merges ours over that rather than replacing it, so a checkout can
+  // reorder our fences into uselessness, and a file under .opencode/plugin
+  // runs before any gate is consulted. The checkout loses those paths before
+  // the agent starts. This runs after the clean, or the clean would restore
+  // them.
+  const stripped = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'strip_repo_config.sh'), dir], {
+    env: gitEnv(),
+  });
+  if (stripped.code !== 0) {
+    throw new Error(`the checkout could not be stripped of its own opencode configuration: ${redact(stripped.stderr).trim()}`);
+  }
+  for (const line of stripped.stdout.split('\n')) {
+    if (line.trim().startsWith('removed ')) log('warn', `${repo.fullName}: ${line.trim()}`);
+  }
+
   const tracked = await runProcess('git', ['-C', dir, 'ls-files', '--error-unmatch', '.opencode/agents/sre-fix.md'], {
     env: gitEnv(),
   });
