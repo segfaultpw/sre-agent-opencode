@@ -36,6 +36,11 @@ const HTTP_TIMEOUT_MS = 30_000;
 // has a bound. Only the agent's is the operator's to set.
 const PROCESS_TIMEOUT_MS = 600_000;
 const KILL_GRACE_MS = 5_000;
+// After the kill, how long to wait for the pipes to close before answering
+// anyway. A grandchild in its own session survives the group kill and holds
+// them, and "close" waits for both the exit and the pipes, so waiting for it
+// means never reporting at all.
+const ABANDON_GRACE_MS = 2_000;
 
 // The same shapes the CI door uses, so a pull request from either door carries
 // the same two lines: scripts/decline_comment.sh and fix.yml's marking step
@@ -176,10 +181,15 @@ function runProcess(command, args, options = {}) {
     let timedOut = false;
     let killTimer = null;
     let graceTimer = null;
+    let abandonTimer = null;
+    let settled = false;
 
     const done = (result) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(killTimer);
       clearTimeout(graceTimer);
+      clearTimeout(abandonTimer);
       resolve(result);
     };
 
@@ -204,7 +214,24 @@ function runProcess(command, args, options = {}) {
       killTimer = setTimeout(() => {
         timedOut = true;
         killGroup(child.pid, 'SIGTERM');
-        graceTimer = setTimeout(() => killGroup(child.pid, 'SIGKILL'), KILL_GRACE_MS);
+        graceTimer = setTimeout(() => {
+          killGroup(child.pid, 'SIGKILL');
+          // "close" needs the child gone AND every pipe closed, and a
+          // grandchild that put itself in another session survives the group
+          // kill while still holding them. Waiting for that event is waiting
+          // for ever, and a request that is never reported is the one failure
+          // the platform cannot tell apart from a runner that never existed:
+          // it waits out its 45 minute sweep and tells the customer nobody
+          // answered. So the timeout answers on its own, lets go of the
+          // pipes, and says that something may still be running.
+          abandonTimer = setTimeout(() => {
+            child.stdout.destroy();
+            child.stderr.destroy();
+            child.stdin.destroy();
+            child.unref();
+            done({ code: null, signal: 'SIGKILL', stdout, stderr, timedOut: true, abandoned: true });
+          }, ABANDON_GRACE_MS);
+        }, KILL_GRACE_MS);
       }, timeoutMs);
     }
 
@@ -457,6 +484,7 @@ async function runAgent(config, workspace, brief) {
   return {
     code: result.code,
     timedOut: result.timedOut,
+    abandoned: Boolean(result.abandoned),
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
     stderr: result.stderr,
@@ -687,6 +715,14 @@ async function handleJob(config, job) {
     if (agent.timedOut) {
       result.summary = `The agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds) and nothing was published.`;
       result.evidence.timed_out = true;
+      if (agent.abandoned) {
+        // Reported rather than hidden: the operator is the only one who can
+        // go and look, and a process still holding the pipes after a kill is
+        // usually one that put itself in another session.
+        result.summary = `${result.summary} A process it started did not exit and may still be running on this machine.`;
+        result.evidence.abandoned_process = true;
+        log('warn', `handoff ${job.handoff_id}: a process outlived the kill and the pipes stayed open; reported anyway`);
+      }
       return;
     }
 
@@ -767,8 +803,19 @@ async function main() {
       if (error.fatal) throw error;
       log('error', error.message);
     }
-    for (const job of jobs) {
-      await handleJob(config, job);
+    // One job per poll, and the poll comes back immediately while there is
+    // more work. The platform's sweep bound runs from dispatch on every job it
+    // handed over, not from the moment this runner got to it, so working a
+    // batch in series spends the second job's bound on the first: it would be
+    // swept mid-run, its report refused, and its pull request left in the
+    // customer's repository with nothing pointing at it. Leaving the rest in
+    // the queue costs one round trip and loses nothing, since a job is only
+    // taken when its brief is fetched.
+    if (jobs.length > 1) {
+      log('info', `the queue answered with ${jobs.length} requests; taking one and polling again for the rest`);
+    }
+    if (jobs.length > 0) {
+      await handleJob(config, jobs[0]);
     }
     if (config.once) return;
   }

@@ -176,7 +176,10 @@ run_once() {
   : > "$opencode_log"
   out="$work/$1.out"
   rc=0
-  env SRE_ONCE=1 \
+  # A wall clock around every case, because the failure this bound catches is
+  # a pass that never returns: the one shape where the platform is told the
+  # runner never answered while it is sitting there alive.
+  timeout 120 env SRE_ONCE=1 \
     SRE_SERVER_URL="$server_url" \
     SRE_API_KEY="$runner_api_key" \
     SRE_MODEL="$model" \
@@ -374,6 +377,49 @@ if [ -f "$workspace/acme/app/.opencode/agents/sre-fix.md" ]; then echo "ok   the
 if grep -q 'removed opencode.json' "$out"; then echo "ok   the runner says what it removed and why"; else echo "FAIL the removal is not in the log: $(cat "$out")"; fail=1; fi
 if ! jq -e '.evidence.changed_files | index("opencode.json")' <<<"$report" >/dev/null; then echo "ok   no pull request carries the deletion of the repository's configuration"; else echo "FAIL the report staged a deletion: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the agent's own change is still what the pull request carries"; else echo "FAIL evidence: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 19. a process that outlives the kill still gets the request reported ---"
+# The worst shape this program has: the agent's grandchild puts itself in
+# another session, survives the group kill and keeps the pipes open, so the
+# child's "close" event never arrives. Waiting for it means no report at all,
+# and the platform then waits out its 45 minute sweep and tells the customer
+# nobody answered while the runner is sitting there alive. The wall clock in
+# run_once is what turns that back into a failure here.
+start_fixture escaped
+queue_one h-escaped acme/app
+export STUB_OPENCODE_MODE=escape STUB_OPENCODE_SLEEP=120
+run_once escaped
+unset STUB_OPENCODE_SLEEP
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ]; then echo "ok   the pass returns rather than waiting on a pipe nobody will close"; else echo "FAIL exited $rc, which is the wall clock: $(tail -3 "$out")"; fail=1; fi
+if [ "$(count_path /report)" -eq 1 ]; then echo "ok   the request is reported"; else echo "FAIL the request was never reported"; fail=1; fi
+if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   it is reported as not validated"; else echo "FAIL outcome: $report"; fail=1; fi
+if jq -e '.evidence.timed_out' <<<"$report" >/dev/null; then echo "ok   the report says the run hit its time bound"; else echo "FAIL evidence: $report"; fail=1; fi
+if jq -e '.evidence.abandoned_process' <<<"$report" >/dev/null; then echo "ok   the report says a process may still be running on the machine"; else echo "FAIL evidence: $report"; fail=1; fi
+if ! grep -q ' push ' "$git_log"; then echo "ok   nothing is published from a run that was killed"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
+pkill -f 'sleep 120' 2>/dev/null || true
+stop_fixture
+
+echo "--- 20. a queue answering two requests is worked one at a time ---"
+# The platform's 45 minute sweep runs from dispatch on every job it handed
+# over, so a batch worked in series spends the second job's bound on the
+# first: swept mid-run, report refused, pull request orphaned. The runner
+# takes one and polls again.
+start_fixture batch
+jq -n --arg base "$server_url" --arg token "$handoff_token" \
+  '[{handoff_id: "h-first", subject_id: "11111111-2222-3333-4444-555555555555", repo_full_name: null,
+     brief_url: ($base + "/api/handoffs/h-first/brief"), report_url: ($base + "/api/handoffs/h-first/report"), token: $token},
+    {handoff_id: "h-second", subject_id: "22222222-3333-4444-5555-666666666666", repo_full_name: null,
+     brief_url: ($base + "/api/handoffs/h-second/brief"), report_url: ($base + "/api/handoffs/h-second/report"), token: $token}]' > "$queue_file"
+export STUB_OPENCODE_MODE=diagnose
+run_once batch
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ]; then echo "ok   a two request answer exits 0"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if [ "$(count_path /report)" -eq 1 ]; then echo "ok   exactly one request is worked in the pass"; else echo "FAIL $(count_path /report) reports were posted"; fail=1; fi
+if [ "$(count_path /brief)" -eq 1 ]; then echo "ok   only that request's brief is fetched, so the other is not taken"; else echo "FAIL $(count_path /brief) briefs were fetched"; fail=1; fi
+if jq -r 'select(.path | endswith("/report")) | .path' "$fixture_log" | grep -q 'h-first'; then echo "ok   the one worked is the first the queue offered"; else echo "FAIL the wrong request was worked"; fail=1; fi
+if grep -q 'taking one and polling again' "$out"; then echo "ok   the log says the rest were left for the next poll"; else echo "FAIL the log does not say what happened to the other request: $(cat "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 18. a credential in the agent's own message is redacted like any other line ---"

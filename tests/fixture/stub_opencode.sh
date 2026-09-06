@@ -74,6 +74,16 @@ case "$mode" in
   hang)
     sleep "${STUB_OPENCODE_SLEEP:-60}"
     ;;
+  escape)
+    # A grandchild in a session of its own, holding the pipes this process's
+    # death would otherwise close. The runner kills the process group, which
+    # misses it, so the child's "close" event never arrives: the shape where
+    # waiting for the stream to end means never reporting the request at all.
+    # setsid is what puts it outside the group. A plain background job would
+    # be killed with its parent and would prove nothing.
+    setsid sleep "${STUB_OPENCODE_SLEEP:-120}" &
+    sleep "${STUB_OPENCODE_SLEEP:-120}"
+    ;;
   *)
     echo "unknown stub mode: $mode" >&2
     exit 9
