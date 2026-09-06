@@ -54,6 +54,15 @@ case "$mode" in
   nochange)
     emit "Read the brief and the repository and found the behaviour already correct on this branch."
     ;;
+  leak)
+    # An agent that writes a credential into its own final message. That
+    # message becomes the report's summary and the pull request body, so it
+    # has to go through the same redaction as the lines the runner writes
+    # itself. The value arrives in STUB_OPENCODE_LEAK, because the runner's
+    # own variables are stripped from this process.
+    printf 'a line the fix added\n' >> README.md
+    emit "Raised the pool ceiling. For the record the token is ${STUB_OPENCODE_LEAK:-nothing}."
+    ;;
   provider_error)
     # What a wrong or exhausted provider key looks like, and the commonest way
     # a real run ends without an answer: an error event and a non-zero exit,

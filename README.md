@@ -236,14 +236,14 @@ The unit runs as its own account with `NoNewPrivileges`, `ProtectSystem=strict`,
 5. It runs `opencode run --agent sre-fix` once, with the brief on stdin and this package's configuration passed in through the environment, bounded by `SRE_RUN_TIMEOUT_SECONDS`. Its own credentials are removed from that process's environment first: the agent has a shell and needs none of them.
 6. It stages everything the agent left and runs [`scripts/protected_paths.sh`](scripts/protected_paths.sh) over the staged list, the gate the CI door runs on the pull request's files. A change touching `.github/`, an env file, a path containing `secrets` or a `.pem` key publishes nothing, and the report names the paths.
 7. It commits, pushes the branch with `SRE_GITHUB_TOKEN`, and opens a draft pull request whose body is the agent's own message plus the card's marker line and this package's version stamp. Where draft pull requests are not available it opens a normal one, rather than leaving a pushed branch nobody is looking at.
-8. It reports the answer. **The outcome is always `not_validated`, a pull request notwithstanding**, and the summary says the change is an unmerged draft that nothing has verified in a running system. The runner cannot deploy, so it cannot validate; `validated_fixed` belongs to a door that checked a fix where it runs. SRE Agent posts the answer as a comment on the card and links the pull request to it.
+8. It reports the answer. **The outcome is always `not_validated`, a pull request notwithstanding**, and the summary says the change is an unmerged pull request that nothing has verified in a running system. The runner cannot deploy, so it cannot validate; `validated_fixed` belongs to a door that checked a fix where it runs. SRE Agent posts the answer as a comment on the card and links the pull request to it.
 
 Every other ending reports the same outcome with what happened: the agent declined and why, the agent left the working tree unchanged, the gate refused the paths it names, the run hit its time bound, opencode exited non-zero with its provider's error, or the runner itself failed. Read a card comment as an answer to look at, never as a claim that the problem is solved.
 
 ### When the runner is offline
 
 - **A request that arrives while it is down** does not wait for it. Past five minutes without a poll the runner is not routable, and the request runs on SRE Agent's own agent instead, with the reason on the card. A repository set to "Self-hosted runner" behaves the same way.
-- **A request collected by a runner that then dies** is failed by SRE Agent 45 minutes after it was queued, and the handoff is closed with it, so a runner that wakes up late cannot report into a request that already has an answer. Nothing was pushed, because the push is the last step.
+- **A request collected by a runner that then dies** is failed by SRE Agent 45 minutes after it was queued, and the handoff is closed with it, so a runner that wakes up late cannot report into a request that already has an answer. Nothing reaches your default branch, and nothing is reported. A runner that died in the seconds between its push and the pull request can leave a branch named `sre-agent/<handoff id>` behind with no pull request on it, which is the one artefact of a dead run and is safe to delete.
 - **A restart mid-poll** loses nothing: the next poll collects the same request.
 - **A key the queue refuses** stops the runner instead of retrying: HTTP 401 or 403 exits with a message naming `SRE_API_KEY` and the scope it needs.
 
@@ -256,11 +256,11 @@ The permission fences are this package's, and [What the agent may and may not do
 
 What holds regardless of anything the agent does in that shell:
 
-- The runner is the only thing on the machine that touches git or the network. The agent cannot push, fetch a URL, search the web, spawn a subagent or work outside the checkout, which is why none of those denies had to be relaxed for this door.
+- The runner does the git and the network work, so no fence had to be relaxed for this door. opencode's own tool gates hold absolutely: web fetch, web search and subagents are off, and the file tools cannot leave the checkout. The shell is where that ends: `git push`, `curl`, `wget`, `ssh` and `scp` are refused as commands, in every prefixed and wrapped form this package could name, and an interpreter is still an interpreter. Read the bullet above rather than this one for what bounds that.
 - The protected paths gate judges what actually changed rather than which tool changed it, before anything is pushed.
-- Nothing merges without a person. The pull request is a draft, and your own review and CI stand between it and the default branch.
+- Nothing merges without a person. Your own review and CI stand between the pull request and the default branch. It is opened as a draft where your plan offers draft pull requests, and as an ordinary one where it does not, so treat the draft state as a convenience rather than as the control.
 - The runner strips its poll key and its repository token out of the agent's environment. The provider key stays, because opencode needs it to call the model.
-- The poll key, the repository token and the handoff token are redacted from every log line and every report, including the ones a failing `git` or `gh` prints itself. The runner logs into your aggregator, and a handoff token there would be live for 24 hours.
+- The poll key, the repository token and the handoff token are replaced with `[redacted]` in every line the runner writes: its own logs, the ones a failing `git` or `gh` prints, and the agent's own message where it becomes the report, the card comment and the pull request body. The runner logs into your aggregator, and a handoff token there would be live for 24 hours. Those three are the set: the provider key is passed through to opencode by the variable your provider names, and the runner never learns which one that is, so nothing can replace it if the agent prints it.
 
 ### Cost
 

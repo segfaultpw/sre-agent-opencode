@@ -690,6 +690,12 @@ async function handleJob(config, job) {
       return;
     }
 
+    // The agent's own message travels furthest of anything this runner
+    // produces: it becomes the report's summary, the card comment and the
+    // pull request body. It goes through the same redaction as the lines the
+    // runner writes itself, or a credential the agent happened to print would
+    // be the one place the redaction did not reach.
+    agent.finalMessage = redact(agent.finalMessage);
     result.summary = agent.finalMessage || 'The agent produced no final message.';
 
     if (agent.code !== 0) {
@@ -733,7 +739,7 @@ async function handleJob(config, job) {
     // pass, so its own message says what it ran; that is a claim about the
     // checkout, not about the running system, and the change is an unmerged
     // draft until a person merges it.
-    result.summary = `${result.summary}\n\nThis is an unmerged draft pull request, ${result.pr_url}. Nothing has verified the change in a running system.`;
+    result.summary = `${result.summary}\n\nThis is an unmerged pull request, ${result.pr_url}. Nothing has verified the change in a running system.`;
     log('info', `opened ${result.pr_url} for handoff ${job.handoff_id}`);
   } catch (error) {
     result.summary = `The runner could not complete this request: ${redact(error.message)}`;

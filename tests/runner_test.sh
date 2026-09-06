@@ -221,7 +221,7 @@ if grep -q 'pr create --repo acme/app --base main --head sre-agent/h-targeted' "
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the pull request body carries the marker from the brief and the version stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the report's pr_url is the pull request gh opened"; else echo "FAIL report: $report"; fail=1; fi
 if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a delivered pull request is reported as not_validated, carrying the pull request"; else echo "FAIL outcome: $report"; fail=1; fi
-if jq -e '.summary | test("unmerged draft pull request")' <<<"$report" >/dev/null; then echo "ok   the summary says the change is an unmerged draft nothing has verified"; else echo "FAIL summary: $report"; fail=1; fi
+if jq -e '.summary | test("unmerged pull request")' <<<"$report" >/dev/null; then echo "ok   the summary says the change is an unmerged pull request nothing has verified"; else echo "FAIL summary: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the report names what changed"; else echo "FAIL evidence: $report"; fail=1; fi
 
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"
@@ -374,6 +374,23 @@ if [ -f "$workspace/acme/app/.opencode/agents/sre-fix.md" ]; then echo "ok   the
 if grep -q 'removed opencode.json' "$out"; then echo "ok   the runner says what it removed and why"; else echo "FAIL the removal is not in the log: $(cat "$out")"; fail=1; fi
 if ! jq -e '.evidence.changed_files | index("opencode.json")' <<<"$report" >/dev/null; then echo "ok   no pull request carries the deletion of the repository's configuration"; else echo "FAIL the report staged a deletion: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the agent's own change is still what the pull request carries"; else echo "FAIL evidence: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 18. a credential in the agent's own message is redacted like any other line ---"
+# The agent's message travels furthest of anything the runner produces: the
+# report's summary, the card comment and the pull request body. The runner's
+# own credentials are stripped from the agent's environment, so this is the
+# unlikely path rather than the likely one, and it is the path the claim
+# "redacted from every report" is about.
+start_fixture leak
+queue_one h-leak acme/app
+export STUB_OPENCODE_MODE=leak STUB_OPENCODE_LEAK="$github_token"
+run_once leak
+unset STUB_OPENCODE_LEAK
+export STUB_OPENCODE_MODE=fix
+if ! jq -r '.summary' <<<"$report" | grep -qF "$github_token"; then echo "ok   a credential the agent printed does not reach the report"; else echo "FAIL the report carried a credential the agent printed: $report"; fail=1; fi
+if jq -r '.summary' <<<"$report" | grep -qF '[redacted]'; then echo "ok   the summary says where the credential was"; else echo "FAIL summary: $report"; fail=1; fi
+if ! grep -qF "$github_token" "$gh_body"; then echo "ok   the pull request body carries the redacted message"; else echo "FAIL the pull request body carried a credential"; fail=1; fi
 stop_fixture
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
