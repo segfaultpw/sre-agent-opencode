@@ -4,6 +4,8 @@ Versions follow semantic versioning. The major tag (`v1`) moves to every release
 
 ## Unreleased
 
+## v1.1.0
+
 A run that declines now marks its comment. When the action opened no pull request and left a comment beginning `Declined:` on the tracking issue, the workflow appends the issue's marker line and the version stamp to that comment, as it already does to a pull request body. SRE Agent ends the remediation the marker names; a decline without one fell back to the most recently dispatched request, which is the wrong one when a request was superseded while the run was going. An issue body carrying no marker leaves the comment as the action wrote it.
 
 `scripts/install.sh` installs the caller workflow across an organization. Given an owner and either a list of repositories or `--all`, it skips a repository whose `.github/workflows/opencode.yml` is already byte-identical to the file it would write, commits it on the default branch otherwise, and opens a pull request instead when that branch is protected. It reports every prerequisite once with the command that closes it, and refuses before the first write when one is missing: the token's `workflow` scope, the opencode App installation or the Actions pull request policy, the provider secret, and the `SRE_AGENT_BOT_LOGIN` variable. `--dry-run` writes nothing.
