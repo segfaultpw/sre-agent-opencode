@@ -152,24 +152,64 @@ cmd_probe 'rm -r -f /var/lib/app' deny
 cmd_probe 'rm -f -r /var/lib/app' deny
 cmd_probe 'rm --recursive --force /var/lib/app' deny
 cmd_probe 'rm --force --recursive /var/lib/app' deny
+# -R is a valid rm flag and the lower-case family did not cover it.
+cmd_probe 'rm -fR /var/lib/app' deny
+cmd_probe 'rm -Rf /var/lib/app' deny
+cmd_probe 'rm -R /var/lib/app' deny
 
 # gh, the ninth. In CI the agent's environment holds GITHUB_TOKEN, so this is
 # not a convenience: it is the way around the git push deny and the protected
 # paths gate both, since the agent could merge its own pull request. On the
 # runner door the deny is the second line, the first being that the runner
 # deletes GH_TOKEN and GITHUB_TOKEN from the environment it starts it in.
+#
+# One pattern per way of invoking it. Every form below denies:
 cmd_probe 'gh pr merge 7 --squash' deny
 cmd_probe 'gh api -X PUT repos/acme/app/branches/main/protection' deny
+cmd_probe "'gh' api /repos/acme/app" deny
+cmd_probe '"gh" api /repos/acme/app' deny
 cmd_probe 'GH_TOKEN=x gh pr merge 7' deny
 cmd_probe 'env gh pr merge 7' deny
+cmd_probe '/usr/bin/env gh pr merge 7' deny
 cmd_probe '/usr/bin/gh pr merge 7' deny
+cmd_probe './gh pr merge 7' deny
 cmd_probe 'sudo gh pr merge 7' deny
-# The other direction, which is why it is not written "*gh *": those two
-# letters sit inside ordinary words an agent has every reason to type.
+# A backslash form costs nothing to cover: the matcher replaces a backslash
+# with a slash in the resource as well as in the pattern, so the path pattern
+# sees it.
+cmd_probe '\gh api /repos/acme/app' deny
+# And the other direction, which is what the invocation forms buy. "*gh *"
+# denies "echo high five", and "* gh *" denies these three, each of which the
+# agent has every reason to type while running the repository's own build.
+cmd_probe 'grep gh file' allow
+cmd_probe 'cat vendor/gh readme' allow
+cmd_probe 'git commit -m "fix gh actions"' allow
 cmd_probe 'echo high five' allow
 cmd_probe 'grep -r highlight src' allow
 cmd_probe 'npm run build:gh-pages' allow
 cmd_probe 'mix test --only ghost' allow
+# The cost of the quoted patterns, in the open: a quoted search for those two
+# letters is refused. It is the direction to be wrong in, and "grep gh file"
+# above is the form that matters.
+cmd_probe "grep 'gh' file" deny
+# The path patterns anchor at the first character, so a path that is an
+# argument rather than the command stays allowed, absolute or not.
+cmd_probe 'cat /usr/share/doc/gh readme' allow
+# The two subcommands that carry the escalation are refused wherever they
+# appear, which closes the forms no invocation pattern reaches: a relative
+# path with no leading dot, and an interpreter. api is the universal one,
+# since every REST call including a merge goes through it.
+cmd_probe 'bin/gh api /repos/acme/app' deny
+cmd_probe 'sh -c "gh pr merge 7"' deny 'an interpreter running gh'
+# A substitution that resolves the binary is its own command, and it is
+# refused there: nothing needs to locate gh except something about to run it.
+cmd_probe '$(which gh) api /repos/acme/app' deny 'a substitution that resolves gh'
+cmd_probe 'GH=$(command -v gh)' deny 'a substitution that stores the path'
+# What remains open is the class the README names rather than a new one: an
+# interpreter chain that both resolves the binary another way and uses a
+# subcommand other than api or pr. A pattern list does not reach that, and
+# the boundary is the token the door hands the job, not this list.
+cmd_probe 'sh -c "$0 secret list" /usr/bin/gh' allow 'an interpreter given the path as an argument'
 
 # The same words inside another command's arguments, which this shape has to
 # leave alone or an ordinary build would be refused.

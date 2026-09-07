@@ -58,9 +58,13 @@ expect '.permission.bash["*wget *"]' deny
 expect '.permission.bash["*ssh *"]' deny
 expect '.permission.bash["*scp *"]' deny
 expect '.permission.bash["*rm -rf *"]' deny
-# The same careless step with its flags transposed, split, or spelled out.
+# The same careless step with its flags transposed, split, spelled out, or
+# capitalised: -R is a valid rm flag and was allowed while -r was refused.
 expect '.permission.bash["*rm -fr *"]' deny
+expect '.permission.bash["*rm -fR *"]' deny
+expect '.permission.bash["*rm -Rf *"]' deny
 expect '.permission.bash["*rm -r *"]' deny
+expect '.permission.bash["*rm -R *"]' deny
 expect '.permission.bash["*rm -f *"]' deny
 expect '.permission.bash["*rm --recursive*"]' deny
 expect '.permission.bash["*rm --force*"]' deny
@@ -69,14 +73,40 @@ expect '.permission.bash["*sudo *"]' deny
 # convenience: fix.yml puts GITHUB_TOKEN in the agent's environment, so
 # "gh pr merge" and "gh api -X PUT" walk around the git push deny and the
 # protected paths gate both, and the agent could merge its own pull request.
-# Three patterns rather than one "*gh *", which would deny "echo high five":
-# the bare form, one with the space an environment prefix or a wrapper leaves
-# in front of it, and one for an absolute path. On the runner door this is the
-# second line, the first being that the runner deletes GH_TOKEN and
-# GITHUB_TOKEN from the environment it starts the agent in.
+#
+# One pattern per way of INVOKING it, rather than one for the two letters.
+# "*gh *" denies "echo high five", and "* gh *" denies "grep gh file" and a
+# commit message mentioning gh, which the agent has every reason to type while
+# running the repository's own build. So: the bare form, both quoted forms
+# (which slipped past all three of the previous patterns), any path form, an
+# environment-variable prefix, and the env wrapper. "sudo gh" is covered by
+# the sudo deny, and a backslash form is covered by the path one, since the
+# matcher replaces a backslash with a slash in the resource as well as in the
+# pattern. On the runner door this is the second line, the first being that
+# the runner deletes GH_TOKEN and GITHUB_TOKEN from the environment it starts
+# the agent in.
 expect '.permission.bash["gh *"]' deny
-expect '.permission.bash["* gh *"]' deny
-expect '.permission.bash["*/gh *"]' deny
+expect ".permission.bash[\"*'gh' *\"]" deny
+expect '.permission.bash["*\"gh\" *"]' deny
+expect '.permission.bash["/*gh *"]' deny
+expect '.permission.bash[".*/gh *"]' deny
+expect '.permission.bash["*=* gh *"]' deny
+expect '.permission.bash["*env gh *"]' deny
+# The path forms anchor at the first character, because "*/gh *" denies
+# "cat vendor/gh readme", where the path is an argument rather than the
+# command. What that leaves open is a relative path with no leading dot, and
+# an interpreter or a substitution producing the path, so the two subcommands
+# that carry the escalation are denied wherever they appear: api is the
+# universal one, since every REST call including a merge goes through it, and
+# pr is the direct one.
+expect '.permission.bash["*gh api *"]' deny
+expect '.permission.bash["*gh pr *"]' deny
+# And the three ways a shell is asked where the binary is, since a
+# substitution that resolves it is its own command and can be refused there.
+# Nothing needs to locate gh except something about to run it.
+expect '.permission.bash["*which gh*"]' deny
+expect '.permission.bash["*command -v gh*"]' deny
+expect '.permission.bash["*type -p gh*"]' deny
 # The mutating denies matter to a runner on a customer's machine, where the
 # role the machine holds can reach live systems. They are a second line: the
 # boundary is that role, and the read-only posture comes from granting one.
