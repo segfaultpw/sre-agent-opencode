@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Appends the tracking issue's marker line, and the version stamp, to the
-# comment the action left when the run declined, the way the post-step
-# appends both to a pull request body. SRE Agent ends the remediation row the
-# marker names; a decline without one falls back to the newest dispatched row,
-# which is the wrong row when the request was superseded while the run was
-# going. The comment edited is the newest one beginning "Declined:" that this
-# run's clock covers, and an issue body carrying no marker leaves the comment
-# exactly as the action wrote it: the stamp alone tells the platform nothing
-# and the comment is on the customer's issue.
+# comment left when the run declined, the way the post-step appends both to a
+# pull request body. It is not what names the request to SRE Agent, which
+# reads a decline off the comment as it was created and skips every edited
+# delivery: on the dispatch door the workflow posts the marker with the
+# comment, and on the comment door the action writes the comment and no step
+# can. What this is for is the issue itself, where it says which request the
+# run answered and which version of the package answered it. The comment
+# edited is the newest one beginning "Declined:" that this run's clock covers,
+# and an issue body carrying no marker leaves the comment exactly as it was
+# written: the stamp alone says nothing the run's log does not, and the
+# comment sits on the customer's issue.
 set -euo pipefail
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"

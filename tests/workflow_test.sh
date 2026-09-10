@@ -80,8 +80,12 @@ check 'pull_requests=0' 'the marking step reports a run that opened none'
 check '- name: Mark the decline comment for SRE Agent' 'the decline step exists'
 check 'bash /tmp/sre-agent-decline_comment.sh' 'the decline step runs the fetched script'
 
+# The candidate count guards this step as well. A dispatched run whose own
+# decline was suppressed left no comment to finish, and the script edits the
+# newest "Declined:" comment this run's clock covers, which would then be
+# somebody else's.
 decline="$(awk '/- name: Mark the decline comment for SRE Agent/ { found = 1; next } found && /^ *if:/ { print; exit }' "$wf")"
-for needle in '!inputs.dry_run' "env.ISSUE_NUMBER != ''" "steps.mark.outputs.pull_requests == '0'"; do
+for needle in '!inputs.dry_run' "env.ISSUE_NUMBER != ''" "steps.mark.outputs.pull_requests == '0'" "steps.mark.outputs.candidates == '0'"; do
   if [[ "$decline" == *"$needle"* ]]; then
     echo "ok   the decline step's guard names $needle"
   else
@@ -275,6 +279,14 @@ if [[ "$mark_block" == *'::warning::'* ]] && [[ "$mark_block" == *'candidates.js
 else
   echo "FAIL the marking step is silent when every candidate belongs to another run"; fail=1
 fi
+# The count of candidates, beside the count of this run's own, because the
+# decline step needs both to tell a run that opened nothing from a run whose
+# own pull request it could not recognise.
+if [[ "$mark_block" == *'echo "candidates='* ]]; then
+  echo "ok   the marking step publishes how many candidates it saw"
+else
+  echo "FAIL the marking step reports no candidate count for the decline step to read"; fail=1
+fi
 
 # The gate closes every candidate, because a protected path has to be closed
 # whichever run opened it, and fails only on this run's own, because failing
@@ -310,11 +322,42 @@ for step in 'Read the brief from the issue' 'React to the comment the relay answ
 done
 
 # The decline the action cannot post on a dispatched run, in the shape the
-# platform ends a request on, before the step that appends the marker to it.
+# platform ends a request on, and carrying the marker line already. SRE Agent
+# reads a decline off the comment as CREATED and skips every edited delivery,
+# so a marker appended by the step below reaches it on no door: without one in
+# the body as posted, the decline ends the newest live request on the issue
+# rather than the one that asked.
 check '- name: Decline on the issue when the run opened no pull request' 'a dispatched run that opened no pull request declines on the issue'
-check "--body \"Declined: the run opened no pull request; the agent's answer is in the run log" 'the decline carries the prefix the platform reads and links the run'
+check "body=\"Declined: the run opened no pull request; the agent's answer is in the run log \${run_url}\"" 'the decline carries the prefix the platform reads and links the run'
+post_block="$(step_block 'Decline on the issue when the run opened no pull request')"
+if [[ "$post_block" == *"grep -oE '<!-- sre-agent:remediation:[^>]*-->'"* ]]; then
+  echo "ok   the decline reads the marker off the issue body the way the marking step does"
+else
+  echo "FAIL the decline extracts no marker from the issue body (got '${post_block}')"; fail=1
+fi
+if [[ "$post_block" == *'"${marker}"'* ]] && [[ "$post_block" == *'--body "$body"'* ]]; then
+  echo "ok   the marker is in the body the decline is posted with"
+else
+  echo "FAIL the decline is not posted with the body the marker was added to (got '${post_block}')"; fail=1
+fi
+for needle in 'steps.brief.outputs.body' 'github.event.issue.body'; do
+  if [[ "$post_block" == *"$needle"* ]]; then
+    echo "ok   the decline step reads the issue body from the environment, ${needle} included"
+  else
+    echo "FAIL the decline step does not pass ISSUE_BODY from ${needle} (got '${post_block}')"; fail=1
+  fi
+done
+# The version stamp is left to the step that edits the comment. The reason
+# SRE Agent quotes onto the card is this body with the marker line removed and
+# nothing else removed, so a stamp written here would be read as part of what
+# the run said.
+if [[ "$post_block" != *'sre-agent-opencode:'* ]]; then
+  echo "ok   the posted decline carries no version stamp for the platform to quote"
+else
+  echo "FAIL the posted decline carries the version stamp (got '${post_block}')"; fail=1
+fi
 decline_post_guard="$(awk '/- name: Decline on the issue when the run opened no pull request/ { found = 1; next } found && /^ *if:/ { print; exit }' "$wf")"
-for needle in '!inputs.dry_run' "github.event_name == 'workflow_dispatch'" "env.ISSUE_NUMBER != ''" "steps.mark.outputs.pull_requests == '0'"; do
+for needle in '!inputs.dry_run' "github.event_name == 'workflow_dispatch'" "env.ISSUE_NUMBER != ''" "steps.mark.outputs.pull_requests == '0'" "steps.mark.outputs.candidates == '0'"; do
   if [[ "$decline_post_guard" == *"$needle"* ]]; then
     echo "ok   the decline step's guard names $needle"
   else

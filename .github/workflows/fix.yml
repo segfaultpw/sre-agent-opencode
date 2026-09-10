@@ -394,13 +394,16 @@ jobs:
           # would put this run's card key and marker line on it, and the
           # platform would adopt the wrong one.
           jq -c 'select(.mine)' "$RUNNER_TEMP/candidates.jsonl" > "$RUNNER_TEMP/prs.jsonl"
-          # The count is this step's verdict on which outcome the run had, and
-          # the decline step reads it: a run that opened a pull request has
-          # nothing to mark on the issue.
+          # Both counts are this step's verdict on which outcome the run had,
+          # and the decline step reads both: a run that opened a pull request
+          # has nothing to mark on the issue, and a run that saw candidates it
+          # could not claim may well have opened one of them.
+          candidates="$(grep -c '' "$RUNNER_TEMP/candidates.jsonl" || true)"
+          echo "candidates=${candidates}" >> "$GITHUB_OUTPUT"
           if [ ! -s "$RUNNER_TEMP/prs.jsonl" ]; then
             echo "pull_requests=0" >> "$GITHUB_OUTPUT"
-            if [ -s "$RUNNER_TEMP/candidates.jsonl" ]; then
-              echo "::warning::$(grep -c '' "$RUNNER_TEMP/candidates.jsonl") pull request(s) were opened on a dispatch branch while this run was going and none of them links this run, so none was marked. A run link the action stopped writing would look exactly like this."
+            if [ "$candidates" -gt 0 ]; then
+              echo "::warning::${candidates} pull request(s) were opened on a dispatch branch while this run was going and none of them links this run, so none was marked. A run link the action stopped writing would look exactly like this."
             fi
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
@@ -441,31 +444,60 @@ jobs:
       # request on a comment beginning "Declined:" written by this token's
       # identity, which is what the shape below is; only the reason is
       # generic, because the action exposes the agent's answer nowhere but the
-      # run's log, and the comment links it. The step after this one appends
-      # the marker line and the version stamp, exactly as it does to the
-      # action's own decline on the comment door.
+      # run's log, and the comment links it.
+      #
+      # The marker line goes in at creation. The platform reads a decline off
+      # the comment as it was created and skips every edited delivery, so the
+      # marker the step below appends reaches it on no door, and a decline
+      # naming no request ends the newest live one on the issue instead, which
+      # is the wrong one when the request was superseded while the run was
+      # going. The version stamp is left to that step: the reason the platform
+      # quotes onto the card is this body with the marker line taken out and
+      # nothing else taken out, so a stamp here would be read as part of what
+      # the run said.
+      #
+      # It refuses to fire when candidates existed and none of them linked
+      # this run, because that is what the action changing its run-link footer
+      # looks like from here, and a decline posted then would answer a request
+      # this run may have delivered a pull request for. The cost is a genuine
+      # decline that overlapped another dispatched run's pull request: it
+      # posts nothing, and the platform's own 45-minute sweep ends the request
+      # instead.
       - name: Decline on the issue when the run opened no pull request
-        if: ${{ !inputs.dry_run && github.event_name == 'workflow_dispatch' && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' }}
+        if: ${{ !inputs.dry_run && github.event_name == 'workflow_dispatch' && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' && steps.mark.outputs.candidates == '0' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: ${{ steps.brief.outputs.body != '' && steps.brief.outputs.body || github.event.issue.body }}
         run: |
           set -euo pipefail
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "Declined: the run opened no pull request; the agent's answer is in the run log ${run_url}"
+          body="Declined: the run opened no pull request; the agent's answer is in the run log ${run_url}"
+          marker="$(grep -oE '<!-- sre-agent:remediation:[^>]*-->' <<<"$ISSUE_BODY" | head -n 1 || true)"
+          if [ -n "$marker" ]; then
+            body="${body}"$'\n\n'"${marker}"
+          else
+            echo "no marker line in the issue body; the decline names no request and the platform falls back to the newest one on this issue"
+          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$body"
           echo "declined on issue #${ISSUE_NUMBER} with a link to this run"
 
       # A decline is the run's other ending: no pull request, and the agent's
-      # answer posted as a comment beginning "Declined:". SRE Agent ends the
-      # remediation row the marker names, so the comment carries the same
-      # marker the pull request body would have carried; without it a decline
-      # that lands after the request was superseded ends the newest dispatched
-      # row instead, which is the wrong one. It runs only when the marking
-      # step found no pull request, so a run never both delivers one and
-      # declines.
+      # answer posted as a comment beginning "Declined:". This step finishes
+      # that comment: the version stamp on both doors, and the marker line on
+      # the comment door, where the action wrote the comment and no step of
+      # ours could put one in it at creation. What the edit is for is the
+      # issue, where it says which request the run answered and which version
+      # answered it; SRE Agent reads a decline off the comment as created, so
+      # an edit is never what names the request to it. It runs only when the
+      # marking step found no pull request, so a run never both delivers one
+      # and declines, and it takes the candidate count with it: where that
+      # count suppressed the decline above, this run wrote no comment, and the
+      # newest "Declined:" one its clock covers belongs to somebody else. On
+      # the comment door the two counts are the same number, since every
+      # candidate there is this run's, so nothing changes for it.
       - name: Mark the decline comment for SRE Agent
-        if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' }}
+        if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' && steps.mark.outputs.candidates == '0' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
