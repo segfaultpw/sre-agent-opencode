@@ -4,6 +4,15 @@
 # comment on a tracking issue; this workflow hands it to the package's
 # reusable workflow, which runs opencode on your runner.
 #
+# How a run starts. A member's own /opencode comment runs the fix job
+# directly. SRE Agent's comment cannot: the opencode action asks GitHub for
+# the commenting user's collaborator permission on every run a comment
+# starts, in either identity mode, and a GitHub App holds no permission level
+# on a repository, so such a run fails before the agent reads anything. The
+# relay job below turns that comment into a workflow_dispatch of this same
+# file, which the action does not check, and the fix job runs from there with
+# the issue number as an input.
+#
 # vars.SRE_AGENT_BOT_LOGIN is a repository or organization variable holding
 # the login SRE Agent comments with, shown on the Integrations page:
 # sreagent-app[bot] for the hosted platform, or your own App's login for a
@@ -13,14 +22,52 @@ name: opencode
 on:
   issue_comment:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: The tracking issue the run answers
+        required: true
+        type: string
+      comment_id:
+        description: The comment that asked for the run
+        required: false
+        type: string
 
 jobs:
-  fix:
-    # Only SRE Agent's App and this repository's own members may start a run:
-    # anyone able to comment could otherwise spend your minutes and tokens.
+  # Only SRE Agent's App reaches this job, and starting a run is all it may
+  # do. An event created with GITHUB_TOKEN starts no further workflow, with
+  # two exceptions, and workflow_dispatch is one of them; that is what makes
+  # the relay work at all.
+  relay:
     if: |
+      github.event_name == 'issue_comment' &&
       (contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')) &&
-      (github.event.comment.user.login == vars.SRE_AGENT_BOT_LOGIN ||
+      github.event.comment.user.login == vars.SRE_AGENT_BOT_LOGIN
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Start the run through workflow_dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          set -euo pipefail
+          # GitHub registers workflow_dispatch from the copy of the file on
+          # the default branch, so that is the ref the run starts from, and
+          # the file has to be named the way the install writes it.
+          gh workflow run opencode.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+            -f issue_number="$ISSUE_NUMBER" -f comment_id="$COMMENT_ID"
+          echo "relayed issue #${ISSUE_NUMBER} to a workflow_dispatch run on ${DEFAULT_BRANCH}"
+
+  fix:
+    # The run the relay dispatched, or a member's own comment: anyone able to
+    # comment could otherwise spend your minutes and tokens.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      ((contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')) &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
     # A called workflow can only keep or reduce what its caller grants, and
     # GITHUB_TOKEN is read-only by default, so the grant has to be here.
@@ -32,6 +79,10 @@ jobs:
     uses: segfaultpw/sre-agent-opencode/.github/workflows/fix.yml@v1
     with:
       model: openrouter/deepseek/deepseek-v4-pro
+      # Both are empty on the comment door, where the event carries the issue
+      # and the action reacts to the comment itself.
+      issue_number: ${{ inputs.issue_number }}
+      comment_id: ${{ inputs.comment_id }}
       # use_github_token: true   # skip the opencode App; see the README's first install step
     secrets:
       provider_key: ${{ secrets.OPENROUTER_API_KEY }}

@@ -29,6 +29,10 @@ case "$1 $2" in
     if [ "${FAKE_GH_FAIL:-}" = "api" ]; then echo "gh: HTTP 502" >&2; exit 1; fi
     cat "$FAKE_GH_DIR/refs.txt"
     ;;
+  "api repos/acme/app/git/matching-refs/heads/opencode/dispatch-")
+    if [ "${FAKE_GH_FAIL:-}" = "api" ]; then echo "gh: HTTP 502" >&2; exit 1; fi
+    cat "$FAKE_GH_DIR/dispatch-refs.txt"
+    ;;
   "pr list")
     head=""
     while [ $# -gt 0 ]; do
@@ -90,5 +94,49 @@ if [ "$rc" -ne 0 ]; then echo "ok   a failure on the second branch fails the scr
 : > "$work/fixtures/refs.txt"
 out="$(bash "$script" 2>/dev/null)"
 if [ -z "$out" ]; then echo "ok   no branches means no pull requests"; else echo "FAIL expected no output, got: $out"; fail=1; fi
+
+# A run the relay dispatched carries no issue in its event, and the action
+# names its branch opencode/dispatch-<hex>-<timestamp>, with no issue number
+# in it. Two runs of one repository therefore see each other's branches, so
+# --mine keeps the pull request whose body links THIS run, which is the footer
+# the action writes itself. The diff gate passes no flag, because there the
+# safe direction is to inspect one pull request too many.
+cat > "$work/fixtures/dispatch-refs.txt" <<'EOF'
+refs/heads/opencode/dispatch-a1b2c3-20260909T101500
+refs/heads/opencode/dispatch-d4e5f6-20260909T101600
+EOF
+cat > "$work/fixtures/prs-opencode_dispatch-a1b2c3-20260909T101500.json" <<'EOF'
+[{"number": 51, "title": "This run", "body": "what changed\n\n[github run](/acme/app/actions/runs/555)", "isDraft": false, "createdAt": "2026-09-09T10:16:00Z", "author": {"login": "app/opencode-agent"}, "headRefName": "opencode/dispatch-a1b2c3-20260909T101500"}]
+EOF
+cat > "$work/fixtures/prs-opencode_dispatch-d4e5f6-20260909T101600.json" <<'EOF'
+[{"number": 52, "title": "Another run", "body": "what changed\n\n[github run](/acme/app/actions/runs/999)", "isDraft": false, "createdAt": "2026-09-09T10:17:00Z", "author": {"login": "app/opencode-agent"}, "headRefName": "opencode/dispatch-d4e5f6-20260909T101600"}]
+EOF
+
+dispatched=(env GITHUB_EVENT_NAME=workflow_dispatch GITHUB_RUN_ID=555)
+
+out="$("${dispatched[@]}" bash "$script" 2>/dev/null)"
+if [ "$(grep -c . <<<"$out")" -eq 2 ]; then echo "ok   a dispatched run's branches are the ones the action names dispatch"; else echo "FAIL dispatch output: $out"; fail=1; fi
+
+out="$("${dispatched[@]}" bash "$script" --mine 2>"$work/stderr")"
+if [ "$(grep -c . <<<"$out")" -eq 1 ] && [ "$(jq -r '.number' <<<"$out")" = "51" ]; then echo "ok   --mine keeps the pull request whose body links this run"; else echo "FAIL --mine output: $out"; fail=1; fi
+if grep -q 'pull request #52 .*another run' "$work/stderr"; then echo "ok   the pull request another run opened is named rather than dropped in silence"; else echo "FAIL stderr: $(cat "$work/stderr")"; fail=1; fi
+
+rc=0
+"${dispatched[@]}" bash "$script" > /dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ]; then echo "ok   a dispatched run without --mine keeps every candidate"; else echo "FAIL exit $rc without --mine"; fail=1; fi
+
+rc=0
+env GITHUB_EVENT_NAME=workflow_dispatch bash "$script" --mine >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then echo "ok   --mine without a run id is refused rather than matching nothing"; else echo "FAIL --mine ran without GITHUB_RUN_ID"; fail=1; fi
+
+# The comment door is untouched: its branch carries the issue number, and
+# --mine has nothing to narrow there.
+printf '%s\n' refs/heads/opencode/issue7-20260905T230000 > "$work/fixtures/refs.txt"
+out="$(env GITHUB_EVENT_NAME=issue_comment bash "$script" --mine 2>/dev/null)"
+if [ "$(jq -r '.number' <<<"$out")" = "42" ]; then echo "ok   the comment door answers the same with --mine"; else echo "FAIL comment door output: $out"; fail=1; fi
+
+rc=0
+bash "$script" --nope >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 2 ]; then echo "ok   an unknown flag is refused"; else echo "FAIL unknown flag exit $rc"; fail=1; fi
 
 exit $fail

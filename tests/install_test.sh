@@ -88,6 +88,10 @@ if [ "$(jq -r '.branch' <<<"$sent")" = "main" ]; then echo "ok   the commit land
 if [ "$(jq -r '.content' <<<"$sent" | base64 -d)" = "$(cat "$example")" ]; then echo "ok   the content is the example workflow"; else echo "FAIL the content is not the example"; fail=1; fi
 if [ "$(jq -r '.sha // "none"' <<<"$sent")" = "none" ]; then echo "ok   a new file is created without a sha"; else echo "FAIL a sha was sent for a file that does not exist"; fail=1; fi
 if grep -qE '^acme/app +committed' <<<"$out"; then echo "ok   the table says the repository was committed to"; else echo "FAIL table: $out"; fail=1; fi
+# What the customer receives has to hold both doors, since SRE Agent's own
+# comment reaches a run only through the relay job the file carries.
+written="$(jq -r '.content' <<<"$sent" | base64 -d)"
+if grep -q '^  relay:' <<<"$written" && grep -q '^  workflow_dispatch:' <<<"$written"; then echo "ok   the installed workflow carries the relay that starts a run from SRE Agent's comment"; else echo "FAIL the installed workflow has no relay job"; fail=1; fi
 
 # The same repository a second time: byte-identical, so nothing is written.
 reset_fixtures

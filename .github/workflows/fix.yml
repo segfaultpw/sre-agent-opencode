@@ -12,6 +12,16 @@ on:
         required: false
         type: string
         default: ""
+      issue_number:
+        description: "The tracking issue this run answers. The relay in the caller workflow sets it, because a workflow_dispatch payload carries no issue; a comment-started run leaves it empty and the event carries the issue."
+        required: false
+        type: string
+        default: ""
+      comment_id:
+        description: "The comment the relay answered, so the run can react to it. Empty on a comment-started run, which the action reacts to itself."
+        required: false
+        type: string
+        default: ""
       agent:
         description: "The primary agent opencode runs, set as its default_agent."
         required: false
@@ -57,16 +67,40 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
     # One run per issue at a time: a second comment while the first run is
-    # still open would otherwise race it on the same issue.
+    # still open would otherwise race it on the same issue. A concurrency
+    # group cannot read env, so the resolver below is written out again here.
     concurrency:
-      group: sre-agent-opencode-${{ github.repository }}-${{ github.event.issue.number || github.run_id }}
+      group: sre-agent-opencode-${{ github.repository }}-${{ inputs.issue_number != '' && inputs.issue_number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
     permissions:
       id-token: write
       contents: write
       pull-requests: write
       issues: write
+    env:
+      # The issue this run answers, from whichever door started it: the relay
+      # passes it as an input because a workflow_dispatch payload has no issue
+      # in it, and a comment carries it in the event. Every step below reads
+      # this one value, so the two doors cannot drift apart.
+      ISSUE_NUMBER: ${{ inputs.issue_number != '' && inputs.issue_number || github.event.issue.number }}
     steps:
+      # The relay job holds actions: write and nothing else, so it cannot
+      # react to the comment it relayed, and on this door the action reacts to
+      # nothing: a workflow_dispatch run has no comment in its event. The
+      # reaction is what tells the person watching the issue that the request
+      # was picked up.
+      - name: React to the comment the relay answered
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.comment_id != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ inputs.comment_id }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content=rocket > /dev/null \
+            || echo "::warning::could not react to comment ${COMMENT_ID}; the run itself is unaffected"
+
       # In App mode the action sets its own push credential and identity, so
       # the checkout keeps none. In token mode the action pushes with whatever
       # git holds, so the checkout keeps the token the pull request is opened
@@ -185,6 +219,41 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           echo "commit identity set to github-actions[bot] for token mode"
 
+      # A run the relay dispatched has no comment and no issue in its event,
+      # so the action's prompt is mandatory there and the brief is the issue's
+      # own body. The title and the body are read here as well: the marking
+      # and decline steps take the card key and the marker line from them, and
+      # this door's event carries neither.
+      - name: Read the brief from the issue
+        id: brief
+        if: ${{ github.event_name == 'workflow_dispatch' && env.ISSUE_NUMBER != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body)"
+          title="$(jq -r '.title // ""' <<<"$issue")"
+          body="$(jq -r '.body // ""' <<<"$issue")"
+          # The issue carries text an attacker can write, so each value leaves
+          # this step behind a delimiter that text cannot guess and therefore
+          # cannot close early.
+          eof="SRE_AGENT_EOF_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "title<<${eof}"
+            printf '%s\n' "$title"
+            echo "$eof"
+            echo "body<<${eof}"
+            printf '%s\n' "$body"
+            echo "$eof"
+            echo "prompt<<${eof}"
+            echo "The text below is the brief. Follow its contract."
+            echo
+            printf '%s\n' "$body"
+            echo "$eof"
+          } >> "$GITHUB_OUTPUT"
+          echo "read the brief from issue #${ISSUE_NUMBER}"
+
       # Pinned to a release tag: anomalyco/opencode has no major tag, only
       # releases and a moving "latest". Bumps go through the CHANGELOG.
       - name: Run opencode
@@ -196,21 +265,21 @@ jobs:
         with:
           model: ${{ inputs.model }}
           agent: ${{ inputs.agent }}
-          prompt: ${{ inputs.prompt }}
+          prompt: ${{ inputs.prompt != '' && inputs.prompt || steps.brief.outputs.prompt }}
           variant: ${{ inputs.variant }}
           share: false
           use_github_token: ${{ inputs.use_github_token }}
 
       # A separate failure-only step, because the steps below never run when
-      # the action fails, and the action's own report is a comment on the
-      # issue rather than a line in the log. The commonest token-mode failure
-      # is a repository policy, which the log alone does not explain.
+      # the action fails, and the action's own report, where the run had a
+      # comment to answer, is a comment on the issue rather than a line in the
+      # log. The commonest token-mode failure is a repository policy, which
+      # the log alone does not explain.
       - name: Explain a refused pull request
-        if: ${{ failure() && steps.opencode.outcome == 'failure' && inputs.use_github_token && github.event.issue.number }}
+        if: ${{ failure() && steps.opencode.outcome == 'failure' && inputs.use_github_token && env.ISSUE_NUMBER != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           comments="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments?per_page=10" --jq '.[].body' || true)"
@@ -218,7 +287,11 @@ jobs:
             echo "::error::the branch was pushed but the pull request was refused by policy. Enable 'Allow GitHub Actions to create and approve pull requests' for this repository, and for the organization when the organization restricts it: gh api -X PUT repos/${GITHUB_REPOSITORY}/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true (and the same for orgs/<org>/actions/permissions/workflow). The opencode App identity needs none of this."
             exit 1
           fi
-          echo "::warning::opencode failed in token mode; the action reports the reason as a comment on issue #${ISSUE_NUMBER} and the details are in this run's log"
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "::warning::opencode failed in token mode; a dispatched run gets no comment on the issue, so the reason is in this run's log alone"
+          else
+            echo "::warning::opencode failed in token mode; the action reports the reason as a comment on issue #${ISSUE_NUMBER} and the details are in this run's log"
+          fi
 
       # The fences in the configuration are opencode's own tool gates, and the
       # agent also runs a shell, which can write a file without any tool. The
@@ -227,11 +300,10 @@ jobs:
       # pull request that touched .github/, an env file, a secrets path or a
       # key is closed with a comment and the job fails.
       - name: Close a pull request that touched a protected path
-        if: ${{ !inputs.dry_run && github.event.issue.number }}
+        if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           # The lookup's exit status is the gate's first verdict: a failed
@@ -271,13 +343,12 @@ jobs:
       # rather than fail a run whose pull request is already open.
       - name: Mark the pull request for SRE Agent
         id: mark
-        if: ${{ !inputs.dry_run && github.event.issue.number }}
+        if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_TITLE: ${{ steps.brief.outputs.title != '' && steps.brief.outputs.title || github.event.issue.title }}
+          ISSUE_BODY: ${{ steps.brief.outputs.body != '' && steps.brief.outputs.body || github.event.issue.body }}
         run: |
           set -euo pipefail
           key="$(grep -oE '^[A-Z][A-Z0-9]*-[0-9]+' <<<"$ISSUE_TITLE" || true)"
@@ -285,7 +356,7 @@ jobs:
           stamp="<!-- sre-agent-opencode:${SRE_AGENT_OPENCODE_VERSION} -->"
           [ -n "$key" ] || echo "no card key at the start of the issue title; the title is left as the action wrote it"
           [ -n "$marker" ] || echo "no marker line in the issue body; the body gets the version stamp only"
-          if ! bash /tmp/sre-agent-run_prs.sh > "$RUNNER_TEMP/prs.jsonl"; then
+          if ! bash /tmp/sre-agent-run_prs.sh --mine > "$RUNNER_TEMP/prs.jsonl"; then
             echo "::error::could not list this run's pull requests; failing rather than leaving one unmarked"
             exit 1
           fi
@@ -336,10 +407,9 @@ jobs:
       # step found no pull request, so a run never both delivers one and
       # declines.
       - name: Mark the decline comment for SRE Agent
-        if: ${{ !inputs.dry_run && github.event.issue.number && steps.mark.outputs.pull_requests == '0' }}
+        if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_BODY: ${{ steps.brief.outputs.body != '' && steps.brief.outputs.body || github.event.issue.body }}
         run: bash /tmp/sre-agent-decline_comment.sh

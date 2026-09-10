@@ -18,7 +18,7 @@ WORKFLOW_PATH=.github/workflows/opencode.yml
 BOT_LOGIN_VARIABLE=SRE_AGENT_BOT_LOGIN
 COMMIT_MESSAGE="ci: run SRE Agent fix requests with opencode"
 PR_BRANCH=sre-agent/opencode-runner
-PR_BODY="Runs SRE Agent fix requests on this repository's own runner through segfaultpw/sre-agent-opencode. A fix request arrives as a /opencode comment on a tracking issue and ends in a draft pull request. The default branch is protected, so this arrives as a pull request rather than a commit."
+PR_BODY="Runs SRE Agent fix requests on this repository's own runner through segfaultpw/sre-agent-opencode. A fix request arrives as a /opencode comment on a tracking issue and ends in a draft pull request. SRE Agent comments as a GitHub App, and the opencode action refuses a run whose commenting user holds no collaborator permission, so the workflow relays that comment to itself as a workflow_dispatch and the run starts from there; a member of this repository who comments /opencode starts a run directly. The default branch is protected, so this arrives as a pull request rather than a commit."
 
 here="$(cd "$(dirname "$0")" && pwd)"
 workflow="$here/../examples/opencode.yml"
