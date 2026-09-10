@@ -164,17 +164,31 @@ check_ex '-f issue_number=' 'the dispatch passes the issue number'
 check_ex '-f comment_id=' 'the dispatch passes the comment id'
 
 fix_if="$(job_if fix "$ex")"
-for needle in "github.event_name == 'workflow_dispatch'" 'OWNER' 'MEMBER' 'COLLABORATOR'; do
+for needle in "github.event_name == 'workflow_dispatch'" '/opencode' '/oc' 'OWNER' 'MEMBER' 'COLLABORATOR'; do
   if [[ "$fix_if" == *"$needle"* ]]; then
     echo "ok   the fix job's guard names $needle"
   else
     echo "FAIL the fix job's guard is missing $needle (got '${fix_if}')"; fail=1
   fi
 done
-if [[ "$fix_if" == *SRE_AGENT_BOT_LOGIN* ]]; then
-  echo "FAIL the fix job still admits the bot login, whose run the action refuses"; fail=1
+if [[ "$fix_if" == *'!= vars.SRE_AGENT_BOT_LOGIN'* ]] && [[ "$fix_if" != *'== vars.SRE_AGENT_BOT_LOGIN'* ]]; then
+  echo "ok   the fix job refuses the login the relay answers rather than admitting it"
 else
-  echo "ok   the fix job no longer admits the bot login, whose run the action refuses"
+  echo "FAIL the fix job's condition treats the bot login wrongly (got '${fix_if}')"; fail=1
+fi
+
+# Starting a run is all the relay does, and a relay that cannot reach the API
+# should not hold a runner for the job's own bound.
+relay_block="$(job_block relay "$ex")"
+if [[ "$relay_block" != *"uses:"* ]]; then
+  echo "ok   the relay job runs no action of its own"
+else
+  echo "FAIL the relay job uses an action"; fail=1
+fi
+if [[ "$relay_block" == *"timeout-minutes:"* ]]; then
+  echo "ok   the relay job has a time bound"
+else
+  echo "FAIL the relay job has no timeout-minutes"; fail=1
 fi
 check_ex 'issue_number: ${{ inputs.issue_number }}' 'the fix job passes the dispatched issue number on'
 check_ex 'comment_id: ${{ inputs.comment_id }}' 'the fix job passes the dispatched comment id on'
@@ -244,17 +258,75 @@ done
 # card key and marker line on it; the diff gate takes every candidate, because
 # there over-inclusion only ever closes a pull request that touched a
 # protected path.
-mark_lookup="$(awk '/- name: Mark the pull request for SRE Agent/ { found = 1 } found && /run_prs\.sh/ { print; exit }' "$wf")"
-if [[ "$mark_lookup" == *'run_prs.sh --mine'* ]]; then
+# The lines of one step of fix.yml, for the assertions that are about what a
+# step does rather than about one line of it.
+step_block() {
+  awk -v step="- name: $1" 'index($0, step) { in_step = 1; next } in_step && /^      - name: / { exit } in_step { print }' "$wf"
+}
+
+mark_block="$(step_block 'Mark the pull request for SRE Agent')"
+if [[ "$mark_block" == *"jq -c 'select(.mine)'"* ]]; then
   echo "ok   the marking step marks this run's own pull request only"
 else
-  echo "FAIL the marking step does not pass --mine (got '${mark_lookup}')"; fail=1
+  echo "FAIL the marking step does not keep this run's own pull requests (got '${mark_block}')"; fail=1
 fi
-gate_lookup="$(awk '/- name: Close a pull request that touched a protected path/ { found = 1 } found && /run_prs\.sh/ { print; exit }' "$wf")"
-if [[ "$gate_lookup" != *'--mine'* ]]; then
+if [[ "$mark_block" == *'::warning::'* ]] && [[ "$mark_block" == *'candidates.jsonl'* ]]; then
+  echo "ok   the marking step warns when candidates existed and none linked this run"
+else
+  echo "FAIL the marking step is silent when every candidate belongs to another run"; fail=1
+fi
+
+# The gate closes every candidate, because a protected path has to be closed
+# whichever run opened it, and fails only on this run's own, because failing
+# on another run's would leave this run's work unmarked.
+gate_block="$(step_block 'Close a pull request that touched a protected path')"
+if [[ "$gate_block" != *'select(.mine)'* ]]; then
   echo "ok   the diff gate inspects every candidate pull request"
 else
-  echo "FAIL the diff gate narrows its list to this run (got '${gate_lookup}')"; fail=1
+  echo "FAIL the diff gate narrows its list to this run"; fail=1
+fi
+if [[ "$gate_block" == *"jq -r '.mine' <<<\"\$pr\")\" = true"* ]] && [[ "$gate_block" == *'::warning::'* ]]; then
+  echo "ok   the diff gate fails on this run's own pull request and warns on another run's"
+else
+  echo "FAIL the diff gate's verdict is not this run's own (got '${gate_block}')"; fail=1
+fi
+
+# A bump of the action pin has to check the footer the marking depends on.
+pin_note="$(awk '/# Pinned to a release tag/ { in_note = 1 } in_note && /- name: Run opencode/ { exit } in_note { print }' "$wf")"
+if [[ "$pin_note" == *'actions/runs/'* ]]; then
+  echo "ok   the pin note says a bump has to check the run link the marking reads"
+else
+  echo "FAIL the pin note does not mention the run link (got '${pin_note}')"; fail=1
+fi
+
+# What a person with write access types on the manual dispatch door is not a
+# number until it is checked.
+for step in 'Read the brief from the issue' 'React to the comment the relay answered'; do
+  if [[ "$(step_block "$step")" == *'=~ ^[0-9]+$'* ]]; then
+    echo "ok   the step \"$step\" checks its input is a number"
+  else
+    echo "FAIL the step \"$step\" takes its dispatch input unchecked"; fail=1
+  fi
+done
+
+# The decline the action cannot post on a dispatched run, in the shape the
+# platform ends a request on, before the step that appends the marker to it.
+check '- name: Decline on the issue when the run opened no pull request' 'a dispatched run that opened no pull request declines on the issue'
+check "--body \"Declined: the run opened no pull request; the agent's answer is in the run log" 'the decline carries the prefix the platform reads and links the run'
+decline_post_guard="$(awk '/- name: Decline on the issue when the run opened no pull request/ { found = 1; next } found && /^ *if:/ { print; exit }' "$wf")"
+for needle in '!inputs.dry_run' "github.event_name == 'workflow_dispatch'" "env.ISSUE_NUMBER != ''" "steps.mark.outputs.pull_requests == '0'"; do
+  if [[ "$decline_post_guard" == *"$needle"* ]]; then
+    echo "ok   the decline step's guard names $needle"
+  else
+    echo "FAIL the decline step's guard is missing $needle (got '${decline_post_guard}')"; fail=1
+  fi
+done
+post_line="$(grep -n -- '- name: Decline on the issue when the run opened no pull request' "$wf" | cut -d: -f1 | head -1)"
+marker_line="$(grep -n -- '- name: Mark the decline comment for SRE Agent' "$wf" | cut -d: -f1 | head -1)"
+if [ -n "$post_line" ] && [ -n "$marker_line" ] && [ "$post_line" -lt "$marker_line" ]; then
+  echo "ok   the decline is posted before the step that marks it for SRE Agent"
+else
+  echo "FAIL the decline is posted after the step that would have marked it"; fail=1
 fi
 
 # The relay holds actions: write, so it cannot react to the comment it

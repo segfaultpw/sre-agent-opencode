@@ -97,6 +97,10 @@ jobs:
           COMMENT_ID: ${{ inputs.comment_id }}
         run: |
           set -euo pipefail
+          if [[ ! "$COMMENT_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::comment_id must be a number; this run was dispatched with '${COMMENT_ID}'"
+            exit 1
+          fi
           gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
             -f content=rocket > /dev/null \
             || echo "::warning::could not react to comment ${COMMENT_ID}; the run itself is unaffected"
@@ -232,6 +236,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Anyone with write access can dispatch this workflow from the
+          # Actions tab and type whatever they like into the input.
+          if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "::error::issue_number must be a number; this run was dispatched with '${ISSUE_NUMBER}'"
+            exit 1
+          fi
           issue="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title,body)"
           title="$(jq -r '.title // ""' <<<"$issue")"
           body="$(jq -r '.body // ""' <<<"$issue")"
@@ -255,7 +265,12 @@ jobs:
           echo "read the brief from issue #${ISSUE_NUMBER}"
 
       # Pinned to a release tag: anomalyco/opencode has no major tag, only
-      # releases and a moving "latest". Bumps go through the CHANGELOG.
+      # releases and a moving "latest". Bumps go through the CHANGELOG, and a
+      # bump has one more thing to check: a run dispatched by the relay finds
+      # its own pull request by the run link the action ends every body with,
+      # "[github run](/owner/repo/actions/runs/<id>)". A release that changes
+      # that shape leaves every dispatched run marking nothing, which the
+      # marking step reports as a warning rather than as a failure.
       - name: Run opencode
         id: opencode
         if: ${{ !inputs.dry_run }}
@@ -299,6 +314,13 @@ jobs:
       # after the action, where nothing the agent does can walk around it: a
       # pull request that touched .github/, an env file, a secrets path or a
       # key is closed with a comment and the job fails.
+      #
+      # Every candidate is inspected and closed, this run's own or another
+      # dispatched run's, because a pull request that touched a protected path
+      # has to be closed whichever run opened it. Only the verdict is this
+      # run's: failing on another run's pull request would fail this run and
+      # leave its own work unmarked, and the platform would record a request
+      # that succeeded as failed.
       - name: Close a pull request that touched a protected path
         if: ${{ !inputs.dry_run && env.ISSUE_NUMBER != '' }}
         shell: bash
@@ -326,10 +348,18 @@ jobs:
               continue
             fi
             list="$(paste -sd ',' <<<"$flagged" | sed 's/,/, /g')"
-            gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "Closed by the SRE Agent fix runner: it changed a protected path (${list})"
-            gh pr close "$number" --repo "$GITHUB_REPOSITORY"
-            echo "::error::pull request #${number} changed a protected path (${list}) and was closed"
-            failed=1
+            if [ "$(jq -r '.mine' <<<"$pr")" = true ]; then
+              gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "Closed by the SRE Agent fix runner: it changed a protected path (${list})"
+              gh pr close "$number" --repo "$GITHUB_REPOSITORY"
+              echo "::error::pull request #${number} changed a protected path (${list}) and was closed"
+              failed=1
+            else
+              # The run that opened it is closing it too, so losing that race
+              # is not this run's failure and must not become its verdict.
+              gh pr comment "$number" --repo "$GITHUB_REPOSITORY" --body "Closed by the SRE Agent fix runner: it changed a protected path (${list})" || true
+              gh pr close "$number" --repo "$GITHUB_REPOSITORY" || true
+              echo "::warning::pull request #${number} was opened by another run of this repository; it changed a protected path (${list}) and was closed, and this run's verdict is unaffected"
+            fi
           done 9< "$RUNNER_TEMP/prs.jsonl"
           exit "$failed"
 
@@ -356,15 +386,22 @@ jobs:
           stamp="<!-- sre-agent-opencode:${SRE_AGENT_OPENCODE_VERSION} -->"
           [ -n "$key" ] || echo "no card key at the start of the issue title; the title is left as the action wrote it"
           [ -n "$marker" ] || echo "no marker line in the issue body; the body gets the version stamp only"
-          if ! bash /tmp/sre-agent-run_prs.sh --mine > "$RUNNER_TEMP/prs.jsonl"; then
+          if ! bash /tmp/sre-agent-run_prs.sh > "$RUNNER_TEMP/candidates.jsonl"; then
             echo "::error::could not list this run's pull requests; failing rather than leaving one unmarked"
             exit 1
           fi
+          # Only this run's own: marking another dispatched run's pull request
+          # would put this run's card key and marker line on it, and the
+          # platform would adopt the wrong one.
+          jq -c 'select(.mine)' "$RUNNER_TEMP/candidates.jsonl" > "$RUNNER_TEMP/prs.jsonl"
           # The count is this step's verdict on which outcome the run had, and
           # the decline step reads it: a run that opened a pull request has
           # nothing to mark on the issue.
           if [ ! -s "$RUNNER_TEMP/prs.jsonl" ]; then
             echo "pull_requests=0" >> "$GITHUB_OUTPUT"
+            if [ -s "$RUNNER_TEMP/candidates.jsonl" ]; then
+              echo "::warning::$(grep -c '' "$RUNNER_TEMP/candidates.jsonl") pull request(s) were opened on a dispatch branch while this run was going and none of them links this run, so none was marked. A run link the action stopped writing would look exactly like this."
+            fi
             echo "no pull request opened by this run on issue #${ISSUE_NUMBER}"
             exit 0
           fi
@@ -397,6 +434,27 @@ jobs:
             fi
             echo "marked pull request #${number} for SRE Agent"
           done 9< "$RUNNER_TEMP/prs.jsonl"
+
+      # A dispatched run has no comment to answer on and the action posts
+      # nothing on the issue for one, so the decline that would have carried
+      # the agent's own words is written here instead. The platform ends a
+      # request on a comment beginning "Declined:" written by this token's
+      # identity, which is what the shape below is; only the reason is
+      # generic, because the action exposes the agent's answer nowhere but the
+      # run's log, and the comment links it. The step after this one appends
+      # the marker line and the version stamp, exactly as it does to the
+      # action's own decline on the comment door.
+      - name: Decline on the issue when the run opened no pull request
+        if: ${{ !inputs.dry_run && github.event_name == 'workflow_dispatch' && env.ISSUE_NUMBER != '' && steps.mark.outputs.pull_requests == '0' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --body "Declined: the run opened no pull request; the agent's answer is in the run log ${run_url}"
+          echo "declined on issue #${ISSUE_NUMBER} with a link to this run"
 
       # A decline is the run's other ending: no pull request, and the agent's
       # answer posted as a comment beginning "Declined:". SRE Agent ends the

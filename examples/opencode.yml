@@ -44,6 +44,7 @@ jobs:
       (contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')) &&
       github.event.comment.user.login == vars.SRE_AGENT_BOT_LOGIN
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       actions: write
     steps:
@@ -64,11 +65,14 @@ jobs:
 
   fix:
     # The run the relay dispatched, or a member's own comment: anyone able to
-    # comment could otherwise spend your minutes and tokens.
+    # comment could otherwise spend your minutes and tokens. The login the
+    # relay answers is excluded here, so a SRE_AGENT_BOT_LOGIN that names a
+    # person by mistake starts one run rather than two.
     if: |
       github.event_name == 'workflow_dispatch' ||
       ((contains(github.event.comment.body, '/opencode') || contains(github.event.comment.body, '/oc')) &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+       github.event.comment.user.login != vars.SRE_AGENT_BOT_LOGIN)
     # A called workflow can only keep or reduce what its caller grants, and
     # GITHUB_TOKEN is read-only by default, so the grant has to be here.
     permissions:
