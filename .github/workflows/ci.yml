@@ -43,10 +43,14 @@ jobs:
       - run: bash tests/decline_comment_test.sh
       - run: bash tests/install_test.sh
       - run: bash tests/changelog_section_test.sh
+      - run: bash tests/conventional_title_test.sh
+      - run: bash tests/card_key_test.sh
+      - run: bash tests/pr_body_test.sh
       # The runner is the only Node file in the package, so its syntax gate is
       # the one lint it gets; the test that follows runs it for real against a
       # fixture platform.
       - run: node --check runner/runner.js
+      - run: node --check runner/conventional_title.js
       - run: bash tests/runner_test.sh
       - run: bash tests/image_test.sh
       - run: bash tests/install_runner_test.sh
@@ -115,6 +119,7 @@ jobs:
             aws --version
             test "$(id -u)" -ne 0
             node --check /opt/sre-agent-opencode/runner/runner.js
+            node --check /opt/sre-agent-opencode/runner/conventional_title.js
             # Every file the runner reads out of the package at run time. A
             # build context rule that excluded one of these would produce an
             # image that builds and then fails its first job.

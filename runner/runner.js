@@ -18,6 +18,7 @@ const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
 const { spawn } = require('node:child_process');
+const { conventionalTitle } = require('./conventional_title.js');
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 
@@ -548,14 +549,21 @@ async function stageAndGate(dir) {
   return { changed: staged, flagged };
 }
 
+// The pull request title and the commit message are one line, a Conventional
+// Commits header, because a repository that checks its titles refuses anything
+// else and a squash merge keeps this line. It is the first line of the agent's
+// final message with markdown decoration taken off; the shared normaliser
+// drops tags, keeps a valid header, and otherwise types the line as a fix.
+// It is handed no card key, because neither the queue's job nor the brief
+// carries one, so no key-shaped word is taken off the title here. With nothing
+// usable the handoff id is what the title names.
 function pullRequestTitle(message, handoffId) {
   const line = message
     .split('\n')
     .map((candidate) => candidate.trim())
     .find((candidate) => candidate && !candidate.startsWith('<!--'));
-  if (!line) return `SRE Agent fix ${handoffId}`;
-  const cleaned = line.replace(/^#+\s*/, '').replace(/^[-*]\s+/, '');
-  return cleaned.length > 72 ? `${cleaned.slice(0, 69)}...` : cleaned;
+  const cleaned = (line || '').replace(/^#+\s*/, '').replace(/^[-*]\s+/, '');
+  return conventionalTitle(cleaned, `apply the requested fix (${handoffId})`);
 }
 
 function pullRequestBody(message, brief, version) {
