@@ -553,8 +553,10 @@ async function stageAndGate(dir) {
 // Commits header, because a repository that checks its titles refuses anything
 // else and a squash merge keeps this line. It is the first line of the agent's
 // final message with markdown decoration taken off; the shared normaliser
-// drops tags and card keys, keeps a valid header, and otherwise types the line
-// as a fix. With nothing usable the handoff id is what the title names.
+// drops tags, keeps a valid header, and otherwise types the line as a fix.
+// It is handed no card key, because neither the queue's job nor the brief
+// carries one, so no key-shaped word is taken off the title here. With nothing
+// usable the handoff id is what the title names.
 function pullRequestTitle(message, handoffId) {
   const line = message
     .split('\n')

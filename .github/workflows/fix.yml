@@ -371,10 +371,11 @@ jobs:
       # contract (a draft, a Conventional Commits title, the card key and the
       # marker and the version stamp somewhere in the body) is applied here so
       # it never depends on the model obeying its prompt. The title is
-      # normalised into a header and the card key is written into the body on
-      # a `Refs:` line: a repository that checks its titles refuses `KEY: ...`,
-      # and SRE Agent adopts by the marker, with the key in the body as the
-      # fallback. The issue's text reaches the scripts only through the
+      # normalised into a header (a leading copy of this card's own key is
+      # dropped from it, no other key-shaped word) and the card key is written
+      # into the body on a `Refs:` line: a repository that checks its titles
+      # refuses `KEY: ...`, and SRE Agent adopts by the marker, with the key in
+      # the body as the fallback. The issue's text reaches the scripts only through the
       # environment. Draft pull requests need a plan that supports them, so the
       # conversion is allowed to fail with a warning rather than fail a run
       # whose pull request is already open.
@@ -422,7 +423,7 @@ jobs:
             body="$(jq -r '.body' <<<"$pr")"
             draft="$(jq -r '.isDraft' <<<"$pr")"
             args=()
-            new_title="$(printf '%s' "$title" | bash /tmp/sre-agent-conventional_title.sh)"
+            new_title="$(printf '%s' "$title" | CARD_KEY="$key" bash /tmp/sre-agent-conventional_title.sh)"
             if [ "$new_title" != "$title" ]; then
               args+=(--title "$new_title")
             fi

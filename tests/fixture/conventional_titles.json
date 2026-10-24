@@ -58,31 +58,37 @@
  {
   "name": "a leading card key is dropped",
   "input": "NUM-12: widen the timeout",
+  "key": "NUM-12",
   "expected": "fix: widen the timeout"
  },
  {
   "name": "a lower case card key is dropped",
   "input": "num-12: fix the thing",
+  "key": "NUM-12",
   "expected": "fix: fix the thing"
  },
  {
   "name": "a card key before a valid header leaves the header",
   "input": "NUM-12: feat(api)!: rename the field",
+  "key": "NUM-12",
   "expected": "feat(api)!: rename the field"
  },
  {
   "name": "tags and keys in any order are dropped",
   "input": "[team] NUM-12: [urgent] chore: bump the base image",
+  "key": "NUM-12",
   "expected": "chore: bump the base image"
  },
  {
   "name": "a key followed by more of a hyphenated id is not a key prefix",
   "input": "CVE-2024-1234: patch openssl",
+  "key": "CVE-2024",
   "expected": "fix: CVE-2024-1234: patch openssl"
  },
  {
-  "name": "a key with no colon is part of the subject",
+  "name": "a key shaped word that is not the card's key is part of the subject",
   "input": "GPT-4 support for the summary",
+  "key": "NUM-12",
   "expected": "fix: GPT-4 support for the summary"
  },
  {
@@ -128,6 +134,7 @@
  {
   "name": "only a key takes the fallback",
   "input": "NUM-12:",
+  "key": "NUM-12",
   "expected": "fix: apply the requested fix"
  },
  {
@@ -163,8 +170,8 @@
  },
  {
   "name": "the cut counts code points and does not split a combining mark",
-  "input": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
-  "expected": "fix: ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+  "input": "e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301",
+  "expected": "fix: e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301e\u0301"
  },
  {
   "name": "a scope too long for the cap is dropped, never cut in half",
@@ -182,5 +189,170 @@
   "name": "a revert header keeps its quoted subject",
   "input": "revert: \"feat: x\"",
   "expected": "revert: \"feat: x\""
+ },
+ {
+  "name": "the card's key followed by a space is dropped",
+  "input": "NUM-12 widen the timeout",
+  "key": "NUM-12",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "the card's key on a line of its own is dropped",
+  "input": "NUM-12\nfeat: rename the field",
+  "key": "NUM-12",
+  "expected": "feat: rename the field"
+ },
+ {
+  "name": "without a card key a key shaped prefix is part of the subject",
+  "input": "NUM-12: widen the timeout",
+  "expected": "fix: NUM-12: widen the timeout"
+ },
+ {
+  "name": "another card's key is part of the subject",
+  "input": "OPS-12: widen the timeout",
+  "key": "NUM-12",
+  "expected": "fix: OPS-12: widen the timeout"
+ },
+ {
+  "name": "a key that only starts with the card's key is part of the subject",
+  "input": "NUM-123: widen the timeout",
+  "key": "NUM-12",
+  "expected": "fix: NUM-123: widen the timeout"
+ },
+ {
+  "name": "the card's key glued to more text is part of the subject",
+  "input": "NUM-12abc: widen the timeout",
+  "key": "NUM-12",
+  "expected": "fix: NUM-12abc: widen the timeout"
+ },
+ {
+  "name": "an acronym and a number keep their subject",
+  "input": "SHA-256: verify the download checksum",
+  "key": "NUM-12",
+  "expected": "fix: SHA-256: verify the download checksum"
+ },
+ {
+  "name": "an acronym and a number keep their subject without a card",
+  "input": "UTF-8: decode the BOM before parsing",
+  "expected": "fix: UTF-8: decode the BOM before parsing"
+ },
+ {
+  "name": "a key that matches the card's only under Unicode case folding is part of the subject",
+  "input": "ſku-1: widen the timeout",
+  "key": "SKU-1",
+  "expected": "fix: ſku-1: widen the timeout"
+ },
+ {
+  "name": "a card key that is not key shaped drops nothing",
+  "input": "not a key: widen the timeout",
+  "key": "not a key",
+  "expected": "fix: not a key: widen the timeout"
+ },
+ {
+  "name": "a byte order mark in front is removed",
+  "input": "\ufefffeat: a",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a byte order mark inside is removed",
+  "input": "fix: wid\ufeffen the timeout",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "a next line character ends the line",
+  "input": "feat: a\u0085long explanation",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a next line character before the tags is whitespace",
+  "input": "\u0085[x] feat: a",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a line separator ends the line",
+  "input": "feat: a\u2028b",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a paragraph separator ends the line",
+  "input": "feat: a\u2029b",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a vertical tab ends the line",
+  "input": "feat: a\u000bb",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a form feed ends the line",
+  "input": "feat: a\fb",
+  "expected": "feat: a"
+ },
+ {
+  "name": "a lone carriage return ends the line",
+  "input": "feat: a\rb",
+  "expected": "feat: a"
+ },
+ {
+  "name": "tabs between tags are whitespace",
+  "input": "[a]\t[b]\tfeat: x",
+  "expected": "feat: x"
+ },
+ {
+  "name": "a no-break space inside is not collapsed",
+  "input": "fix: a\u00a0\u00a0b",
+  "expected": "fix: a\u00a0\u00a0b"
+ },
+ {
+  "name": "a no-break space after the colon is part of the subject",
+  "input": "fix:\u00a0widen",
+  "expected": "fix: \u00a0widen"
+ },
+ {
+  "name": "a title made only of combining marks takes the fallback",
+  "input": "\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "a short title made only of combining marks takes the fallback",
+  "input": "\u0301\u0301",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "a subject made only of combining marks takes the fallback",
+  "input": "feat(x): \u0301",
+  "expected": "feat(x): apply the requested fix"
+ },
+ {
+  "name": "a zero width joiner alone takes the fallback",
+  "input": "\u200d",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "a cut that leaves no subject takes the fallback",
+  "input": "x\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301\u0301",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "a spacing mark is not one of the combining marks, so it is kept",
+  "input": "\u0903",
+  "expected": "fix: \u0903"
+ },
+ {
+  "name": "a mark in a listed block is a combining mark whatever Unicode version the engine ships",
+  "input": "feat: \u1ae8",
+  "expected": "feat: apply the requested fix"
+ },
+ {
+  "name": "a cut never splits an emoji joined with zero width joiners",
+  "input": "fix: 👨\u200d👩\u200d👧👨\u200d👩\u200d👧👨\u200d👩\u200d👧👨\u200d👩\u200d👧👨\u200d👩\u200d👧👨\u200d👩\u200d👧",
+  "expected": "fix: 👨\u200d👩\u200d👧👨\u200d👩\u200d👧👨\u200d👩\u200d👧",
+  "max": 22
+ },
+ {
+  "name": "a cut never separates a spacing mark from its base",
+  "input": "fix: \u0915\u093f\u0915\u093f\u0915\u093f\u0915\u093f\u0915\u093f",
+  "expected": "fix: \u0915\u093f\u0915\u093f",
+  "max": 10
  }
 ]

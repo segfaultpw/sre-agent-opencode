@@ -39,10 +39,10 @@ case "$mode" in
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
   titled)
-    # What a model writes when it ignores the brief's title rule: a tag, a
-    # card key and a header with an upper case type, then the explanation.
+    # What a model writes when it ignores the brief's title rule: a tag and
+    # a header with an upper case type, then the explanation.
     printf 'a line the fix added\n' >> README.md
-    emit "$(printf '[numaris] NUM-12: Feat(sso)!: allow the new IdP\n\nAdded the IdP to the allow list and ran bash test.sh.')"
+    emit "$(printf '[numaris] Feat(sso)!: allow the new IdP\n\nAdded the IdP to the allow list and ran bash test.sh.')"
     ;;
   untitled)
     printf 'a line the fix added\n' >> README.md

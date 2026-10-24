@@ -52,6 +52,18 @@ expect "an earlier Refs line for another card does not hide ours" \
   "$(body_for $'Refs: ZZZ-1\n\n'"$agent"$'\nRefs: NUM-12\n'"$marker"$'\n'"$stamp" NUM-12 "$marker" "$stamp")" \
   $'Refs: ZZZ-1\n\n'"$agent"$'\nRefs: NUM-12\n'"$marker"$'\n'"$stamp"
 
+expect "a Refs line with a form feed is not the card line" \
+  "$(body_for "$agent"$'\n\nRefs:\fNUM-12\n'"$marker"$'\n'"$stamp" NUM-12 "$marker" "$stamp")" \
+  "$agent"$'\n\nRefs:\fNUM-12\n'"$marker"$'\n'"$stamp"$'\n\nRefs: NUM-12'
+
+expect "a Refs line with a tab is the card line" \
+  "$(body_for "$agent"$'\n\nRefs:\tNUM-12\n'"$marker"$'\n'"$stamp" NUM-12 "$marker" "$stamp")" \
+  "$agent"$'\n\nRefs:\tNUM-12\n'"$marker"$'\n'"$stamp"
+
+expect "a Refs line ending in a carriage return is the card line" \
+  "$(body_for "$agent"$'\n\nRefs: NUM-12\r\n'"$marker"$'\n'"$stamp" NUM-12 "$marker" "$stamp")" \
+  "$agent"$'\n\nRefs: NUM-12\r\n'"$marker"$'\n'"$stamp"
+
 expect "a missing marker is added and a missing issue marker adds nothing" \
   "$(body_for "$agent" "" "" "$stamp")" \
   "$agent"$'\n\n'"$stamp"

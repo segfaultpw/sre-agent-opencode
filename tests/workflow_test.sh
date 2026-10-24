@@ -275,7 +275,7 @@ check 'curl -fsSL "$base/scripts/conventional_title.sh"' 'the title script is fe
 check 'curl -fsSL "$base/scripts/card_key.sh"' 'the card key script is fetched at the workflow commit'
 check 'curl -fsSL "$base/scripts/pr_body.sh"' 'the body script is fetched at the workflow commit'
 mark_text="$(awk '/- name: Mark the pull request for SRE Agent/ { found = 1 } found && /- name: Decline on the issue/ { exit } found { print }' "$wf")"
-for needle in 'bash /tmp/sre-agent-conventional_title.sh' 'bash /tmp/sre-agent-card_key.sh' 'bash /tmp/sre-agent-pr_body.sh' '--title "$new_title"' '--body "$new_body"'; do
+for needle in 'CARD_KEY="$key" bash /tmp/sre-agent-conventional_title.sh' 'bash /tmp/sre-agent-card_key.sh' 'bash /tmp/sre-agent-pr_body.sh' '--title "$new_title"' '--body "$new_body"'; do
   if [[ "$mark_text" == *"$needle"* ]]; then
     echo "ok   the marking step uses ${needle}"
   else

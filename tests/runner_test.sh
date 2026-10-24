@@ -230,7 +230,10 @@ if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a d
 if jq -e '.summary | test("unmerged pull request")' <<<"$report" >/dev/null; then echo "ok   the summary says the change is an unmerged pull request nothing has verified"; else echo "FAIL summary: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the report names what changed"; else echo "FAIL evidence: $report"; fail=1; fi
 
-echo "--- 2b. a tag, a card key and an upper case type are normalised out of the title and the commit ---"
+# The machine door is handed no card key (the queue's job and the brief carry
+# none), so the only key a title can lose is never known here and no
+# key-shaped word is dropped; tests/conventional_title_test.sh covers that.
+echo "--- 2b. a tag and an upper case type are normalised out of the title and the commit ---"
 start_fixture titled
 queue_one h-titled acme/app
 export STUB_OPENCODE_MODE=titled
@@ -238,7 +241,7 @@ run_once titled
 if [ "$rc" -eq 0 ]; then echo "ok   a titled job exits 0"; else echo "FAIL a titled job exited $rc: $(cat "$out")"; fail=1; fi
 if grep -qF -- "--title feat(sso)!: allow the new IdP --body-file" "$gh_log"; then echo "ok   the title is the normalised header"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF -- " commit -m feat(sso)!: allow the new IdP" "$git_log"; then echo "ok   the commit message is the normalised header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
-if grep -qF "[numaris]" "$gh_body" && grep -qF "NUM-12:" "$gh_body"; then echo "ok   the agent's own words stay in the body untouched"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+if grep -qF "[numaris] Feat(sso)!:" "$gh_body"; then echo "ok   the agent's own words stay in the body untouched"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the marker and the stamp are still in the body byte for byte"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 stop_fixture
 
