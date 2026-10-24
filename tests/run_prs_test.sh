@@ -129,7 +129,8 @@ if [ "$(jq -r 'select(.number == 53) | .mine' <<<"$out")" = "false" ]; then echo
 if grep -q 'pull request #52 .*links another run' "$work/stderr"; then echo "ok   another run's pull request is named rather than passed over in silence"; else echo "FAIL stderr: $(cat "$work/stderr")"; fail=1; fi
 
 rc=0
-env GITHUB_EVENT_NAME=workflow_dispatch bash "$script" >/dev/null 2>&1 || rc=$?
+# Unset rather than left out: on a GitHub runner the test inherits the CI run's own id.
+env -u GITHUB_RUN_ID GITHUB_EVENT_NAME=workflow_dispatch bash "$script" >/dev/null 2>&1 || rc=$?
 if [ "$rc" -ne 0 ]; then echo "ok   a dispatched run without a run id is refused rather than claiming everything"; else echo "FAIL ran without GITHUB_RUN_ID"; fail=1; fi
 
 # The comment door is untouched: its branch carries the issue number, one run
