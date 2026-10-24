@@ -125,6 +125,15 @@ check('[js] a long run of tags and whitespace is handled in linear time', () => 
   assert.ok(Date.now() - started < 2000, 'took too long');
 });
 
+check('[js] long whitespace runs at the edges and inside the line are handled in linear time', () => {
+  const run = ' '.repeat(160000);
+  const started = Date.now();
+  assert.equal(conventionalTitle(`${run}fix: widen the pool${run}`), 'fix: widen the pool');
+  assert.equal(conventionalTitle(`fix: a${run}b`), 'fix: a b');
+  assert.equal(conventionalTitle(`\t${run}\n${run}fix: x\n${run}`), 'fix: x');
+  assert.ok(Date.now() - started < 2000, 'took too long');
+});
+
 if (failed > 0) {
   console.log(`${failed} case(s) failed`);
   process.exit(1);

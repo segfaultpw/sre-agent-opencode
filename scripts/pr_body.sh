@@ -22,7 +22,7 @@ key_pattern='[A-Za-z][A-Za-z0-9]{1,5}-[1-9][0-9]{0,8}'
 
 tail=""
 if [ -n "${CARD_KEY:-}" ]; then
-  last="$(printf '%s\n' "$body" | sed 's/\r$//' | grep -E "^[Rr][Ee][Ff][Ss]:[${blank}]+${key_pattern}[${blank}]*\$" | tail -n 1 || true)"
+  last="$(printf '%s\n' "$body" | tr -d '\r' | grep -E "^[Rr][Ee][Ff][Ss]:[${blank}]+${key_pattern}[${blank}]*\$" | tail -n 1 || true)"
   last="$(sed -E "s/^[Rr][Ee][Ff][Ss]:[${blank}]+//; s/[${blank}]+\$//" <<<"$last" | tr '[:lower:]' '[:upper:]')"
   if [ "$last" != "$(tr '[:lower:]' '[:upper:]' <<<"$CARD_KEY")" ]; then
     tail="${tail}Refs: ${CARD_KEY}"$'\n'

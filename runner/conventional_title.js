@@ -23,8 +23,19 @@ const MIN_SUBJECT = 10;
 // removed before anything else.
 const SPACE = '[ \\t\\n\\r\\u000b\\u000c\\u0085\\u2028\\u2029]';
 const BREAK = /\r\n|[\n\r\u000b\u000c\u0085\u2028\u2029]/u;
-const EDGES = new RegExp(`^${SPACE}+|${SPACE}+$`, 'gu');
-const BLANK_EDGES = /^[ \t]+|[ \t]+$/gu;
+// Edges are trimmed by scanning, not by a `^x+|x+$` expression, which takes time quadratic in a long whitespace run
+// (160,000 spaces took 13.9 s); the machine door hands this the agent's whole first line, unbounded. Every character
+// in both sets is a single UTF-16 unit, so indexing by unit is exact.
+const SPACE_CHARS = new Set([' ', '\t', '\n', '\r', '\u000b', '\u000c', '\u0085', '\u2028', '\u2029']);
+const BLANK_CHARS = new Set([' ', '\t']);
+
+function trimSet(text, chars) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && chars.has(text[start])) start += 1;
+  while (end > start && chars.has(text[end - 1])) end -= 1;
+  return text.slice(start, end);
+}
 
 const KEY_SHAPE = /^[A-Za-z][A-Za-z0-9]{1,5}-[1-9][0-9]{0,8}$/;
 
@@ -65,10 +76,10 @@ function prefixes(cardKey) {
 }
 
 function firstLine(text, cardKey) {
-  const trimmed = text.replace(/\ufeff/gu, '').replace(EDGES, '').replace(prefixes(cardKey), '');
+  const trimmed = trimSet(text.replace(/\ufeff/gu, ''), SPACE_CHARS).replace(prefixes(cardKey), '');
   const line = trimmed
     .split(BREAK)
-    .map((candidate) => candidate.replace(BLANK_EDGES, ''))
+    .map((candidate) => trimSet(candidate, BLANK_CHARS))
     .find((candidate) => candidate !== '');
   return (line || '').replace(/[ \t]+/gu, ' ');
 }
@@ -109,7 +120,7 @@ function conventionalTitle(text, fallback = DEFAULT_FALLBACK, { max = MAX_TITLE,
     type = asciiLower(found[1]);
     scope = found[2] || '';
     bang = found[3] || '';
-    subject = found[4].replace(BLANK_EDGES, '');
+    subject = trimSet(found[4], BLANK_CHARS);
   }
   if (subject === '' || MARKS_ONLY.test(subject)) subject = subjectFallback;
 
