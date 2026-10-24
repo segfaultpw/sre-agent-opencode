@@ -1,0 +1,186 @@
+[
+ {
+  "name": "a valid header is kept",
+  "input": "feat(sso): add AbrahamIbarra to Analysts-BI",
+  "expected": "feat(sso): add AbrahamIbarra to Analysts-BI"
+ },
+ {
+  "name": "every listed type is kept",
+  "input": "revert: undo the pool change",
+  "expected": "revert: undo the pool change"
+ },
+ {
+  "name": "the type is written in lower case, the scope and subject keep their words",
+  "input": "Feat(SSO): Add X",
+  "expected": "feat(SSO): Add X"
+ },
+ {
+  "name": "a breaking change marker, with and without a scope",
+  "input": "refactor(api)!: rename the field",
+  "expected": "refactor(api)!: rename the field"
+ },
+ {
+  "name": "a bare breaking change marker",
+  "input": "feat!: drop the v1 endpoint",
+  "expected": "feat!: drop the v1 endpoint"
+ },
+ {
+  "name": "a trailing period is kept",
+  "input": "fix: Raised the pool.",
+  "expected": "fix: Raised the pool."
+ },
+ {
+  "name": "a missing space after the colon is added",
+  "input": "feat:add",
+  "expected": "feat: add"
+ },
+ {
+  "name": "a type with no subject takes the fallback subject",
+  "input": "feat!:",
+  "expected": "feat!: apply the requested fix"
+ },
+ {
+  "name": "a type with no subject takes the caller's fallback",
+  "input": "fix(db):   ",
+  "expected": "fix(db): address handoff h-1",
+  "fallback": "address handoff h-1"
+ },
+ {
+  "name": "leading bracketed tags are dropped",
+  "input": "[numaris] fix(sso): add a",
+  "expected": "fix(sso): add a"
+ },
+ {
+  "name": "several tags are dropped before a plain subject",
+  "input": "[numaris] [OPS-4] widen the timeout",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "a leading card key is dropped",
+  "input": "NUM-12: widen the timeout",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "a lower case card key is dropped",
+  "input": "num-12: fix the thing",
+  "expected": "fix: fix the thing"
+ },
+ {
+  "name": "a card key before a valid header leaves the header",
+  "input": "NUM-12: feat(api)!: rename the field",
+  "expected": "feat(api)!: rename the field"
+ },
+ {
+  "name": "tags and keys in any order are dropped",
+  "input": "[team] NUM-12: [urgent] chore: bump the base image",
+  "expected": "chore: bump the base image"
+ },
+ {
+  "name": "a key followed by more of a hyphenated id is not a key prefix",
+  "input": "CVE-2024-1234: patch openssl",
+  "expected": "fix: CVE-2024-1234: patch openssl"
+ },
+ {
+  "name": "a key with no colon is part of the subject",
+  "input": "GPT-4 support for the summary",
+  "expected": "fix: GPT-4 support for the summary"
+ },
+ {
+  "name": "text with no header gets the default type",
+  "input": "Raised the pool ceiling",
+  "expected": "fix: Raised the pool ceiling"
+ },
+ {
+  "name": "a header with no colon is not a header",
+  "input": "feat(sso) add x",
+  "expected": "fix: feat(sso) add x"
+ },
+ {
+  "name": "an empty scope is not a scope",
+  "input": "fix(): thing",
+  "expected": "fix: fix(): thing"
+ },
+ {
+  "name": "an unlisted type is not a type",
+  "input": "update: the pool",
+  "expected": "fix: update: the pool"
+ },
+ {
+  "name": "a type that only folds to a listed one under Unicode case rules is not a type",
+  "input": "docſ: long s",
+  "expected": "fix: docſ: long s"
+ },
+ {
+  "name": "empty input takes the fallback",
+  "input": "",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "whitespace takes the fallback",
+  "input": "   \n\t ",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "only a tag takes the fallback",
+  "input": "[numaris] [OPS-1]  ",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "only a key takes the fallback",
+  "input": "NUM-12:",
+  "expected": "fix: apply the requested fix"
+ },
+ {
+  "name": "only the first non-blank line is used",
+  "input": "\n\n  fix: widen the timeout  \n\nlong explanation",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "windows line endings end the line",
+  "input": "fix: widen the timeout\r\nlong explanation",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "whitespace inside collapses to single spaces",
+  "input": "fix:   widen \t the   timeout",
+  "expected": "fix: widen the timeout"
+ },
+ {
+  "name": "non-ASCII subjects are kept",
+  "input": "[numaris] fix(sso): añadir a Ibarra 日本語",
+  "expected": "fix(sso): añadir a Ibarra 日本語"
+ },
+ {
+  "name": "a 300 character summary is cut to 256 characters",
+  "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expected": "fix: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ },
+ {
+  "name": "the cut leaves no trailing space",
+  "input": "fix: word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+  "expected": "fix: word word word word",
+  "max": 25
+ },
+ {
+  "name": "the cut counts code points and does not split a combining mark",
+  "input": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+  "expected": "fix: ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+ },
+ {
+  "name": "a scope too long for the cap is dropped, never cut in half",
+  "input": "feat(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): add the thing",
+  "expected": "feat: add the thing",
+  "max": 72
+ },
+ {
+  "name": "a scope that leaves room for the subject is kept and the subject is cut",
+  "input": "feat(sso): word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word ",
+  "expected": "feat(sso): word word word word word word word word word word word word w",
+  "max": 72
+ },
+ {
+  "name": "a revert header keeps its quoted subject",
+  "input": "revert: \"feat: x\"",
+  "expected": "revert: \"feat: x\""
+ }
+]

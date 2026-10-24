@@ -256,6 +256,38 @@ for needle in 'steps.brief.outputs.title' 'github.event.issue.title'; do
   fi
 done
 
+# The card key now comes off the issue body (the Refs line) first, so the
+# marking step is handed the body as well.
+body_passed="$(awk '/- name: Mark the pull request for SRE Agent/ { found = 1 } found && /ISSUE_BODY:/ { print; exit }' "$wf")"
+for needle in 'steps.brief.outputs.body' 'github.event.issue.body'; do
+  if [[ "$body_passed" == *"$needle"* ]]; then
+    echo "ok   the marking step reads the issue body from the environment, ${needle} included"
+  else
+    echo "FAIL the marking step does not pass ISSUE_BODY from ${needle} (got '${body_passed}')"; fail=1
+  fi
+done
+
+# Pull requests follow Conventional Commits: the three scripts are fetched at
+# the workflow's own commit like every other one, the marking step titles with
+# conventional_title.sh and writes the card key with pr_body.sh, and nothing
+# prefixes the key on the title any more.
+check 'curl -fsSL "$base/scripts/conventional_title.sh"' 'the title script is fetched at the workflow commit'
+check 'curl -fsSL "$base/scripts/card_key.sh"' 'the card key script is fetched at the workflow commit'
+check 'curl -fsSL "$base/scripts/pr_body.sh"' 'the body script is fetched at the workflow commit'
+mark_text="$(awk '/- name: Mark the pull request for SRE Agent/ { found = 1 } found && /- name: Decline on the issue/ { exit } found { print }' "$wf")"
+for needle in 'bash /tmp/sre-agent-conventional_title.sh' 'bash /tmp/sre-agent-card_key.sh' 'bash /tmp/sre-agent-pr_body.sh' '--title "$new_title"' '--body "$new_body"'; do
+  if [[ "$mark_text" == *"$needle"* ]]; then
+    echo "ok   the marking step uses ${needle}"
+  else
+    echo "FAIL the marking step does not use ${needle}"; fail=1
+  fi
+done
+if [[ "$mark_text" == *'${key}: ${title}'* ]] || [[ "$mark_text" == *'"${key}: '* ]]; then
+  echo "FAIL the marking step still prefixes the card key on the title"; fail=1
+else
+  echo "ok   the marking step does not prefix the card key on the title"
+fi
+
 # A dispatched run's branch carries no issue number, so two runs of one
 # repository see each other's. The marking step takes only the pull request
 # whose body links this run, because marking another one would put this run's

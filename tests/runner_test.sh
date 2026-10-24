@@ -222,10 +222,35 @@ if grep -qx '.opencode/' "$workspace/acme/app/.git/info/exclude"; then echo "ok 
 if branch_exists sre-agent/h-targeted; then echo "ok   the branch is pushed to the repository"; else echo "FAIL sre-agent/h-targeted was not pushed"; fail=1; fi
 if grep -q 'pr create --repo acme/app --base main --head sre-agent/h-targeted' "$gh_log" && grep -q -- '--draft' "$gh_log"; then echo "ok   a draft pull request is opened against the default branch"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the pull request body carries the marker from the brief and the version stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+expected_title="fix: Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
+if grep -qF -- "--title ${expected_title} --body-file" "$gh_log"; then echo "ok   the pull request title is a Conventional Commits header"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if grep -qF -- " commit -m ${expected_title}" "$git_log"; then echo "ok   the commit message is the same header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
 if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the report's pr_url is the pull request gh opened"; else echo "FAIL report: $report"; fail=1; fi
 if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a delivered pull request is reported as not_validated, carrying the pull request"; else echo "FAIL outcome: $report"; fail=1; fi
 if jq -e '.summary | test("unmerged pull request")' <<<"$report" >/dev/null; then echo "ok   the summary says the change is an unmerged pull request nothing has verified"; else echo "FAIL summary: $report"; fail=1; fi
 if jq -e '.evidence.changed_files | index("README.md")' <<<"$report" >/dev/null; then echo "ok   the report names what changed"; else echo "FAIL evidence: $report"; fail=1; fi
+
+echo "--- 2b. a tag, a card key and an upper case type are normalised out of the title and the commit ---"
+start_fixture titled
+queue_one h-titled acme/app
+export STUB_OPENCODE_MODE=titled
+run_once titled
+if [ "$rc" -eq 0 ]; then echo "ok   a titled job exits 0"; else echo "FAIL a titled job exited $rc: $(cat "$out")"; fail=1; fi
+if grep -qF -- "--title feat(sso)!: allow the new IdP --body-file" "$gh_log"; then echo "ok   the title is the normalised header"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if grep -qF -- " commit -m feat(sso)!: allow the new IdP" "$git_log"; then echo "ok   the commit message is the normalised header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
+if grep -qF "[numaris]" "$gh_body" && grep -qF "NUM-12:" "$gh_body"; then echo "ok   the agent's own words stay in the body untouched"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the marker and the stamp are still in the body byte for byte"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+stop_fixture
+
+echo "--- 2c. a message with nothing usable gets a conventional title naming the handoff ---"
+start_fixture untitled
+queue_one h-untitled acme/app
+export STUB_OPENCODE_MODE=untitled
+run_once untitled
+if [ "$rc" -eq 0 ]; then echo "ok   an untitled job exits 0"; else echo "FAIL an untitled job exited $rc: $(cat "$out")"; fail=1; fi
+if grep -qF -- "--title fix: apply the requested fix (h-untitled) --body-file" "$gh_log"; then echo "ok   the title is a fix header naming the handoff"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if grep -qF -- " commit -m fix: apply the requested fix (h-untitled)" "$git_log"; then echo "ok   the commit message is the same header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
+stop_fixture
 
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"
 if [ "$(auth_for /brief)" = "Bearer $handoff_token" ]; then echo "ok   the brief is fetched with the handoff credential"; else echo "FAIL brief authorization: $(auth_for /brief)"; fail=1; fi
