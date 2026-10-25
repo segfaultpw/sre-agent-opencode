@@ -17,6 +17,7 @@ service=sre-agent-fix-runner
 state_dir=/var/lib/sre-agent-fix-runner
 env_file=/etc/sre-agent-fix-runner/env
 unit_file=/etc/systemd/system/sre-agent-fix-runner.service
+agent_account=sre-agent-fix-agent
 fail=0
 
 for f in "$script" "$unit"; do
@@ -38,6 +39,14 @@ u "PrivateTmp=yes" 'it gets a private /tmp'
 u "ProtectSystem=strict" 'the filesystem is read-only to it'
 u "ProtectHome=yes" 'it cannot read anybody home directory'
 u "ReadWritePaths=${state_dir}" 'the state directory is writable'
+u "Environment=SRE_AGENT_USER=${agent_account}" 'the entrypoint is told which account every agent run starts as'
+# The runner is not root on a host. It holds the six capabilities it needs to
+# start the agent as the other account, to hand it one checkout and take it back,
+# to read what the agent wrote there, and to end what the agent leaves running,
+# and nothing else. setpriv clears them in the agent.
+caps="CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL"
+u "AmbientCapabilities=${caps}" 'it holds the six capabilities the split needs, as ambient capabilities'
+u "CapabilityBoundingSet=${caps}" 'and can never gain another'
 
 # ProtectSystem=strict means the writable list is the whole of what this
 # service may change, so a second entry is a decision, not a detail.
@@ -114,7 +123,7 @@ if [ "${STUB_ACCOUNT_EXISTS:-no}" = yes ]; then
 fi
 exit 2
 EOF
-for tool in node git gh opencode; do
+for tool in node git gh opencode setpriv; do
   cat > "$work/bin/$tool" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -151,7 +160,10 @@ for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected
 done
 if [ -x "${root}/opt/sre-agent-opencode/runner/entrypoint.sh" ]; then echo "ok   the entrypoint is executable"; else echo "FAIL the entrypoint is not executable"; fail=1; fi
 if [ -d "${root}${state_dir}/workspace" ]; then echo "ok   the workspace is created"; else echo "FAIL there is no workspace directory"; fail=1; fi
-if [ "$(stat -c '%a' "${root}${state_dir}")" = "750" ]; then echo "ok   the state directory is not world readable"; else echo "FAIL state directory mode $(stat -c '%a' "${root}${state_dir}")"; fail=1; fi
+# 0711: the agent account walks through the state directory to its own home and
+# its checkout, and cannot list it.
+if [ "$(stat -c '%a' "${root}${state_dir}")" = "711" ]; then echo "ok   the state directory can be walked through but not listed"; else echo "FAIL state directory mode $(stat -c '%a' "${root}${state_dir}")"; fail=1; fi
+if [ "$(stat -c '%a' "${root}${state_dir}/agent-home")" = "700" ]; then echo "ok   the agent has a home of its own that nobody else can enter"; else echo "FAIL agent home mode $(stat -c '%a' "${root}${state_dir}/agent-home" 2>&1)"; fail=1; fi
 
 echo "--- the installer writes no credential ---"
 if [ "$(stat -c '%a' "${root}${env_file}")" = "600" ]; then echo "ok   the environment file is 0600"; else echo "FAIL environment file mode $(stat -c '%a' "${root}${env_file}")"; fail=1; fi
@@ -169,6 +181,14 @@ for needle in "--system" "--gid ${service}" "--home-dir ${state_dir}" "nologin" 
   if [[ "$useradd_call" == *"$needle"* ]]; then echo "ok   the account is created with ${needle}"; else echo "FAIL useradd was '${useradd_call}'"; fail=1; fi
 done
 if grep -q "chown ${service}:${service} ${root}${state_dir}" "$STUB_LOG"; then echo "ok   the state directory belongs to the account"; else echo "FAIL the state directory was not given to the account: $(cat "$STUB_LOG")"; fail=1; fi
+# The agent runs as a second account of its own, so what it can reach is not
+# what the runner can reach.
+if grep -q "groupadd --system ${agent_account}" "$STUB_LOG"; then echo "ok   the agent's group is created"; else echo "FAIL no groupadd for the agent: $(cat "$STUB_LOG")"; fail=1; fi
+agent_useradd="$(grep "^useradd .* ${agent_account}\$" "$STUB_LOG" || true)"
+for needle in "--system" "--gid ${agent_account}" "--home-dir ${state_dir}/agent-home" "nologin"; do
+  if [[ "$agent_useradd" == *"$needle"* ]]; then echo "ok   the agent account is created with ${needle}"; else echo "FAIL agent useradd was '${agent_useradd}'"; fail=1; fi
+done
+if grep -q "chown ${agent_account}:${agent_account} ${root}${state_dir}/agent-home" "$STUB_LOG"; then echo "ok   the agent home belongs to the agent account"; else echo "FAIL the agent home was not given to the agent: $(cat "$STUB_LOG")"; fail=1; fi
 # The agent runs as that account, so the package it loads its fences from must
 # not belong to it.
 if grep -q "chown -R root:root ${root}/opt/sre-agent-opencode" "$STUB_LOG"; then echo "ok   the package belongs to root, not to the account the agent runs as"; else echo "FAIL the package was not given to root: $(cat "$STUB_LOG")"; fail=1; fi
@@ -213,7 +233,7 @@ if grep -qF 'has to run as root' <<<"$out"; then echo "ok   the refusal says it 
 # A machine with the tools but no systemd is a container host, and the refusal
 # points it at the image rather than leaving it stuck.
 mkdir -p "$work/without-systemctl"
-for tool in id groupadd useradd chown getent node git gh opencode; do
+for tool in id groupadd useradd chown getent node git gh opencode setpriv; do
   cp "$work/bin/$tool" "$work/without-systemctl/$tool"
 done
 refusal no-systemd PATH="$work/without-systemctl:$work/coreutils"
@@ -221,12 +241,19 @@ if grep -qF 'no systemctl' <<<"$out"; then echo "ok   a machine without systemd 
 if grep -qF 'sre-agent-opencode-runner' <<<"$out"; then echo "ok   the refusal names the container image"; else echo "FAIL output: $out"; fail=1; fi
 
 mkdir -p "$work/without-opencode"
-for tool in id systemctl groupadd useradd chown getent node git gh; do
+for tool in id systemctl groupadd useradd chown getent node git gh setpriv; do
   cp "$work/bin/$tool" "$work/without-opencode/$tool"
 done
 refusal no-opencode PATH="$work/without-opencode:$work/coreutils"
 if grep -qF 'opencode is not on PATH' <<<"$out"; then echo "ok   a missing opencode refuses"; else echo "FAIL output: $out"; fail=1; fi
 if grep -qF 'https://opencode.ai/install' <<<"$out"; then echo "ok   the refusal carries the command that installs it"; else echo "FAIL output: $out"; fail=1; fi
+
+mkdir -p "$work/without-setpriv"
+for tool in id systemctl groupadd useradd chown getent node git gh opencode; do
+  cp "$work/bin/$tool" "$work/without-setpriv/$tool"
+done
+refusal no-setpriv PATH="$work/without-setpriv:$work/coreutils"
+if grep -qF 'setpriv is not on PATH' <<<"$out" && grep -qF 'util-linux' <<<"$out"; then echo "ok   a missing setpriv refuses, naming the package that has it"; else echo "FAIL output: $out"; fail=1; fi
 
 # A clone missing the files the runner reads at run time would install a runner
 # that starts and fails its first job.
@@ -246,7 +273,7 @@ if grep -qF 'runner/memory.js' <<<"$out"; then echo "ok   the refusal names the 
 # a home directory is invisible to the service: the install reports success and
 # the unit lands in failed on its first start.
 mkdir -p "$work/home/operator/bin" "$work/bin-home-hidden"
-for tool in id systemctl groupadd useradd chown getent node git gh; do
+for tool in id systemctl groupadd useradd chown getent node git gh setpriv; do
   cp "$work/bin/$tool" "$work/bin-home-hidden/$tool"
 done
 cp "$work/bin/opencode" "$work/home/operator/bin/opencode"
@@ -275,7 +302,7 @@ echo "--- a copy that fails leaves the working install alone ---"
 install_into fragile
 before="$(cat "${root}/opt/sre-agent-opencode/VERSION")"
 mkdir -p "$work/failing-cp"
-for tool in id systemctl groupadd useradd chown getent node git gh opencode; do
+for tool in id systemctl groupadd useradd chown getent node git gh opencode setpriv; do
   cp "$work/bin/$tool" "$work/failing-cp/$tool"
 done
 cat > "$work/failing-cp/cp" <<EOF

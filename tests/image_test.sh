@@ -36,7 +36,22 @@ for path in VERSION config agents scripts runner; do
   check "$dockerfile" "COPY ${path} /opt/sre-agent-opencode/${path}" "the image copies ${path} in"
 done
 check "$dockerfile" 'chmod -R go-w /opt/sre-agent-opencode' 'the package is not writable by the account the agent runs under'
-check "$dockerfile" 'USER runner' 'the runner does not run as root'
+# Two accounts, and the container's PID 1 is root only so that the runner can
+# start every agent run as the other one (runner/runner.js, "Who runs what").
+# The runner process is root in the container and never on a host: the systemd
+# unit starts it as an unprivileged account holding a few capabilities.
+check "$dockerfile" 'groupadd --gid 10001 runner' 'the runner account has a fixed id, so a mounted volume can be chowned to it'
+check "$dockerfile" 'useradd --uid 10001 --gid runner' 'the runner account is created with that id'
+check "$dockerfile" 'groupadd --gid 10002 agent' 'the agent has a group of its own'
+check "$dockerfile" 'useradd --uid 10002 --gid agent' 'the agent account is a second, unprivileged account'
+check "$dockerfile" '--home-dir /home/agent --create-home' 'the agent has a home of its own to keep opencode state in'
+check "$dockerfile" 'chmod 0700 /home/runner /home/agent' 'both homes are closed to every other account'
+check "$dockerfile" 'chmod 0711 /workspace' 'the workspace can be walked through but not listed by the agent'
+check "$dockerfile" 'ENV SRE_RUNNER_USER=runner' 'the entrypoint is told which account the runner files belong to'
+check "$dockerfile" 'ENV SRE_AGENT_USER=agent' 'the entrypoint is told which account the agent runs as'
+check "$dockerfile" 'util-linux' 'setpriv, which a runner without root starts the agent through, is installed by name'
+check "$dockerfile" 'USER root' 'the container starts as root, which the runner needs to start the agent as another account'
+if ! grep -qE '^USER (runner|agent|[0-9]+)' "$dockerfile"; then echo "ok   no later USER line takes root away from the entrypoint"; else echo "FAIL a USER line other than root remains in the Dockerfile"; fail=1; fi
 check "$dockerfile" 'ENTRYPOINT ["/opt/sre-agent-opencode/runner/entrypoint.sh"]' 'the image starts through the entrypoint'
 check "$dockerfile" 'kubectl version --client' 'kubectl is installed and proved at build time'
 check "$dockerfile" 'aws --version' 'the AWS CLI is installed and proved at build time'
@@ -86,6 +101,33 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/bin" "$work/workspace"
 
+# The account lookups of a root start, answered from a table: runner 10001,
+# agent 10002, nothing else. FAKE_ID_U is the caller's own uid.
+cat > "$work/bin/id" <<'EOF'
+#!/usr/bin/env bash
+if [ "$#" -eq 1 ] && [ "$1" = "-u" ]; then echo "${FAKE_ID_U:-1000}"; exit 0; fi
+if [ "$#" -eq 1 ] && [ "$1" = "-g" ]; then echo "${FAKE_ID_U:-1000}"; exit 0; fi
+case "$2" in
+  runner) uid=10001 ;;
+  agent) uid=10002 ;;
+  *) exit 1 ;;
+esac
+echo "$uid"
+EOF
+cat > "$work/bin/getent" <<'EOF'
+#!/usr/bin/env bash
+case "$2" in
+  runner) echo "runner:x:10001:10001::/home/runner:/usr/sbin/nologin" ;;
+  agent) echo "agent:x:10002:10002::/home/agent:/usr/sbin/nologin" ;;
+  *) exit 2 ;;
+esac
+EOF
+cat > "$work/bin/setpriv" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$work/bin/id" "$work/bin/getent" "$work/bin/setpriv"
+
 # Stands in for every command the entrypoint checks for. node also records the
 # argv it was execed with, which is how a case proves the runner was started
 # rather than merely not refused.
@@ -93,6 +135,7 @@ for tool in node git gh opencode; do
   cat > "$work/bin/$tool" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "\$STUB_LOG"
+printf 'env: runner=%s:%s:%s agent=%s:%s:%s\n' "\${SRE_RUNNER_UID-}" "\${SRE_RUNNER_GID-}" "\${SRE_RUNNER_HOME-}" "\${SRE_AGENT_UID-}" "\${SRE_AGENT_GID-}" "\${SRE_AGENT_HOME-}" >> "\$STUB_LOG"
 EOF
   chmod +x "$work/bin/$tool"
 done
@@ -166,6 +209,35 @@ unset SRE_WORKSPACE_V
 if [ "$rc" -ne 0 ]; then echo "ok   an unusable workspace refuses to start"; else echo "FAIL an unusable workspace started anyway"; fail=1; fi
 if grep -qF "$work/afile/workspace" <<<"$out"; then echo "ok   the refusal names the workspace it could not use"; else echo "FAIL the refusal does not name the path: $out"; fail=1; fi
 if [ ! -s "$STUB_LOG" ]; then echo "ok   nothing is started when the workspace is unusable"; else echo "FAIL the runner was started anyway: $(cat "$STUB_LOG")"; fail=1; fi
+
+echo "--- a root start resolves the two accounts, and a start that cannot is refused ---"
+run_as() {
+  : > "$STUB_LOG"
+  rc=0
+  out="$(env PATH="$work/bin:$PATH" "$@" \
+    SRE_SERVER_URL=https://app.example.invalid SRE_API_KEY=not-a-real-key \
+    SRE_MODEL=openrouter/deepseek/deepseek-v4-pro SRE_WORKSPACE="$work/workspace" \
+    bash "$entrypoint" 2>&1)" || rc=$?
+}
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent
+if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=10001:10001:/home/runner agent=10002:10002:/home/agent' "$STUB_LOG"; then echo "ok   as root it hands the runner both accounts' ids and homes"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=nobody-here
+if [ "$rc" -ne 0 ] && grep -qF 'nobody-here' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   as root a missing agent account refuses to start, naming it"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=agent SRE_AGENT_USER=agent
+if [ "$rc" -ne 0 ] && grep -qF 'different accounts' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   as root one account for both refuses to start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=1000 SRE_AGENT_USER=agent
+if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=10002:10002:/home/agent' "$STUB_LOG"; then echo "ok   without root, a named agent account is resolved and the runner keeps its own"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+mkdir -p "$work/nosetpriv"
+for tool in node git gh opencode id getent; do cp "$work/bin/$tool" "$work/nosetpriv/$tool"; done
+: > "$STUB_LOG"
+rc=0
+out="$(env PATH="$work/nosetpriv" SRE_AGENT_USER=agent FAKE_ID_U=1000 \
+  SRE_SERVER_URL=https://app.example.invalid SRE_API_KEY=not-a-real-key \
+  SRE_MODEL=openrouter/deepseek/deepseek-v4-pro SRE_WORKSPACE="$work/workspace" \
+  "$bash_bin" "$entrypoint" 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ] && grep -qF 'setpriv' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a split without root needs setpriv and says so"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=1000
+if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=::' "$STUB_LOG"; then echo "ok   without root and without an agent account nothing is resolved (the runner warns in its own log)"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 
 echo "--- the workflows build the image on both architectures ---"
 # Every runs-on in this repository's own workflows reads the organization's

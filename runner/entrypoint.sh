@@ -54,4 +54,43 @@ if [ ! -d "$workspace" ] || [ ! -w "$workspace" ]; then
   exit 1
 fi
 
+# Who runs what. The runner starts every agent run as a second account, so that
+# what the agent can reach is not what the runner can reach (its environment,
+# the memory directory, every other clone). As root, which is how the container
+# starts, the runner switches both ways itself; as anyone else it starts the
+# agent through setpriv and needs the capabilities the systemd unit grants. The
+# ids are resolved here, by name, so the runner is given numbers and never has
+# to guess what an account is called.
+resolve_account() {
+  local role="$1" user="$2" prefix="$3" uid gid home
+  if ! uid="$(id -u "$user" 2>/dev/null)" || ! gid="$(id -g "$user" 2>/dev/null)"; then
+    echo "sre-agent-fix-runner: the ${role} account ${user} does not exist on this machine; create it, or name the one to use in ${prefix}_USER" >&2
+    exit 1
+  fi
+  home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+  if [ -z "$home" ]; then home="/"; fi
+  export "${prefix}_UID=${uid}" "${prefix}_GID=${gid}" "${prefix}_HOME=${home}"
+}
+
+if [ "$(id -u)" = "0" ]; then
+  runner_user="${SRE_RUNNER_USER:-runner}"
+  agent_user="${SRE_AGENT_USER:-agent}"
+  if [ "$runner_user" = "$agent_user" ]; then
+    echo "sre-agent-fix-runner: the runner and the agent must be different accounts, and both are ${runner_user}" >&2
+    exit 1
+  fi
+  resolve_account runner "$runner_user" SRE_RUNNER
+  resolve_account agent "$agent_user" SRE_AGENT
+  if [ "$SRE_RUNNER_UID" = "0" ] || [ "$SRE_AGENT_UID" = "0" ]; then
+    echo "sre-agent-fix-runner: neither ${runner_user} nor ${agent_user} may be root" >&2
+    exit 1
+  fi
+elif [ -n "${SRE_AGENT_USER:-}" ]; then
+  if ! command -v setpriv >/dev/null 2>&1; then
+    echo "sre-agent-fix-runner: setpriv is not on PATH, and it is how a runner that is not root starts the agent as ${SRE_AGENT_USER}; install util-linux" >&2
+    exit 1
+  fi
+  resolve_account agent "$SRE_AGENT_USER" SRE_AGENT
+fi
+
 exec node "${package_root}/runner/runner.js" "$@"

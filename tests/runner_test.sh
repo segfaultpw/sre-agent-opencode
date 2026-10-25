@@ -88,6 +88,21 @@ cat > "$work/bin/git" <<EOF
 # the unmasked URL on stderr, which is how a real git reports one, so the case
 # that follows can prove the runner redacts what it logs and reports.
 set -euo pipefail
+# The runner puts the same two settings in front of every call, so that a hook
+# or a command-running setting left in a reused clone never runs. The raw log
+# keeps them (a case checks every call carried them); the ordinary log and the
+# argument positions below do not, so a case reads the call itself.
+if [ -n "\${FAKE_GIT_RAW_LOG:-}" ]; then
+  # hardened-env marks a call whose environment already carries the settings
+  # (a git that a script or gh starts); the flags are on the runner's own.
+  if [ "\${GIT_CONFIG_KEY_0:-}" = "core.hooksPath" ] && [ "\${GIT_CONFIG_KEY_1:-}" = "core.fsmonitor" ]; then marker=hardened-env; else marker=plain-env; fi
+  printf '%s %s\n' "\$marker" "\$*" >> "\$FAKE_GIT_RAW_LOG"
+fi
+hardening=()
+if [ "\${1:-}" = "-c" ] && [ "\${2:-}" = "core.hooksPath=/dev/null" ] && [ "\${3:-}" = "-c" ] && [ "\${4:-}" = "core.fsmonitor=false" ]; then
+  hardening=(-c core.hooksPath=/dev/null -c core.fsmonitor=false)
+  shift 4
+fi
 if [ -n "\${FAKE_GIT_LOG:-}" ]; then
   printf '%s\n' "\$*" | sed -e 's#://[^@ ]*@#://[redacted]@#g' >> "\$FAKE_GIT_LOG"
 fi
@@ -100,11 +115,11 @@ for a in "\$@"; do
   # Only a URL is redirected. The commit identity is a github.com address too,
   # and rewriting it would make git reject the config rather than the remote.
   case "\$a" in
-    https://*github.com/*) args+=("$remote") ;;
+    https://*github.com/*) args+=("\${FAKE_GIT_REMOTE:-$remote}") ;;
     *) args+=("\$a") ;;
   esac
 done
-exec "$real_git" "\${args[@]}"
+exec "$real_git" "\${hardening[@]}" "\${args[@]}"
 EOF
 chmod +x "$work/bin/git"
 
@@ -128,6 +143,7 @@ install -m 755 "$here/fixture/stub_opencode.sh" "$work/bin/opencode"
 
 export PATH="$work/bin:$PATH"
 export FAKE_GIT_LOG="$git_log" FAKE_GH_LOG="$gh_log" FAKE_GH_BODY="$gh_body"
+export FAKE_GIT_RAW_LOG="$work/git_raw.log"
 export STUB_OPENCODE_LOG="$opencode_log" STUB_OPENCODE_BRIEF_OUT="$brief_seen"
 export FIXTURE_PORT_FILE="$port_file" FIXTURE_API_KEY="$api_key"
 export FIXTURE_HANDOFF_TOKEN="$handoff_token" FIXTURE_BRIEF_FILE="$brief_file"
@@ -717,11 +733,156 @@ echo "--- 30. a repository whose memory directory cannot be named still gets its
 long_name="$(printf 'a%.0s' $(seq 1 101))"
 start_fixture memory_unnamed
 queue_one h-memory-unnamed "acme/$long_name"
+export STUB_OPENCODE_MEMORY_SUMMARY="kept in the body"
 run_once memory_unnamed
+unset STUB_OPENCODE_MEMORY_SUMMARY
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request is answered with a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
 if grep -q 'memory could not be prepared' "$out" && grep -qx 'memory_files: absent' "$opencode_log"; then echo "ok   the run goes ahead without memory, and the log says so"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
 if ! grep -qF 'sre-agent-memory:' "$brief_seen"; then echo "ok   the prompt carries no memory block"; else echo "FAIL the prompt carries a memory block"; fail=1; fi
+if grep -qF 'kept in the body' "$gh_body"; then echo "ok   without a memory block a ## Memory section is the agent's own text and stays in the body"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 stop_fixture
+
+echo "--- 31. a reused clone cannot run its own hooks or settings, and keeps nothing ignored between requests ---"
+# The workspace persists across requests and across task replacements, so what
+# a run leaves in a clone is what the next request's git calls meet.
+clone="$workspace/repos/acme/app"
+mkdir -p "$clone/.git/hooks"
+printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$work/hook-ran" > "$clone/.git/hooks/pre-commit"
+chmod +x "$clone/.git/hooks/pre-commit"
+# hooksPath is set here because a machine's own global setting would otherwise
+# stand in front of the clone's hooks directory and hide the case.
+printf '[core]\n\thooksPath = %s\n\tfsmonitor = touch %s\n[alias]\n\tstatus = !touch %s\n' "$clone/.git/hooks" "$work/fsmonitor-ran" "$work/alias-ran" >> "$clone/.git/config"
+printf 'left behind\n' > "$clone/ignored-leftover.tmp"
+printf 'ignored-leftover.tmp\n' >> "$clone/.git/info/exclude"
+: > "$work/git_raw.log"
+start_fixture hardened
+queue_one h-hardened acme/app
+export STUB_OPENCODE_MODE=fix
+run_once hardened
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request is answered with a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ ! -e "$work/hook-ran" ]; then echo "ok   a hook left in .git/hooks does not run"; else echo "FAIL the pre-commit hook ran"; fail=1; fi
+if [ ! -e "$work/fsmonitor-ran" ] && [ ! -e "$work/alias-ran" ]; then echo "ok   a command in .git/config does not run"; else echo "FAIL a command from .git/config ran"; fail=1; fi
+if ! grep -qE 'fsmonitor|alias' "$clone/.git/config" && grep -qF "url = https://github.com/acme/app.git" "$clone/.git/config"; then echo "ok   .git/config is the runner's own, with the clean origin URL"; else echo "FAIL .git/config: $(cat "$clone/.git/config")"; fail=1; fi
+if [ ! -e "$clone/ignored-leftover.tmp" ]; then echo "ok   an ignored file from an earlier request is cleaned"; else echo "FAIL the ignored file survived"; fail=1; fi
+if [ -s "$work/git_raw.log" ] && ! grep -q '^plain-env ' "$work/git_raw.log"; then echo "ok   every git call, the runner's own and the ones its scripts start, ran with the hook and fsmonitor settings in its environment ($(wc -l < "$work/git_raw.log") calls)"; else echo "FAIL calls without them: $(grep '^plain-env ' "$work/git_raw.log" | head -n 3)"; fail=1; fi
+if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false ' "$work/git_raw.log")" -ge 8 ] && ! grep -v -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false ' "$work/git_raw.log" | grep -qv -E '^hardened-env (rev-parse|update-index|ls-files) '; then echo "ok   the runner's own git calls carry the settings as arguments too; only its scripts' calls rely on the environment"; else echo "FAIL calls: $(grep -v -E ' -c core\.hooksPath=/dev/null ' "$work/git_raw.log" | head -n 5)"; fail=1; fi
+stop_fixture
+
+echo "--- 31b. a .git that is no longer a directory is not trusted ---"
+rm -rf "$clone/.git"
+printf 'gitdir: /nonexistent\n' > "$clone/.git"
+start_fixture gitfile
+queue_one h-gitfile acme/app
+run_once gitfile
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ -d "$clone/.git" ]; then echo "ok   the clone is made again and the request is answered"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 32. a repository that tracks .sre-agent-memory is refused with the reason ---"
+remote2="$work/remote/tracked.git"
+"$real_git" init -q --bare -b main "$remote2"
+"$real_git" init -q -b main "$work/seed2"
+mkdir -p "$work/seed2/.sre-agent-memory"
+printf 'theirs\n' > "$work/seed2/.sre-agent-memory/NOTES.md"
+printf 'x\n' > "$work/seed2/README.md"
+"$real_git" -C "$work/seed2" add -A
+"$real_git" -C "$work/seed2" -c user.name=seed -c user.email=seed@example.invalid commit -q -m "seed"
+"$real_git" -C "$work/seed2" push -q "$remote2" main
+export FAKE_GIT_REMOTE="$remote2"
+start_fixture tracked
+queue_one h-tracked acme/tracked
+run_once tracked
+unset FAKE_GIT_REMOTE
+if [ "$rc" -eq 0 ] && jq -e '.evidence.error | test("tracks .sre-agent-memory")' <<<"$report" >/dev/null; then echo "ok   the report says the repository tracks the name the runner uses"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ ! -s "$opencode_log" ] && ! grep -q ' push ' "$git_log"; then echo "ok   the agent never runs and nothing is pushed"; else echo "FAIL the run went ahead: $(cat "$opencode_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 33. control characters in the notes do not reach the prompt ---"
+seed_memory
+printf 'line one \033[31mred\007 bell\rafter cr\nline two\twith a tab\n' > "$mem/NOTES.md"
+start_fixture controls
+queue_one h-controls acme/app
+export STUB_OPENCODE_MODE=decline
+run_once controls
+export STUB_OPENCODE_MODE=fix
+if ! LC_ALL=C grep -q $'\033' "$brief_seen" && ! LC_ALL=C grep -q $'\007' "$brief_seen" && ! LC_ALL=C grep -q $'\r' "$brief_seen"; then echo "ok   escape, bell and carriage return are gone from the prompt"; else echo "FAIL the prompt carries a control character"; fail=1; fi
+if grep -qE 'line one .\[31mred' "$brief_seen"; then echo "ok   the text around them is kept"; else echo "FAIL prompt: $(grep -n 'line one' "$brief_seen")"; fail=1; fi
+if grep -q "$(printf 'line two\twith a tab')" "$brief_seen"; then echo "ok   a tab and the line breaks are kept"; else echo "FAIL the tab line is not in the prompt"; fail=1; fi
+stop_fixture
+
+echo "--- 34. the ## Memory section is cut out only when a memory block was given, and only up to the next heading ---"
+seed_memory
+start_fixture memory_tail
+queue_one h-memory-tail acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY_SUMMARY="saved a note about the pool" STUB_OPENCODE_TAIL=$'## Verification\nRan the unit tests and they passed.'
+run_once memory_tail
+unset STUB_OPENCODE_TAIL
+if grep -qF 'Ran the unit tests and they passed.' "$gh_body" && ! grep -qF 'saved a note about the pool' "$gh_body"; then echo "ok   the text after the memory section stays in the pull request body, the section does not"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+stop_fixture
+
+echo "--- 35. memory content copied under another name is refused before it is staged ---"
+seed_memory
+start_fixture copyout
+queue_one h-copyout acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=copyout
+unset STUB_OPENCODE_MEMORY_SUMMARY
+run_once copyout
+unset STUB_OPENCODE_MEMORY
+if jq -e '.evidence.flagged_paths | index("docs/notes-copy.md")' <<<"$report" >/dev/null; then echo "ok   the report names the file that holds a memory file's content"; else echo "FAIL report: $report"; fail=1; fi
+if jq -e '.summary | test("memory")' <<<"$report" >/dev/null && ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed and the summary says why"; else echo "FAIL summary: $(jq -r .summary <<<"$report") git: $(cat "$git_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 36. a start puts back a memory directory a crash left aside, and removes the staging leftovers ---"
+mkdir -p "$workspace/memory/acme/lost.sre-agent-old-99" "$workspace/memory/acme/app.sre-agent-new-98"
+printf 'what a crash left aside\n' > "$workspace/memory/acme/lost.sre-agent-old-99/NOTES.md"
+printf 'half written\n' > "$workspace/memory/acme/app.sre-agent-new-98/NOTES.md"
+queue_none
+start_fixture recover
+run_once recover
+if [ "$(cat "$workspace/memory/acme/lost/NOTES.md" 2>/dev/null)" = "what a crash left aside" ] && [ ! -e "$workspace/memory/acme/app.sre-agent-new-98" ] && [ ! -e "$workspace/memory/acme/lost.sre-agent-old-99" ]; then echo "ok   the directory is back and the half written one is gone"; else echo "FAIL $(find "$workspace/memory/acme" -maxdepth 1 | sort)"; fail=1; fi
+if grep -q 'acme/lost was put back' "$out"; then echo "ok   the log says what was put back"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
+stop_fixture
+unset STUB_OPENCODE_MEMORY_SUMMARY
+
+echo "--- 37. what is saved is the snapshot that was checked, not the working copy read again ---"
+# A process the agent started can outlive the run and change a file after the
+# runner has judged the copy. The seam is the one place that can be driven
+# deterministically: the copy is changed the moment the snapshot returns.
+cat > "$work/snapshot_tamper.js" <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const runnerPath = process.argv[2];
+const runner = require(runnerPath);
+const memory = require(path.join(path.dirname(runnerPath), 'memory.js'));
+const ws = process.argv[3];
+const dir = path.join(ws, 'tamper-scratch');
+fs.mkdirSync(path.join(ws, 'memory', '_estate'), { recursive: true });
+fs.writeFileSync(path.join(ws, 'memory', '_estate', 'NOTES.md'), 'the earlier notes\n');
+fs.mkdirSync(dir, { recursive: true });
+const config = { workspace: ws, identity: { mode: 'none', runner: null, agent: null } };
+const mem = runner.internals.openMemory(config, { dir }, null);
+fs.writeFileSync(path.join(mem.copy, 'NOTES.md'), 'the notes that were checked\n');
+const realSnapshot = memory.snapshot;
+memory.snapshot = (target) => {
+  const snap = realSnapshot(target);
+  if (target === mem.copy) {
+    fs.writeFileSync(path.join(mem.copy, 'NOTES.md'), 'x'.repeat(70000));
+    fs.mkdirSync(path.join(mem.copy, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(mem.copy, 'scripts', 'late.sh'), 'echo added after the check\n');
+  }
+  return snap;
+};
+const result = { memoryChanges: [], memorySummary: '', memoryNotes: [] };
+runner.internals.closeMemory(mem, result);
+memory.snapshot = realSnapshot;
+fs.writeFileSync(process.argv[4], JSON.stringify(result));
+EOF
+rm -rf "$work/tamper-ws"
+mkdir -p "$work/tamper-ws"
+rc=0
+timeout 60 node "$work/snapshot_tamper.js" "$runner" "$work/tamper-ws" "$work/tamper.json" > "$work/tamper.out" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] && [ "$(cat "$work/tamper-ws/memory/_estate/NOTES.md")" = "the notes that were checked" ]; then echo "ok   the saved NOTES.md is the one that was checked, not the 70000 bytes it became"; else echo "FAIL rc=$rc: $(cat "$work/tamper.out") $(ls -l "$work/tamper-ws/memory/_estate")"; fail=1; fi
+if [ ! -e "$work/tamper-ws/memory/_estate/scripts/late.sh" ]; then echo "ok   a file that appeared after the check is not saved"; else echo "FAIL late.sh was saved"; fail=1; fi
+if [ ! -e "$work/tamper-ws/tamper-scratch/.sre-agent-memory" ]; then echo "ok   the working copy is removed"; else echo "FAIL the copy is still there"; fail=1; fi
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
 # The runner cannot deploy, so it cannot verify a fix in a running system. The

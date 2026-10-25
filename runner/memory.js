@@ -25,6 +25,7 @@ const MAX_DIR_BYTES = 1048576;
 const MAX_CHANGES = 50;
 const MAX_PATH_CHARS = 300;
 const MAX_DEPTH = 4;
+const MAX_ENTRIES = 200;
 const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // Top-level names the runner owns. An old clone under an owner called one of
 // these cannot be told from the runner's own directory, so it is not migrated
@@ -120,13 +121,19 @@ function migrate(workspace) {
   return moved;
 }
 
-// Hashes in 64 KiB reads so a large file never sits in memory whole. The
-// content is kept (for restoring) only while the kept total stays inside the
-// per-directory bound, which is also the most a restore could ever need.
-function readEntry(full, stat, retained) {
+// Hashes in 64 KiB reads so a large file never sits in memory whole. A file
+// is read only while the directory total stays inside the bound: one that is
+// larger than what is left, or that grows past it while it is being read, is
+// reported as oversize without a hash, so a crafted or runaway file costs one
+// bound's worth of reading, never its own size. The content is kept (for
+// restoring and for saving) only while the kept total stays inside the bound.
+function readEntry(full, stat, budget) {
+  const mode = stat.mode & 0o777;
+  const left = MAX_DIR_BYTES - budget.read;
+  if (stat.size > left) return { bytes: stat.size, sha256: null, mode, oversize: true };
   const fd = fs.openSync(full, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
-    const keep = stat.size <= MAX_DIR_BYTES && retained.total + stat.size <= MAX_DIR_BYTES;
+    const keep = budget.kept + stat.size <= MAX_DIR_BYTES;
     const hash = crypto.createHash('sha256');
     const chunks = [];
     const buffer = Buffer.allocUnsafe(65536);
@@ -135,13 +142,18 @@ function readEntry(full, stat, retained) {
       const read = fs.readSync(fd, buffer, 0, buffer.length, null);
       if (read === 0) break;
       bytes += read;
+      if (bytes > left) {
+        budget.read = MAX_DIR_BYTES;
+        return { bytes: stat.size, sha256: null, mode, oversize: true };
+      }
       hash.update(buffer.subarray(0, read));
       if (keep) chunks.push(Buffer.from(buffer.subarray(0, read)));
     }
-    const entry = { bytes, sha256: hash.digest('hex'), mode: stat.mode & 0o777 };
+    budget.read += bytes;
+    const entry = { bytes, sha256: hash.digest('hex'), mode };
     if (keep) {
       entry.content = Buffer.concat(chunks);
-      retained.total += bytes;
+      budget.kept += bytes;
     }
     return entry;
   } finally {
@@ -151,18 +163,23 @@ function readEntry(full, stat, retained) {
 
 // Map of relative path (forward slashes) to {bytes, sha256, mode, content}.
 // Regular files only: a symlink, a FIFO or a device is not part of the memory.
+// At most MAX_ENTRIES files are listed; past that the map carries `truncated`.
 function snapshot(dir) {
   const out = new Map();
-  const retained = { total: 0 };
+  const budget = { read: 0, kept: 0 };
   const walk = (current, prefix, depth) => {
     for (const name of readDirOrEmpty(current)) {
+      if (out.size >= MAX_ENTRIES) {
+        Object.defineProperty(out, 'truncated', { value: true });
+        return;
+      }
       const full = path.join(current, name);
       const stat = lstatOrNull(full);
       if (!stat) continue;
       if (stat.isDirectory()) {
         if (depth < MAX_DEPTH) walk(full, `${prefix}${name}/`, depth + 1);
       } else if (stat.isFile()) {
-        out.set(`${prefix}${name}`, readEntry(full, stat, retained));
+        out.set(`${prefix}${name}`, readEntry(full, stat, budget));
       }
     }
   };
@@ -170,9 +187,41 @@ function snapshot(dir) {
   return out;
 }
 
+// What a snapshot breaks, one sentence each; empty when it is safe to save.
+// enforce() makes a directory pass this, but a process the agent started can
+// outlive the run and change a file after enforce looked, so the save judges
+// the snapshot it is about to write, not the directory.
+function check(snap) {
+  const problems = [];
+  if (snap.truncated) problems.push(`it holds more than ${MAX_ENTRIES} files`);
+  let total = 0;
+  let scripts = 0;
+  for (const [rel, entry] of snap) {
+    if (entry.oversize) problems.push(`${rel} is larger than the memory directory's ${MAX_DIR_BYTES} byte limit allows`);
+    if (!entry.oversize && !Buffer.isBuffer(entry.content)) problems.push(`${rel} has no content to save`);
+    total += entry.bytes;
+    if (rel === NOTES) {
+      if (entry.bytes > MAX_NOTES_BYTES) problems.push(`${NOTES} is ${entry.bytes} bytes, over the ${MAX_NOTES_BYTES} byte limit`);
+    } else if (rel.startsWith(`${SCRIPTS}/`) && !rel.slice(SCRIPTS.length + 1).includes('/') && validName(rel.slice(SCRIPTS.length + 1))) {
+      scripts += 1;
+    } else {
+      problems.push(`${rel} is not ${NOTES} or a script`);
+    }
+  }
+  if (scripts > MAX_SCRIPTS) problems.push(`it holds ${scripts} scripts, over the ${MAX_SCRIPTS} limit`);
+  if (total > MAX_DIR_BYTES) problems.push(`it holds ${total} bytes, over the ${MAX_DIR_BYTES} byte limit`);
+  return problems;
+}
+
+// The id git gives a file's content, so a staged blob can be compared with a
+// memory file without reading either through git.
+function blobSha(content) {
+  return crypto.createHash('sha1').update(`blob ${content.length}\0`).update(content).digest('hex');
+}
+
 function hashFile(full) {
   const stat = fs.lstatSync(full);
-  return readEntry(full, stat, { total: MAX_DIR_BYTES }).sha256;
+  return readEntry(full, stat, { read: 0, kept: MAX_DIR_BYTES }).sha256;
 }
 
 // Applies the bounds to a memory directory the agent has just worked in.
@@ -246,6 +295,7 @@ function enforce(dir, previous = new Map()) {
         continue;
       }
       const stat = lstatOrNull(abs(rel));
+      if (!stat) continue;
       if (!stat.isFile()) {
         revert(rel, 'it was not a regular file');
         continue;
@@ -325,6 +375,35 @@ function changes(before, after, rootPrefix) {
     .slice(0, MAX_CHANGES);
 }
 
+// A crash between the two renames that swap a memory directory in leaves
+// `<name>.old-<pid>` with no `<name>`, and a crash while one is being built
+// leaves `<name>.new-<pid>`. Called before the first poll: a lone .old is put
+// back, every other leftover is removed. Returns one sentence per action.
+function recover(workspace) {
+  const notes = [];
+  const { memory: root } = layout(workspace);
+  const parents = [root];
+  for (const name of readDirOrEmpty(root)) {
+    if (isRealDirectory(path.join(root, name))) parents.push(path.join(root, name));
+  }
+  for (const parent of parents) {
+    for (const name of readDirOrEmpty(parent)) {
+      const match = /^(.+)\.sre-agent-(new|old)-\d+$/.exec(name);
+      if (!match) continue;
+      const leftover = path.join(parent, name);
+      const live = path.join(parent, match[1]);
+      if (match[2] === 'old' && !lstatOrNull(live) && isRealDirectory(leftover)) {
+        fs.renameSync(leftover, live);
+        notes.push(`${path.relative(root, live)} was put back from ${name}, left aside by a run that stopped while saving it`);
+      } else {
+        fs.rmSync(leftover, { recursive: true, force: true });
+        notes.push(`${path.relative(root, leftover)} was removed, left by a run that stopped while saving`);
+      }
+    }
+  }
+  return notes;
+}
+
 module.exports = {
   NOTES,
   SCRIPTS,
@@ -340,4 +419,7 @@ module.exports = {
   snapshot,
   enforce,
   changes,
+  check,
+  blobSha,
+  recover,
 };

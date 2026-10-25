@@ -471,6 +471,115 @@ test('snapshot, enforce and changes agree end to end on one run', () => {
   ]);
 });
 
+test('enforce survives a script that disappears between the listing and the check', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'n');
+  put(dir, 'scripts/gone.sh', 'x');
+  put(dir, 'scripts/stays.sh', 'y');
+  const real = fs.lstatSync;
+  fs.lstatSync = (target, ...rest) => {
+    if (String(target).endsWith('gone.sh')) {
+      const error = new Error('ENOENT: no such file or directory');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return real(target, ...rest);
+  };
+  let result;
+  try {
+    result = memory.enforce(dir, new Map());
+  } finally {
+    fs.lstatSync = real;
+  }
+  assert.ok(result.kept.includes('scripts/stays.sh'));
+  assert.ok(!result.kept.includes('scripts/gone.sh'));
+});
+
+test('snapshot stops reading at the directory bound and marks the file oversize', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'small');
+  put(dir, 'scripts/a.sh', 'a'.repeat(700000));
+  put(dir, 'scripts/b.sh', 'b'.repeat(700000));
+  const snap = memory.snapshot(dir);
+  assert.equal(snap.get('scripts/a.sh').oversize, undefined);
+  assert.equal(snap.get('scripts/b.sh').oversize, true);
+  assert.equal(snap.get('scripts/b.sh').sha256, null);
+  assert.equal(snap.get('scripts/b.sh').content, undefined);
+  assert.ok(memory.check(snap).some((problem) => /scripts\/b\.sh/.test(problem)));
+});
+
+test('a file that grows while it is read is cut at the bound, not hashed whole', () => {
+  const dir = fresh();
+  put(dir, 'scripts/grow.sh', 'g'.repeat(100));
+  const real = fs.lstatSync;
+  fs.lstatSync = (target, ...rest) => {
+    const stat = real(target, ...rest);
+    if (String(target).endsWith('grow.sh')) {
+      fs.writeFileSync(target, 'g'.repeat(memory.MAX_DIR_BYTES + 5000));
+    }
+    return stat;
+  };
+  let snap;
+  try {
+    snap = memory.snapshot(dir);
+  } finally {
+    fs.lstatSync = real;
+  }
+  assert.equal(snap.get('scripts/grow.sh').oversize, true);
+  assert.ok(memory.check(snap).length > 0);
+});
+
+test('check accepts what enforce leaves and names every bound a snapshot breaks', () => {
+  const ok = fresh();
+  put(ok, 'NOTES.md', 'notes');
+  put(ok, 'scripts/a.sh', 'echo a\n');
+  assert.deepEqual(memory.check(memory.snapshot(ok)), []);
+  assert.deepEqual(memory.check(new Map()), []);
+
+  const notes = new Map([['NOTES.md', { bytes: memory.MAX_NOTES_BYTES + 1, sha256: 'x', mode: 0o600, content: Buffer.alloc(0) }]]);
+  assert.ok(memory.check(notes).some((problem) => /NOTES\.md/.test(problem)));
+
+  const many = new Map();
+  for (let i = 0; i < 51; i += 1) many.set(`scripts/s${i}.sh`, { bytes: 1, sha256: 'x', mode: 0o600, content: Buffer.from('x') });
+  assert.ok(memory.check(many).some((problem) => /51 scripts/.test(problem)));
+
+  const stray = new Map([['other/file', { bytes: 1, sha256: 'x', mode: 0o600, content: Buffer.from('x') }]]);
+  assert.ok(memory.check(stray).some((problem) => /other\/file/.test(problem)));
+
+  const total = new Map([
+    ['scripts/a.sh', { bytes: 600000, sha256: 'x', mode: 0o600, content: Buffer.alloc(0) }],
+    ['scripts/b.sh', { bytes: 600000, sha256: 'x', mode: 0o600, content: Buffer.alloc(0) }],
+  ]);
+  assert.ok(memory.check(total).some((problem) => /bytes/.test(problem)));
+});
+
+test('recover puts a lone .old directory back and removes the staging leftovers', () => {
+  const ws = fresh();
+  put(ws, 'memory/acme/api.sre-agent-old-111/NOTES.md', 'the memory a crash left aside');
+  put(ws, 'memory/acme/web/NOTES.md', 'live');
+  put(ws, 'memory/acme/web.sre-agent-old-222/NOTES.md', 'older');
+  put(ws, 'memory/acme/web.sre-agent-new-333/NOTES.md', 'half written');
+  put(ws, 'memory/_estate.sre-agent-new-444/NOTES.md', 'half written');
+  put(ws, 'memory/_estate.sre-agent-old-555/NOTES.md', 'estate before the crash');
+  const notes = memory.recover(ws);
+  assert.equal(fs.readFileSync(path.join(ws, 'memory/acme/api/NOTES.md'), 'utf8'), 'the memory a crash left aside');
+  assert.equal(fs.readFileSync(path.join(ws, 'memory/acme/web/NOTES.md'), 'utf8'), 'live');
+  assert.equal(fs.readFileSync(path.join(ws, 'memory/_estate/NOTES.md'), 'utf8'), 'estate before the crash');
+  assert.deepEqual(listing(path.join(ws, 'memory')), ['_estate/NOTES.md', 'acme/api/NOTES.md', 'acme/web/NOTES.md']);
+  assert.equal(notes.length, 5);
+  assert.deepEqual(memory.recover(ws), []);
+});
+
+test('recover on a workspace with no memory does nothing', () => {
+  assert.deepEqual(memory.recover(fresh()), []);
+  assert.deepEqual(memory.recover(path.join(root, 'does-not-exist')), []);
+});
+
+test('blobSha is the sha1 git hashes a file with', () => {
+  assert.equal(memory.blobSha(Buffer.from('hello\n')), 'ce013625030ba8dba906f756967f9e9ca394464a');
+  assert.equal(memory.blobSha(Buffer.alloc(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 
 if (failed > 0) {

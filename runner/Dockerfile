@@ -56,6 +56,7 @@ RUN apt-get update \
         jq \
         less \
         unzip \
+        util-linux \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -122,14 +123,24 @@ RUN set -eux; \
     rm -rf "/tmp/${dir}.tar.gz" /tmp/gh_checksums.txt "/tmp/${dir}"; \
     gh --version
 
-# One unprivileged account for the runner and, through it, for the agent it
-# starts. The agent has a shell, so what the account can reach is what the
-# agent can reach. The id is fixed rather than allocated, because an operator
-# who mounts a host directory at /workspace has to be able to chown it to
-# something, and that something must not move between releases.
+# Two unprivileged accounts. The agent has a shell, so what its account can
+# reach is what the agent can reach; it therefore is not the runner's account.
+# The runner's holds the workspace, the memory directory, the clones and the
+# runner's git and gh state; the agent's holds a home of its own, and is handed
+# one checkout at a time. The ids are fixed rather than allocated, because an
+# operator who mounts a host directory at /workspace has to be able to chown it
+# to something, and that something must not move between releases (10001 is the
+# account earlier releases ran everything as, so an existing volume keeps
+# working).
 RUN groupadd --gid 10001 runner \
     && useradd --uid 10001 --gid runner \
-       --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner
+       --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner \
+    && groupadd --gid 10002 agent \
+    && useradd --uid 10002 --gid agent \
+       --home-dir /home/agent --create-home --shell /usr/sbin/nologin agent \
+    && chmod 0700 /home/runner /home/agent
+ENV SRE_RUNNER_USER=runner
+ENV SRE_AGENT_USER=agent
 
 # The package stays owned by root and is not writable by the account the agent
 # runs under, so a run cannot edit the fences that the next run will load.
@@ -145,7 +156,8 @@ RUN chown -R root:root /opt/sre-agent-opencode \
 # The checkouts and the agent's own state. Mount a volume here to keep clones
 # between restarts; nothing in it is needed to recover a job, since a job that
 # was collected and lost is failed by the platform's sweep.
-RUN mkdir -p /workspace && chown runner:runner /workspace
+# 0711: the agent walks through it to reach its checkout and cannot list it.
+RUN mkdir -p /workspace && chown runner:runner /workspace && chmod 0711 /workspace
 ENV SRE_WORKSPACE=/workspace
 # For every opencode in this image, not only the one the runner starts for the
 # agent. The pinned binary is what enforces the fences, and an update that
@@ -160,6 +172,12 @@ LABEL org.opencontainers.image.source="https://github.com/segfaultpw/sre-agent-o
 LABEL org.opencontainers.image.description="Answers SRE Agent fix requests with opencode on a machine you own"
 LABEL org.opencontainers.image.licenses="MIT"
 
-USER runner
+# Root, in the container only. The runner needs it to start every agent run as
+# the agent's account and to hand it one checkout at a time; the entrypoint
+# resolves the two accounts and runner/runner.js does the switching. It needs
+# CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_KILL
+# and nothing else, which is Docker's default set, and is what a Kubernetes
+# securityContext that drops everything must add back.
+USER root
 WORKDIR /workspace
 ENTRYPOINT ["/opt/sre-agent-opencode/runner/entrypoint.sh"]

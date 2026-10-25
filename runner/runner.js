@@ -57,6 +57,80 @@ const MARKER_PATTERN = /<!-- sre-agent:remediation:[^>]*-->/;
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 
+// Who runs what. The agent has a shell and the package's fences are command
+// patterns, so they cannot stop an interpreter: whatever the agent's uid can
+// reach, the agent can reach. The runner therefore never runs the agent as
+// itself.
+//
+//   root  The container: the runner is root, every git and gh call and every
+//         script runs as the runner's account, and opencode runs as the agent's
+//         (Node's spawn uid and gid, which also clears the supplementary
+//         groups). Root exists in the container only to make that switch.
+//   caps  A host: the runner is an unprivileged account holding CAP_SETUID,
+//         CAP_SETGID, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_KILL as
+//         ambient capabilities, and starts opencode through setpriv, which
+//         switches to the agent's account and clears the capabilities, because
+//         an ambient capability would otherwise survive into the agent.
+//   none  No agent account is configured (a developer's machine, the tests):
+//         the agent runs as the runner's own account, so nothing the scrub of
+//         its environment removes is out of its reach, and the log says so.
+//
+// The agent is handed the current run's checkout only, by chown for the length
+// of the run, and the runner takes it back before it reads or stages a byte.
+// /workspace/memory, the runner's environment (procfs refuses another uid) and
+// every other clone stay the runner's account's alone.
+const NO_IDENTITY = { mode: 'none', runner: null, agent: null };
+let identity = NO_IDENTITY;
+
+function idFrom(env, name) {
+  const raw = env[name];
+  if (typeof raw !== 'string' || !/^[0-9]+$/.test(raw)) return null;
+  return Number.parseInt(raw, 10);
+}
+
+function accountFrom(env, prefix) {
+  const uid = idFrom(env, `${prefix}_UID`);
+  const gid = idFrom(env, `${prefix}_GID`);
+  const home = env[`${prefix}_HOME`] || '';
+  return { uid, gid, home, complete: uid !== null && gid !== null && path.isAbsolute(home) };
+}
+
+function loadIdentity(env, own) {
+  const agent = accountFrom(env, 'SRE_AGENT');
+  if (own.uid === 0) {
+    const runner = accountFrom(env, 'SRE_RUNNER');
+    const missing = [];
+    for (const [prefix, account] of [['SRE_RUNNER', runner], ['SRE_AGENT', agent]]) {
+      if (!account.complete) missing.push(`${prefix}_UID, ${prefix}_GID and ${prefix}_HOME`);
+    }
+    if (missing.length > 0) {
+      throw fatal(
+        `the runner is root, which it only is to start the agent as another account, and needs ${missing.join(' and ')} (the container entrypoint sets them from SRE_RUNNER_USER and SRE_AGENT_USER)`
+      );
+    }
+    if (runner.uid === 0 || agent.uid === 0 || runner.uid === agent.uid) {
+      throw fatal('SRE_RUNNER_UID and SRE_AGENT_UID must be different accounts, and neither may be root');
+    }
+    return { mode: 'root', runner, agent };
+  }
+  if (env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '') {
+    if (!agent.complete) throw fatal('SRE_AGENT_UID needs SRE_AGENT_GID and an absolute SRE_AGENT_HOME with it');
+    if (agent.uid === own.uid) throw fatal('SRE_AGENT_UID is the runner\'s own account, which would split nothing');
+    return { mode: 'caps', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent };
+  }
+  return { mode: 'none', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent: null };
+}
+
+function describeIdentity() {
+  if (identity.mode === 'root') {
+    return `as root, starting the agent as uid ${identity.agent.uid} and git as uid ${identity.runner.uid}`;
+  }
+  if (identity.mode === 'caps') {
+    return `as uid ${identity.runner.uid}, starting the agent as uid ${identity.agent.uid} through setpriv`;
+  }
+  return 'with the agent in the runner\'s own account';
+}
+
 // Every secret the process holds, so no code path has to remember to redact.
 // The runner logs into the customer's log aggregator, which has a different
 // audience from ours, and a handoff token there is a live credential for the
@@ -125,6 +199,7 @@ function loadConfig() {
     // Only the exact value 1 opts in. The module's agent_aws_access variable
     // sets it, and a typo must leave the agent without the task role.
     agentAwsAccess: process.env.SRE_AGENT_AWS_ACCESS === '1',
+    identity: loadIdentity(process.env, { uid: process.getuid(), gid: process.getgid() }),
   };
 }
 
@@ -172,15 +247,46 @@ function killGroup(pid, signal) {
   }
 }
 
+// Which account a child runs as. 'runner' is the default, so a git call, a gh
+// call or a script is never the agent's or root's by omission; 'agent' is
+// opencode and nothing else; 'root' is the chown that hands a checkout over.
+function launch(command, args, env, as) {
+  const base = env || process.env;
+  if (identity.mode === 'root' && as !== 'root') {
+    const who = as === 'agent' ? identity.agent : identity.runner;
+    return { command, args, env: { ...base, HOME: who.home }, ids: { uid: who.uid, gid: who.gid } };
+  }
+  if (identity.mode === 'caps' && as === 'agent') {
+    return {
+      command: 'setpriv',
+      args: [
+        `--reuid=${identity.agent.uid}`,
+        `--regid=${identity.agent.gid}`,
+        '--clear-groups',
+        '--inh-caps=-all',
+        '--ambient-caps=-all',
+        '--',
+        command,
+        ...args,
+      ],
+      env: { ...base, HOME: identity.agent.home },
+      ids: {},
+    };
+  }
+  return { command, args, env: base, ids: {} };
+}
+
 function runProcess(command, args, options = {}) {
-  const { cwd, env, input = null, timeoutMs = PROCESS_TIMEOUT_MS } = options;
+  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner' } = options;
+  const launched = launch(command, args, requestedEnv, as);
+  const env = launched.env;
   return new Promise((resolve) => {
     // Its own process group: opencode starts a local server of its own, and a
     // timeout that killed only the parent would leave that child holding the
     // pipes open and the runner waiting on a run it already gave up on.
     let child;
     try {
-      child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawn(launched.command, launched.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'], ...launched.ids });
     } catch (error) {
       resolve({ code: null, stdout: '', stderr: error.message, timedOut: false });
       return;
@@ -253,10 +359,27 @@ function runProcess(command, args, options = {}) {
   });
 }
 
+// A reused clone persists across requests and across task replacements, and
+// the agent works in it, so what it holds is not the runner's to trust: a hook
+// in .git/hooks, a core.fsmonitor or an alias in .git/config would run with the
+// runner's environment (the repository token among it) the next time the runner
+// itself runs git there. Every runner git call carries these two settings, the
+// environment repeats them for any git that gh or a script starts, and
+// .git/config is rewritten from a template before the runner uses the clone.
+const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
+
 function gitEnv() {
   // GIT_TERMINAL_PROMPT=0 turns a missing credential into a failure instead of
   // a service that hangs on a password prompt nobody will ever answer.
-  return { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_KEY_0: 'core.hooksPath',
+    GIT_CONFIG_VALUE_0: '/dev/null',
+    GIT_CONFIG_KEY_1: 'core.fsmonitor',
+    GIT_CONFIG_VALUE_1: 'false',
+  };
 }
 
 function gitSubcommand(args) {
@@ -271,7 +394,7 @@ function gitSubcommand(args) {
 }
 
 async function git(args) {
-  const result = await runProcess('git', args, { env: gitEnv() });
+  const result = await runProcess('git', [...GIT_HARDENING, ...args], { env: gitEnv() });
   if (result.code !== 0) {
     throw new Error(`git ${gitSubcommand(args)} failed: ${redact(result.stderr || result.stdout).trim()}`);
   }
@@ -376,13 +499,161 @@ function parseRepo(fullName) {
   return { owner: match[1], name: match[2], fullName };
 }
 
+// The runner writes into .git as itself or as root, and the agent has just had
+// the checkout: a link where a directory or a file belongs would make that write
+// land somewhere else, so what is not a plain directory or file is replaced.
+function plainDirectory(target) {
+  let stat = null;
+  try {
+    stat = fs.lstatSync(target);
+  } catch {
+    stat = null;
+  }
+  if (stat && !stat.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(target, { recursive: true });
+  ownByRunner(target);
+}
+
 function excludeFromGit(dir, entry) {
   const excludePath = path.join(dir, '.git', 'info', 'exclude');
-  fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+  plainDirectory(path.dirname(excludePath));
+  let stat = null;
+  try {
+    stat = fs.lstatSync(excludePath);
+  } catch {
+    stat = null;
+  }
+  if (stat && !stat.isFile()) fs.rmSync(excludePath, { recursive: true, force: true });
   const exclude = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf8') : '';
   if (!exclude.split('\n').includes(entry)) {
     fs.appendFileSync(excludePath, `${exclude.endsWith('\n') || exclude === '' ? '' : '\n'}${entry}\n`);
   }
+  ownByRunner(excludePath);
+}
+
+// What git needs in .git/config for the runner's own calls, and nothing else:
+// no alias, no filter, no fsmonitor, no sshCommand, no credential helper. It is
+// written before the runner uses a clone and again before it stages one, so
+// neither an earlier request nor the agent leaves a setting behind.
+function resetGitDir(dir, cleanUrl) {
+  const gitDir = path.join(dir, '.git');
+  const stat = fs.lstatSync(gitDir);
+  if (!stat.isDirectory()) throw new Error('.git in the checkout is not a directory, so the checkout cannot be trusted');
+  fs.rmSync(path.join(gitDir, 'hooks'), { recursive: true, force: true });
+  const configPath = path.join(gitDir, 'config');
+  fs.rmSync(configPath, { recursive: true, force: true });
+  fs.writeFileSync(
+    configPath,
+    [
+      '[core]',
+      '\trepositoryformatversion = 0',
+      '\tfilemode = true',
+      '\tbare = false',
+      '\tlogallrefupdates = true',
+      '[remote "origin"]',
+      `\turl = ${cleanUrl}`,
+      '\tfetch = +refs/heads/*:refs/remotes/origin/*',
+      '',
+    ].join('\n'),
+    { flag: 'wx' }
+  );
+  ownByRunner(configPath);
+}
+
+function ownByRunner(target) {
+  if (identity.mode === 'root') fs.lchownSync(target, identity.runner.uid, identity.runner.gid);
+}
+
+// A directory the runner owns. In the split modes the ones above a checkout can
+// be walked through but not listed, so the agent reaches its own checkout and
+// cannot see which other repositories exist, and the ones that hold the runner's
+// own state are closed to everyone else.
+function settleDir(dir, mode) {
+  fs.mkdirSync(dir, { recursive: true });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) throw new Error(`${dir} is not a directory`);
+  ownByRunner(dir);
+  if (identity.mode !== 'none') fs.chmodSync(dir, mode);
+}
+
+async function chownTree(dir, who) {
+  if (identity.mode === 'none') return;
+  const target = who === 'agent' ? identity.agent : identity.runner;
+  const result = await runProcess('chown', ['-R', '-h', `${target.uid}:${target.gid}`, dir], { as: 'root' });
+  if (result.code !== 0) throw new Error(`${dir} could not be given to uid ${target.uid}: ${redact(result.stderr).trim()}`);
+}
+
+// The agent gets the current run's checkout and nothing else. A chown rather
+// than a worktree, because the agent runs git in its checkout and a worktree
+// keeps its index and refs in a directory of the main clone it could not
+// write; a clone is a few seconds of chown, once before and once after.
+async function handOver(dir) {
+  await chownTree(dir, 'agent');
+  if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+}
+
+// A process the agent left behind (a daemon it started, something that put
+// itself in another session) is the agent's uid's, and the uid is what lets the
+// runner find it. Zombies have nothing left to kill.
+async function killAgentProcesses() {
+  if (identity.mode === 'none') return;
+  for (let round = 0; round < 5; round += 1) {
+    let found = 0;
+    for (const entry of fs.readdirSync('/proc')) {
+      if (!/^[0-9]+$/.test(entry)) continue;
+      let status;
+      try {
+        status = fs.readFileSync(`/proc/${entry}/status`, 'utf8');
+      } catch {
+        continue;
+      }
+      const uids = /^Uid:\s+(\d+)\s+(\d+)/m.exec(status);
+      if (!uids || (Number(uids[1]) !== identity.agent.uid && Number(uids[2]) !== identity.agent.uid)) continue;
+      if (/^State:\s+Z/m.test(status)) continue;
+      try {
+        process.kill(Number(entry), 'SIGKILL');
+        found += 1;
+      } catch {
+        // Gone already, which is what the kill was after.
+      }
+    }
+    if (found === 0) return;
+    await sleep(50);
+  }
+}
+
+async function reclaim(dir) {
+  await killAgentProcesses();
+  await chownTree(dir, 'runner');
+  if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+}
+
+// Once, before the first poll. Every directory the agent walks through is
+// 0711 and the runner's state is 0700, whoever created it: the migration moves
+// clones with a directory per owner above them, and an older runner created
+// everything for its one account.
+async function settleWorkspace(config) {
+  if (identity.mode === 'none') return;
+  const base = path.resolve(config.workspace);
+  const lay = memory.layout(base);
+  settleDir(base, 0o711);
+  settleDir(lay.repos, 0o711);
+  for (const owner of fs.readdirSync(lay.repos)) {
+    const ownerDir = path.join(lay.repos, owner);
+    if (!fs.lstatSync(ownerDir).isDirectory()) continue;
+    settleDir(ownerDir, 0o711);
+    for (const name of fs.readdirSync(ownerDir)) {
+      const clone = path.join(ownerDir, name);
+      if (!fs.lstatSync(clone).isDirectory()) continue;
+      ownByRunner(clone);
+      fs.chmodSync(clone, 0o700);
+    }
+  }
+  settleDir(lay.memory, 0o700);
+  settleDir(lay.scratch, 0o700);
+  await chownTree(lay.memory, 'runner');
+  const closed = await runProcess('chmod', ['-R', 'go-rwx', lay.memory]);
+  if (closed.code !== 0) throw new Error(`the memory directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
 }
 
 // Step 3. Prepare the workspace. The credential is passed on the command line
@@ -397,7 +668,7 @@ async function prepareCheckout(config, job, repo) {
   const authUrl = `https://x-access-token:${config.githubToken}@github.com/${repo.owner}/${repo.name}.git`;
   const dir = path.join(memory.layout(config.workspace).repos, repo.owner, repo.name);
 
-  const symref = await runProcess('git', ['ls-remote', '--symref', authUrl, 'HEAD'], { env: gitEnv() });
+  const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', authUrl, 'HEAD'], { env: gitEnv() });
   if (symref.code !== 0) {
     throw new Error(`${repo.fullName} could not be reached: ${redact(symref.stderr).trim()}`);
   }
@@ -406,20 +677,54 @@ async function prepareCheckout(config, job, repo) {
     throw new Error(`${repo.fullName} did not name a default branch`);
   }
 
-  if (!fs.existsSync(path.join(dir, '.git'))) {
+  // A clone is reused only when .git is a real directory: a file there is a
+  // gitfile that sends git to a directory of somebody else's choosing.
+  let gitStat = null;
+  try {
+    gitStat = fs.lstatSync(path.join(dir, '.git'));
+  } catch {
+    gitStat = null;
+  }
+  if (gitStat && !gitStat.isDirectory()) {
+    log('warn', `${repo.fullName}: .git in the clone is not a directory; cloning it again`);
     fs.rmSync(dir, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(dir), { recursive: true });
+    gitStat = null;
+  }
+  if (!gitStat) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    settleDir(memory.layout(config.workspace).repos, 0o711);
+    settleDir(path.dirname(dir), 0o711);
     await git(['clone', authUrl, dir]);
     await git(['-C', dir, 'remote', 'set-url', 'origin', cleanUrl]);
   } else {
+    // Whatever the last run's end left behind is the runner's again before the
+    // runner's git touches it, and git does not read a repository it does not
+    // own.
+    await chownTree(dir, 'runner');
+    resetGitDir(dir, cleanUrl);
     await git(['-C', dir, 'fetch', '--prune', authUrl, '+refs/heads/*:refs/remotes/origin/*']);
   }
+  resetGitDir(dir, cleanUrl);
 
   const branch = `sre-agent/${job.handoff_id}`;
   // -f discards whatever a previous run left behind, so one abandoned run
   // cannot put its changes into the next request's pull request.
   await git(['-C', dir, 'checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
-  await git(['-C', dir, 'clean', '-fd']);
+  // -x as well, twice: ignored files (a build directory, a cache, a planted
+  // script) are the other half of what a request leaves for the next one, and
+  // the second f takes a nested repository with it.
+  await git(['-C', dir, 'clean', '-ffdx']);
+
+  // The runner keeps the agent's notes in .sre-agent-memory/ in the checkout
+  // for the length of a run and deletes it afterwards, so a repository that
+  // tracks the name would have its files deleted and staged as a change on
+  // every request. Refused with the reason, the way a tracked agent file is.
+  const tracked = await git(['-C', dir, 'ls-files', '-z', '--', MEMORY_COPY]);
+  if (tracked.trim()) {
+    throw new Error(
+      `${repo.fullName} tracks ${MEMORY_COPY}/, which is where this runner copies the agent's notes for a run and deletes them afterwards; rename or remove that path in the repository, or the runner would stage its deletion in every pull request`
+    );
+  }
 
   // opencode reads configuration, plugins and agent definitions out of the
   // repository it runs in and merges ours over that rather than replacing it,
@@ -443,7 +748,8 @@ async function prepareCheckout(config, job, repo) {
   // every pull request.
   excludeFromGit(dir, '.opencode/');
 
-  return { dir, repo, branch, defaultBranch, authUrl };
+  if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+  return { dir, repo, branch, defaultBranch, authUrl, cleanUrl };
 }
 
 function prepareScratch(config) {
@@ -452,7 +758,7 @@ function prepareScratch(config) {
   // read the last one, and a directory per request would grow without bound.
   const dir = memory.layout(config.workspace).scratch;
   fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
+  settleDir(dir, 0o700);
   return { dir, repo: null, branch: null, defaultBranch: null, authUrl: null };
 }
 
@@ -478,6 +784,9 @@ function agentConfigContent() {
 const MEMORY_COPY = '.sre-agent-memory';
 const MEMORY_SUMMARY_MAX = 500;
 const SCRIPT_COMMENT_MAX = 200;
+// A memory file shorter than this could match a repository file by chance; a
+// longer one that matches byte for byte is a copy.
+const MEMORY_COPY_MIN_BYTES = 64;
 
 function oneLine(text, max) {
   const flat = String(text).replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ').trim();
@@ -500,13 +809,19 @@ function firstComment(content) {
   return '';
 }
 
+// Notes are text the next run reads as a prompt; a terminal escape or a NUL in
+// them has no use there. Line breaks and tabs stay.
+function printable(text) {
+  return String(text).replace(/\p{Cc}/gu, (char) => (char === '\n' || char === '\t' ? char : ' '));
+}
+
 // The block that goes ahead of the brief. Its markers carry a nonce minted for
 // this run, the same defence the platform's brief uses: whoever wrote a note
 // last could not know the id, so a closing marker spelled inside a note does
 // not close anything. The sentence above the block says what the block is.
 function memoryBlock(mem) {
   const notesEntry = mem.before.get(memory.NOTES);
-  const notes = notesEntry && notesEntry.content ? notesEntry.content.toString('utf8').trimEnd() : '';
+  const notes = notesEntry && notesEntry.content ? printable(notesEntry.content.toString('utf8')).trimEnd() : '';
   const scripts = [...mem.before.keys()].filter((rel) => rel.startsWith(`${memory.SCRIPTS}/`)).sort();
   const listing = scripts.map((rel) => {
     const entry = mem.before.get(rel);
@@ -540,10 +855,10 @@ function openMemory(config, workspace, repo) {
   const before = memory.snapshot(source);
 
   fs.mkdirSync(copy, { recursive: true });
-  for (const rel of before.keys()) {
+  for (const [rel, entry] of before) {
     const target = path.join(copy, ...rel.split('/'));
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.copyFileSync(path.join(source, ...rel.split('/')), target);
+    fs.writeFileSync(target, entry.content, { mode: entry.mode & 0o777, flag: 'wx' });
   }
   if (repo) excludeFromGit(workspace.dir, `${MEMORY_COPY}/`);
 
@@ -554,6 +869,7 @@ function openMemory(config, workspace, repo) {
     source,
     copy,
     before,
+    blobs: new Set(),
     nonce: crypto.randomBytes(4).toString('hex'),
   };
 }
@@ -567,24 +883,30 @@ function memoryDiffers(before, after) {
   return false;
 }
 
-// The new directory is built beside the old one and swapped in, so a crash
-// leaves either the whole old directory or the whole new one.
+// What the runner writes is the snapshot it just judged, never the working
+// copy again: a process the agent left behind can change a file after the
+// check, and the saved memory must be exactly what was bounded. The new
+// directory is built beside the old one and swapped in, so a crash leaves
+// either the whole old directory or the whole new one (memory.recover puts
+// the old one back when a crash fell between the two renames).
 function replaceMemory(mem, after) {
-  const staging = `${mem.source}.new-${process.pid}`;
-  const previous = `${mem.source}.old-${process.pid}`;
+  const staging = `${mem.source}.sre-agent-new-${process.pid}`;
+  const previous = `${mem.source}.sre-agent-old-${process.pid}`;
   fs.rmSync(staging, { recursive: true, force: true });
   fs.rmSync(previous, { recursive: true, force: true });
-  fs.mkdirSync(staging, { recursive: true });
+  settleDir(path.dirname(mem.source), 0o700);
+  settleDir(staging, 0o700);
   try {
-    for (const rel of after.keys()) {
+    for (const [rel, entry] of after) {
+      if (!Buffer.isBuffer(entry.content)) throw new Error(`${rel} has no checked content to save`);
       const target = path.join(staging, ...rel.split('/'));
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      fs.copyFileSync(path.join(mem.copy, ...rel.split('/')), target);
+      settleDir(path.dirname(target), 0o700);
+      fs.writeFileSync(target, entry.content, { mode: entry.mode & 0o100 ? 0o700 : 0o600, flag: 'wx' });
+      ownByRunner(target);
     }
     const existed = fs.existsSync(mem.source);
     if (existed) fs.renameSync(mem.source, previous);
     try {
-      fs.mkdirSync(path.dirname(mem.source), { recursive: true });
       fs.renameSync(staging, mem.source);
     } catch (error) {
       if (existed) fs.renameSync(previous, mem.source);
@@ -611,14 +933,28 @@ function closeMemory(mem, result) {
       // Replaced by a link or a file, or deleted: what the previous run left
       // stands, rather than the memory being wiped by a run that broke its
       // working copy.
-      result.memoryNotes.push(`${MEMORY_COPY}/ was not a directory at the end of the run, so the earlier memory was kept`);
-      log('warn', `memory for ${mem.label}: ${result.memoryNotes[result.memoryNotes.length - 1]}`);
+      const note = `${MEMORY_COPY}/ was not a directory at the end of the run, so the earlier memory was kept`;
+      result.memoryNotes.push(note);
+      log('warn', `memory for ${mem.label}: ${note}`);
       return;
     }
     const enforced = memory.enforce(mem.copy, mem.before);
     const after = memory.snapshot(mem.copy);
     result.memoryNotes.push(...enforced.notes);
     for (const note of enforced.notes) log('warn', `memory for ${mem.label}: ${note}`);
+
+    const problems = memory.check(after);
+    if (problems.length > 0) {
+      const note = `the memory was not saved, so the earlier memory stands: ${problems.join('; ')}`;
+      result.memoryNotes.push(note);
+      log('warn', `memory for ${mem.label}: ${note}`);
+      return;
+    }
+    // Content the memory holds, by the id git gives it, so a copy of it under
+    // another name in the checkout can be recognised when the change is staged.
+    for (const entry of [...mem.before.values(), ...after.values()]) {
+      if (entry.content && entry.content.length >= MEMORY_COPY_MIN_BYTES) mem.blobs.add(memory.blobSha(entry.content));
+    }
     result.memoryChanges = memory.changes(mem.before, after, mem.prefix);
     if (memoryDiffers(mem.before, after)) replaceMemory(mem, after);
     if (result.memoryChanges.length > 0) {
@@ -635,14 +971,27 @@ function closeMemory(mem, result) {
 
 // The agent ends its final message with a "## Memory" section. It is the
 // agent's report of what it did to its memory, so it goes to the memory
-// report and leaves the text that becomes the pull request body.
-function splitMemorySummary(message) {
+// report and leaves the text that becomes the pull request body. It is only
+// looked for when the run was given a memory block, because only then is the
+// heading the agent's answer to the instruction, and the section ends at the
+// next heading, so anything the agent wrote after it stays in the message.
+function splitMemorySummary(message, hadBlock) {
+  if (!hadBlock) return { message, summary: '' };
   const lines = message.split('\n');
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     if (/^##\s+Memory\s*$/i.test(lines[index].trim())) {
+      let end = lines.length;
+      for (let next = index + 1; next < lines.length; next += 1) {
+        if (/^#{1,6}\s/.test(lines[next].trim())) {
+          end = next;
+          break;
+        }
+      }
+      const before = lines.slice(0, index).join('\n').trimEnd();
+      const after = lines.slice(end).join('\n').trim();
       return {
-        message: lines.slice(0, index).join('\n').trimEnd(),
-        summary: oneLine(lines.slice(index + 1).join('\n'), MEMORY_SUMMARY_MAX),
+        message: after ? `${before}\n\n${after}` : before,
+        summary: oneLine(lines.slice(index + 1, end).join('\n'), MEMORY_SUMMARY_MAX),
       };
     }
   }
@@ -688,6 +1037,7 @@ async function runAgent(config, workspace, prompt) {
     cwd: workspace,
     env,
     input: prompt,
+    as: 'agent',
     timeoutMs: config.runTimeoutMs,
   });
 
@@ -726,14 +1076,21 @@ async function runAgent(config, workspace, prompt) {
 // also runs a shell, which can write a file without any tool, so what actually
 // changed is judged here, by the same script the CI door uses, before anything
 // is published.
-async function stageAndGate(dir) {
+async function stageAndGate(workspace, memoryBlobs) {
+  const { dir, cleanUrl } = workspace;
+  // The agent has just had the whole checkout, .git included, so what the
+  // runner stages with is rebuilt first: the config, the hooks and the ignore
+  // entries that keep the runner's own files out of the commit.
+  resetGitDir(dir, cleanUrl);
+  excludeFromGit(dir, '.opencode/');
+  excludeFromGit(dir, `${MEMORY_COPY}/`);
   await git(['-C', dir, 'add', '-A']);
   const staged = (await git(['-C', dir, 'diff', '--cached', '--name-only']))
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
 
-  if (staged.length === 0) return { changed: [], flagged: [] };
+  if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [] };
 
   const gate = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'protected_paths.sh')], {
     input: `${staged.join('\n')}\n`,
@@ -745,7 +1102,20 @@ async function stageAndGate(dir) {
   if (gate.code !== 0 && flagged.length === 0) {
     throw new Error(`the protected paths gate failed to run: ${gate.stderr.trim()}`);
   }
-  return { changed: staged, flagged };
+
+  // The path gate cannot see memory content copied into another file. Memory is
+  // small and its blobs are known, so a staged blob that is a memory file byte
+  // for byte is refused whatever it is called.
+  const memoryCopies = [];
+  if (memoryBlobs.size > 0) {
+    const raw = await git(['-C', dir, 'diff', '--cached', '--raw', '--abbrev=40', '--no-renames', '-z']);
+    const tokens = raw.split('\0');
+    for (let index = 0; index + 1 < tokens.length; index += 2) {
+      const meta = /^:\d+ \d+ [0-9a-f]+ ([0-9a-f]+) [AMT]$/.exec(tokens[index]);
+      if (meta && memoryBlobs.has(meta[1])) memoryCopies.push(tokens[index + 1]);
+    }
+  }
+  return { changed: staged, flagged: [...new Set([...flagged, ...memoryCopies])], memoryCopies };
 }
 
 // The pull request title and the commit message are one line, a Conventional
@@ -801,7 +1171,7 @@ async function publish(config, workspace, message, brief, result) {
   const bodyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-')), 'body.md');
   fs.writeFileSync(bodyPath, pullRequestBody(message, brief, config.version));
 
-  const ghEnv = { ...process.env, GH_TOKEN: config.githubToken, GH_PROMPT_DISABLED: '1' };
+  const ghEnv = { ...gitEnv(), GH_TOKEN: config.githubToken, GH_PROMPT_DISABLED: '1' };
   const base = [
     'pr',
     'create',
@@ -903,6 +1273,7 @@ function isDecline(message) {
 }
 
 async function handleJob(config, job) {
+  identity = config.identity || NO_IDENTITY;
   if (!job || !job.handoff_id || !job.report_url || !job.token) {
     log('error', 'the queue answered with a job carrying no handoff id, report URL or credential; skipping it');
     return;
@@ -958,10 +1329,22 @@ async function handleJob(config, job) {
       log('warn', `memory could not be prepared (${redact(error.message)}); the run goes ahead without it`);
     }
     let agent;
+    let reclaimed = false;
     try {
+      await handOver(workspace.dir);
       agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief);
     } finally {
-      if (mem) closeMemory(mem, result);
+      // Whatever happened, the agent's processes end and the checkout is the
+      // runner's again before the runner reads or stages anything in it. A
+      // checkout that cannot be taken back fails the request, and its memory
+      // copy is dropped unread.
+      try {
+        await reclaim(workspace.dir);
+        reclaimed = true;
+      } finally {
+        if (mem && reclaimed) closeMemory(mem, result);
+        else if (mem) fs.rmSync(mem.copy, { recursive: true, force: true });
+      }
     }
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
@@ -987,7 +1370,7 @@ async function handleJob(config, job) {
     // runner writes itself, or a credential the agent happened to print would
     // be the one place the redaction did not reach.
     agent.finalMessage = redact(agent.finalMessage);
-    const memoryReport = splitMemorySummary(agent.finalMessage);
+    const memoryReport = splitMemorySummary(agent.finalMessage, mem !== null);
     agent.finalMessage = memoryReport.message;
     result.memorySummary = memoryReport.summary;
     result.summary = agent.finalMessage || 'The agent produced no final message.';
@@ -1011,7 +1394,7 @@ async function handleJob(config, job) {
       return result;
     }
 
-    const { changed, flagged } = await stageAndGate(workspace.dir);
+    const { changed, flagged, memoryCopies } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
       return result;
@@ -1021,6 +1404,10 @@ async function handleJob(config, job) {
     if (flagged.length > 0) {
       result.evidence.flagged_paths = flagged;
       result.summary = `${result.summary}\n\nNothing was published: the change touched ${flagged.join(', ')}, which the protected paths gate refuses.`;
+      if (memoryCopies.length > 0) {
+        result.summary = `${result.summary} ${memoryCopies.join(', ')} holds a copy of what the agent keeps in its memory, and memory never goes into a pull request.`;
+        result.evidence.memory_copy_paths = memoryCopies;
+      }
       result.actions.push(`the protected paths gate refused ${flagged.join(', ')}`);
       log('error', `the protected paths gate refused ${flagged.join(', ')}; nothing was pushed`);
       return result;
@@ -1052,7 +1439,17 @@ async function main() {
   if (config.githubToken) constantSecrets.push(config.githubToken);
   logLevel = LEVELS[(process.env.SRE_LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
 
-  log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}`);
+  identity = config.identity;
+  // Files the runner and its children create are the runner's alone; the
+  // directories the agent has to walk through are opened explicitly.
+  if (identity.mode !== 'none') process.umask(0o077);
+  log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}, running ${describeIdentity()}`);
+  if (identity.mode === 'none') {
+    log(
+      'warn',
+      'no agent account is configured (SRE_AGENT_UID), so the agent runs as the runner\'s own account: taking credentials out of its environment is not a boundary, because it can read this process\'s environment and write the memory directory. The container image and the systemd install configure the split.'
+    );
+  }
 
   try {
     const moved = memory.migrate(config.workspace);
@@ -1062,6 +1459,12 @@ async function main() {
   } catch (error) {
     log('warn', `the clones from the earlier layout could not be moved under repos/ (${redact(error.message)}); they will be cloned again`);
   }
+  try {
+    for (const note of memory.recover(config.workspace)) log('info', `memory: ${note}`);
+  } catch (error) {
+    log('warn', `memory directories left by a stopped run could not be put in order (${redact(error.message)})`);
+  }
+  await settleWorkspace(config);
 
   for (;;) {
     let jobs = [];
@@ -1089,7 +1492,7 @@ async function main() {
   }
 }
 
-module.exports = { loadConfig, handleJob };
+module.exports = { loadConfig, handleJob, internals: { openMemory, closeMemory, replaceMemory } };
 
 if (require.main === module) {
   process.on('uncaughtException', (error) => {

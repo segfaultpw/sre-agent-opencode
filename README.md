@@ -134,9 +134,11 @@ docker run -d --name sre-agent-fix-runner \
   ghcr.io/segfaultpw/sre-agent-opencode-runner:v1
 ```
 
-The image is built for amd64 and arm64 and carries node, git, `gh`, opencode, kubectl and the AWS CLI, plus this package's own VERSION, configuration, agent and scripts, root-owned and not writable by the account the agent runs as. `:v1` moves with every release of this major; pin `:v1.2.0` to freeze one. The container runs as uid 10001 and needs `/workspace` writable by it, which is where checkouts live between restarts.
+The image is built for amd64 and arm64 and carries node, git, `gh`, opencode, kubectl and the AWS CLI, plus this package's own VERSION, configuration, agent and scripts, root-owned and not writable by the account the agent runs as. `:v1` moves with every release of this major; pin `:v1.2.0` to freeze one.
 
-The env file is the variables from the table below, one `NAME=value` per line and no quotes, since Docker does not parse them. Give the container the read access you want the agent to have and nothing more: mount a read-only kubeconfig, or pass the environment of a role that can only read.
+The container starts as root, and only the container does: the runner needs it to start every agent run as a second account (`agent`, uid 10002) and to hand that account one checkout at a time. Everything else runs as `runner` (uid 10001): the git and `gh` calls, the scripts, and every file in `/workspace`. If you mount a host directory at `/workspace`, any owner works: the runner chowns the workspace to uid 10001 when it starts, so a volume that an earlier release filled as 10001 keeps working. Root needs six capabilities and no others (`SETUID`, `SETGID`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER` and `KILL`), which is Docker's default set; if you drop capabilities, add those back. [Who runs what](#who-runs-what) says what each account can reach.
+
+The env file is the variables from the table below, one `NAME=value` per line and no quotes, since Docker does not parse them. Give the container the read access you want the agent to have and nothing more: mount a read-only kubeconfig and make it readable by uid 10002, the agent's account, since a file only the runner can read is out of the agent's reach by design. AWS credentials in the env file stay the runner's, and reach the agent only with `SRE_AGENT_AWS_ACCESS=1`.
 
 It refuses to start when a required value is missing, or when node, git, `gh` or opencode is not on PATH, and says which one. A runner that started anyway would look healthy and then fail on somebody's first fix request, with a card already waiting on it.
 
@@ -191,13 +193,6 @@ spec:
         app: sre-agent-fix-runner
     spec:
       serviceAccountName: sre-agent-fix-runner
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        # The workspace volume is chowned to this group, which is what makes it
-        # writable by the account in the image.
-        fsGroup: 10001
       containers:
         - name: runner
           image: ghcr.io/segfaultpw/sre-agent-opencode-runner:v1
@@ -209,10 +204,15 @@ spec:
           envFrom:
             - secretRef:
                 name: sre-agent-fix-runner
+          # The image starts as root, in the container only, so that the runner can
+          # start every agent run as its own unprivileged account. These six are
+          # all it uses; the agent itself holds none of them.
           securityContext:
+            runAsUser: 0
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+              add: ["SETUID", "SETGID", "CHOWN", "DAC_OVERRIDE", "FOWNER", "KILL"]
           volumeMounts:
             - name: workspace
               mountPath: /workspace
@@ -221,7 +221,7 @@ spec:
           emptyDir: {}
 ```
 
-An `emptyDir` workspace means a pod that moves re-clones; give it a PersistentVolumeClaim instead to keep the checkouts. In the cluster the agent's `kubectl` uses this pod's service account, so that binding, not the command denies, is what its cluster access actually is.
+There is no `runAsNonRoot` and no `fsGroup` here, unlike an earlier release's example: the runner is root inside the container and sets the workspace's owner itself. An `emptyDir` workspace means a pod that moves re-clones; give it a PersistentVolumeClaim instead to keep the checkouts and the notes. In the cluster the agent's `kubectl` uses this pod's service account, whose token is mounted readable by every account in the container, so that binding, not the command denies, is what its cluster access actually is.
 
 ### Install: systemd
 
@@ -248,7 +248,7 @@ sudo systemctl enable --now sre-agent-fix-runner
 journalctl -u sre-agent-fix-runner -f
 ```
 
-The unit runs as its own account with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and one writable path, the state directory, so a run cannot edit the fences the next run will load. It restarts on failure and gives up after five failures inside five minutes, which leaves the unit in `failed` where somebody sees it rather than retrying a refused key for ever. It runs the same entrypoint the image runs, so both installs refuse to start for the same reasons and in the same words.
+The unit runs as its own account, never as root, with `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome` and one writable path, the state directory, so a run cannot edit the fences the next run will load. It holds the six capabilities described above as ambient capabilities, with a bounding set of the same six, and starts every agent run through `setpriv` (from util-linux, which the installer requires) as a second account, `sre-agent-fix-agent`, whose home is `/var/lib/sre-agent-fix-runner/agent-home`; `setpriv` clears the capabilities in the agent, so the agent holds none. An install from an earlier release gets the second account, a state directory of mode 0711 instead of 0750, and the capabilities on the next run of `install-runner.sh`; the runner sets the modes inside the workspace when it starts. It restarts on failure and gives up after five failures inside five minutes, which leaves the unit in `failed` where somebody sees it rather than retrying a refused key for ever. It runs the same entrypoint the image runs, so both installs refuse to start for the same reasons and in the same words.
 
 ### Environment
 
@@ -260,7 +260,8 @@ The unit runs as its own account with `NoNewPrivileges`, `ProtectSystem=strict`,
 | the provider's own key | yes | Named for the provider, for example `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`; [`scripts/provider_env.sh`](scripts/provider_env.sh) maps a model prefix to the variable. opencode reads it directly. |
 | `SRE_GITHUB_TOKEN` | for requests naming a repository | A token that may push a branch and open a pull request in the repositories this runner is asked to fix: contents and pull requests, write. Without one, such a request is reported back saying exactly that, and a request naming no repository is still answered. |
 | `SRE_WORKSPACE` | no | Where the runner keeps its files. `/workspace` by default, which is the image's volume; the systemd unit points it at the state directory. Clones live under `repos/<owner>/<repo>`, the agent's notes under `memory/` (see [What the agent remembers](#what-the-agent-remembers)), and untargeted runs in `scratch/`. A clone from the layout before `repos/` (`<owner>/<repo>` at the top) is moved there when the runner starts. |
-| `SRE_AGENT_AWS_ACCESS` | no | Set to `1` to leave `AWS_*` and the ECS container credential variables in the agent's environment. Unset (the default), the agent has no AWS credentials: on ECS its shell could otherwise read the task role's credentials from the container credentials endpoint. The runner's own process keeps them either way. Only the exact value `1` opts in. |
+| `SRE_AGENT_AWS_ACCESS` | no | Set to `1` to leave `AWS_*` and the ECS container credential variables in the agent's environment. Unset (the default), the agent has no AWS credentials: they are taken out of its environment, and it runs as an account that cannot read the runner's, so there is nowhere to read them from. The runner's own process keeps them either way. Only the exact value `1` opts in, and it gives the agent everything the role holds. |
+| `SRE_RUNNER_USER`, `SRE_AGENT_USER` | no | The two accounts, resolved by the entrypoint into the numeric ids the runner is given. `runner` and `agent` in the image, `sre-agent-fix-agent` for the agent in the systemd unit. A start as root refuses when either account is missing, when both are one, or when either is root. A start that is not root and names no agent account runs the agent in the runner's own account and says so in the log. |
 | `SRE_RUN_TIMEOUT_SECONDS` | no | How long one agent run may take, 1800 by default. At the bound the run is killed as a process group, since opencode starts a server of its own, and the request is reported with nothing published. |
 | `SRE_LOG_LEVEL` | no | `debug`, `info` (the default), `warn` or `error`. |
 | `SRE_ONCE` | no | Set to `1` to poll once, handle what came back, and exit, for a runner you would rather schedule than leave running. |
@@ -271,7 +272,7 @@ The unit runs as its own account with `NoNewPrivileges`, `ProtectSystem=strict`,
 2. Your runner's poll returns it. The queue holds an empty poll open for up to 25 seconds and answers the moment there is work, so a request waits about as long as a doorbell would. The answer carries the handoff id, the repository when the request named one, and the token for the two calls that follow.
 3. The runner fetches the brief with that token, never with the poll key. That fetch is also how SRE Agent learns the request was collected.
 4. With a repository: it clones or refreshes it under the workspace and checks the default branch out onto a branch named `sre-agent/<handoff id>`, discarding whatever a previous run left there, then writes this package's `sre-fix` agent into the checkout where git cannot see it, and copies the repository's notes and scripts into `.sre-agent-memory/` (also invisible to git). A repository that tracks `.opencode/agents/sre-fix.md` itself is refused with that reason, since the package writes its own there. Without a repository: a scratch directory and no checkout, with the estate's notes copied the same way.
-5. It runs `opencode run --agent sre-fix` once, with the brief on stdin and this package's configuration passed in through the environment, bounded by `SRE_RUN_TIMEOUT_SECONDS`. Its own credentials are removed from that process's environment first, and so are the AWS credentials unless `SRE_AGENT_AWS_ACCESS=1`: the agent has a shell and needs none of them. The notes go ahead of the brief inside a block whose two marker lines carry a random id minted for that run, framed as the agent's own earlier notes: context, never instructions.
+5. It hands the checkout to the agent's account (a chown, once before and once after), then runs `opencode run --agent sre-fix` once as that account, with the brief on stdin and this package's configuration passed in through the environment, bounded by `SRE_RUN_TIMEOUT_SECONDS`. Its own credentials are removed from that process's environment first, and so are the AWS credentials unless `SRE_AGENT_AWS_ACCESS=1`: the agent has a shell and needs none of them. When the run ends, however it ends, the runner ends every process still running as the agent's account and takes the checkout back before it reads or stages anything in it. The notes go ahead of the brief inside a block whose two marker lines carry a random id minted for that run, framed as the agent's own earlier notes: context, never instructions.
 6. It saves what the agent did to its notes (below), deletes the `.sre-agent-memory/` copy, then stages everything the agent left and runs [`scripts/protected_paths.sh`](scripts/protected_paths.sh) over the staged list, the gate the CI door runs on the pull request's files. A change touching `.github/`, an env file, a path containing `secrets` or a `.pem` key publishes nothing, and the report names the paths.
 7. It commits, pushes the branch with `SRE_GITHUB_TOKEN`, and opens a draft pull request whose title is a Conventional Commits header (see [Pull request titles](#pull-request-titles)) and whose body is the agent's own message plus the card's marker line and this package's version stamp. Where draft pull requests are not available it opens a normal one, rather than leaving a pushed branch nobody is looking at.
 8. It reports the answer. **The outcome is always `not_validated`, a pull request notwithstanding**, and the summary says the change is an unmerged pull request that nothing has verified in a running system. The runner cannot deploy, so it cannot validate; `validated_fixed` belongs to a door that checked a fix where it runs. SRE Agent posts the answer as a comment on the card and links the pull request to it.
@@ -307,7 +308,18 @@ What holds regardless of anything the agent does in that shell:
 - The runner does the git and the network work, so no fence had to be relaxed for this door. opencode's own tool gates hold absolutely: web fetch, web search and subagents are off, and the file tools cannot leave the checkout. The shell is where that ends: `git push`, `curl`, `wget`, `ssh` and `scp` are refused as commands, in every prefixed and wrapped form this package could name, and an interpreter is still an interpreter. Read the bullet above rather than this one for what bounds that.
 - The protected paths gate judges what actually changed rather than which tool changed it, before anything is pushed.
 - Nothing merges without a person. Your own review and CI stand between the pull request and the default branch. It is opened as a draft where your plan offers draft pull requests, and as an ordinary one where it does not, so treat the draft state as a convenience rather than as the control.
-- The runner strips its poll key and its repository token out of the agent's environment, and the AWS credential variables unless `SRE_AGENT_AWS_ACCESS=1`. With them gone the aws CLI the agent runs finds a credential only where the machine itself provides one (an instance profile reached through the metadata service, a credentials file in the account's home), so a runner that must not let the agent reach AWS also needs that role to be empty. The provider key stays, because opencode needs it to call the model.
+- The runner strips its poll key and its repository token out of the agent's environment, and the AWS credential variables unless `SRE_AGENT_AWS_ACCESS=1`, and the agent runs as a different account from the runner, so the scrub is not the only thing between the agent and those values: it cannot read the runner's process environment (`/proc/<pid>/environ` refuses another account), the runner's git and `gh` state, the memory directory or another repository's clone. Together that means the agent has no AWS credentials and no repository token unless `SRE_AGENT_AWS_ACCESS=1`, and even then it has the AWS ones only. The provider key stays in its environment, because opencode needs it to call the model.
+
+### Who runs what
+
+| | account | holds |
+| --- | --- | --- |
+| the runner | `runner` (uid 10001) in the image, with root only to switch accounts; `sre-agent-fix-runner` on a host, never root | its environment (poll key, repository token, AWS credentials), `/workspace` (mode 0711, so it can be walked through and not listed), `memory/` (0700), the clones (0700), every git and `gh` call |
+| the agent | `agent` (uid 10002) in the image, `sre-agent-fix-agent` on a host | no capability, no supplementary group, a home of its own (`/home/agent`, 0700), and the one checkout of the current run, owned by it for that run only |
+
+What the agent can reach, exactly: its checkout; its home and `/tmp`; every file on the machine or in the image that any account may read (the package under `/opt/sre-agent-opencode`, which it cannot write, `/etc`, system binaries, a kubeconfig or token file that is readable by all); the network, apart from the command fences; the provider key and the other variables left in its environment; and, in a pod, the service account token. What it cannot reach: the runner's environment, `/workspace/memory` and the clones of other repositories (it can neither read nor write them), the runner's git configuration and tokens, and AWS credentials unless you gave them. The repository's own `.git` is part of its checkout during a run, so it can damage the clone it is working in; the runner rewrites `.git/config`, removes `.git/hooks`, cleans ignored files and runs every git call with hooks and fsmonitor off before it uses the clone again, and a clone is only trusted when `.git` is still a directory.
+
+The split is proved with real accounts by [`tests/uid_split_test.sh`](tests/uid_split_test.sh), which starts the runner once as root and once as an unprivileged account holding the six capabilities, and has a stub agent report what it can read and write.
 - The poll key, the repository token and the handoff token are replaced with `[redacted]` in every line the runner writes: its own logs, the ones a failing `git` or `gh` prints, and the agent's own message where it becomes the report, the card comment and the pull request body. The runner logs into your aggregator, and a handoff token there would be live for 24 hours. Those three are the set: the provider key is passed through to opencode by the variable your provider names, and the runner never learns which one that is, so nothing can replace it if the agent prints it.
 
 ### Cost

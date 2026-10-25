@@ -25,6 +25,12 @@ WorkingDirectory=/var/lib/sre-agent-fix-runner
 # because ProtectHome below hides /home entirely and opencode keeps state in it.
 Environment=HOME=/var/lib/sre-agent-fix-runner
 Environment=SRE_WORKSPACE=/var/lib/sre-agent-fix-runner/workspace
+# Every agent run starts as this second account, whose home is
+# /var/lib/sre-agent-fix-runner/agent-home. The agent has a shell, so what it can
+# reach is what its account can reach: not this process's environment, not the
+# memory directory, not the clones of other repositories. install-runner.sh
+# creates it.
+Environment=SRE_AGENT_USER=sre-agent-fix-agent
 
 # Root-owned and 0600: it holds the poll credential, and the account this unit
 # runs as never needs to read it, since systemd reads it as root and passes the
@@ -41,6 +47,14 @@ Restart=always
 RestartSec=15s
 
 NoNewPrivileges=yes
+# Not root: the runner is the unprivileged account above holding the six
+# capabilities that starting the agent as the other account takes. SETUID and
+# SETGID to switch to it (through setpriv, which clears them again, so the agent
+# holds none), CHOWN to hand it one checkout at a time and take it back,
+# DAC_OVERRIDE and FOWNER to read and change what the agent leaves in that
+# checkout, KILL to end what the agent leaves running. Nothing else can be gained.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
 PrivateTmp=yes
 ProtectSystem=strict
 # Every home directory is empty to this service, so node, git, gh and opencode

@@ -32,6 +32,35 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
   } >> "$STUB_OPENCODE_LOG"
 fi
 
+# What the agent can reach from where it runs, for tests/uid_split_test.sh: the
+# account it runs as, what it can read of the runner and of the memory, and a
+# process it leaves behind for the runner to clean up.
+if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
+  ws="${STUB_PROBE_WORKSPACE:?}"
+  allowed() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+  {
+    printf 'id: %s:%s\n' "$(id -u)" "$(id -g)"
+    printf 'groups: %s\n' "$(grep '^Groups:' /proc/self/status | cut -f2 | tr -d ' ')"
+    printf 'cap_eff: %s\n' "$(grep '^CapEff:' /proc/self/status | cut -f2)"
+    printf 'home: %s\n' "$HOME"
+    printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
+    printf 'runner_environ: %s\n' "$(if cat "/proc/$PPID/environ" >/dev/null 2>&1; then echo readable; else echo denied; fi)"
+    printf 'memory_list: %s\n' "$(allowed ls "$ws/memory")"
+    printf 'memory_write: %s\n' "$(allowed bash -c ": >> '$ws/memory/acme/app/NOTES.md'")"
+    printf 'other_read: %s\n' "$(allowed ls "$ws/repos/acme/other")"
+    printf 'other_write: %s\n' "$(allowed bash -c ": > '$ws/repos/acme/other/planted'")"
+    printf 'own_write: %s\n' "$(allowed bash -c ": >> README.md")"
+    printf 'home_write: %s\n' "$(allowed bash -c ": >> '$HOME/probe'")"
+    if [ -d .git ]; then
+      printf 'git_status: %s\n' "$(if "${STUB_PROBE_GIT:?}" status --porcelain >/dev/null 2>&1; then echo ok; else echo failed; fi)"
+    else
+      echo 'git_status: ok'
+    fi
+  } >> "$STUB_OPENCODE_PROBE"
+  setsid sleep 300 </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "${STUB_PROBE_SURVIVOR:?}"
+fi
+
 if [ -n "${STUB_OPENCODE_BRIEF_OUT:-}" ]; then
   printf '%s' "$brief" > "$STUB_OPENCODE_BRIEF_OUT"
 fi
@@ -60,12 +89,21 @@ case "${STUB_OPENCODE_MEMORY:-}" in
     rm -rf .sre-agent-memory
     ln -s /etc .sre-agent-memory
     ;;
+  copyout)
+    # Memory content under another name: no path rule can see this, so the
+    # runner compares what it is about to stage with what the memory holds.
+    mkdir -p docs
+    cp .sre-agent-memory/NOTES.md docs/notes-copy.md
+    ;;
 esac
 
 emit() {
   local text="$1"
   if [ -n "${STUB_OPENCODE_MEMORY_SUMMARY:-}" ]; then
     text="${text}"$'\n\n## Memory\n'"${STUB_OPENCODE_MEMORY_SUMMARY}"
+  fi
+  if [ -n "${STUB_OPENCODE_TAIL:-}" ]; then
+    text="${text}"$'\n\n'"${STUB_OPENCODE_TAIL}"
   fi
   jq -cn --arg t "$text" '{type: "text", timestamp: 0, sessionID: "stub", part: {type: "text", text: $t}}'
 }
