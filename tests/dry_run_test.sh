@@ -282,6 +282,8 @@ printf -- '---\nname: claude-skill\ndescription: planted claude skill\n---\nhi\n
 printf -- '---\nname: ext-skill\ndescription: planted external skill\n---\nhi\n' > "$d/.agents/skills/ext-skill/SKILL.md"
 printf '{"instructions":["/nonexistent-planted"]}\n' > "$d/.config/opencode/opencode.json"
 printf '{}\n' > "$d/.claude.json"
+mkdir -p "$d/.local/share/opencode"
+printf '{"planted-provider":{"type":"api","key":"planted-key-value"}}\n' > "$d/.local/share/opencode/auth.json"
 PLANT
 home_run() {
   # $1 label, the rest: extra environment for opencode
@@ -292,13 +294,15 @@ home_run() {
     env "$@" HOME="$agent_home" SRE_PLUGIN_MARKER="$work/home-$label-ran" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
       timeout 120 opencode debug skill > "$work/home-$label-skills.txt" 2>&1 || true
     env "$@" HOME="$agent_home" SRE_PLUGIN_MARKER="$work/home-$label-ran" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
-      timeout 120 opencode debug config > "$work/home-$label-config.txt" 2>&1 || true )
+      timeout 120 opencode debug config > "$work/home-$label-config.txt" 2>&1 || true
+    env "$@" HOME="$agent_home" OPENCODE_DISABLE_AUTOUPDATE=1 \
+      timeout 120 opencode auth list > "$work/home-$label-auth.txt" 2>&1 || true )
 }
 home_ran() { find "$work" -maxdepth 1 -name "home-$1-ran*" -printf '%f\n' | sort | tr '\n' ' '; }
 bash "$work/plant_home.sh" "$agent_home"
-home_run control XDG_CONFIG_HOME="$agent_home/.config"
-if [ -n "$(home_ran control)" ] && grep -qx 'planted (primary)' "$work/home-control-agents.txt" && grep -q 'claude-skill' "$work/home-control-skills.txt" && grep -q 'nonexistent-planted' "$work/home-control-config.txt"; then
-  echo "ok   as the home stands, opencode runs its plugins ($(home_ran control)), lists its planted agent, finds its skills and reads its configuration"
+home_run control XDG_CONFIG_HOME="$agent_home/.config" XDG_DATA_HOME="$agent_home/.local/share" XDG_STATE_HOME="$agent_home/.local/state" XDG_CACHE_HOME="$agent_home/.cache"
+if [ -n "$(home_ran control)" ] && grep -qx 'planted (primary)' "$work/home-control-agents.txt" && grep -q 'claude-skill' "$work/home-control-skills.txt" && grep -q 'nonexistent-planted' "$work/home-control-config.txt" && grep -q 'planted-provider' "$work/home-control-auth.txt"; then
+  echo "ok   as the home stands, opencode runs its plugins ($(home_ran control)), lists its planted agent, finds its skills, reads its configuration and its stored credentials"
 else
   echo "FAIL the control no longer loads the planted home, so this case proves nothing: ran '$(home_ran control)'"; fail=1
 fi
@@ -333,6 +337,11 @@ if ! grep -q 'claude-skill\|ext-skill' "$work/home-prepared-skills.txt" && ! gre
   echo "ok   no skill from the Claude Code or external directories and no instruction from the home's configuration is loaded"
 else
   echo "FAIL the home still feeds opencode: $(grep -o 'claude-skill\|ext-skill\|nonexistent-planted' "$work"/home-prepared-skills.txt "$work"/home-prepared-config.txt | tr '\n' ' ')"; fail=1
+fi
+if ! grep -q 'planted-provider' "$work/home-prepared-auth.txt" && grep -q '0 credentials' "$work/home-prepared-auth.txt" && [ ! -e "$agent_home/.local/share/opencode/auth.json" ]; then
+  echo "ok   no stored credential from the home is read (auth.json removed, and OPENCODE_AUTH_CONTENT replaces it), so no wellknown entry can fetch a remote configuration"
+else
+  echo "FAIL opencode still reads the home's stored credentials: $(tr '\n' ' ' < "$work/home-prepared-auth.txt" | cut -c1-300)"; fail=1
 fi
 prepared_rules="$(awk '/^sre-fix \(primary\)$/ { on = 1; next } /^[a-z0-9_-]+ \((primary|subagent|all)\)$/ { on = 0 } on' "$work/home-prepared-agents.txt")"
 if jq -e 'map(select(.permission == "webfetch")) | last | .action == "deny"' <<<"$prepared_rules" >/dev/null 2>&1 &&

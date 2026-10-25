@@ -856,9 +856,22 @@ const AGENT_GITCONFIG = [
 ].join('\n');
 
 // What opencode loads from a home without being told to. Removed whole, before
-// every run; the tool directories (.local, .npm-global, .cargo, go, mise's data)
-// run only when the agent invokes them, so they stay.
-const AGENT_HOME_SCRUB = ['.config/opencode', '.opencode', '.claude', '.claude.json', '.agents'];
+// every run: its configuration, and its own data, state and cache directories,
+// because the data directory holds auth.json, whose "wellknown" entries make
+// opencode fetch and merge a remote configuration (instructions, agents, MCP
+// servers it starts) before any gate. The tool directories (the rest of .local,
+// .npm-global, .cargo, go, mise's data) run only when the agent invokes them, so
+// they stay.
+const AGENT_HOME_SCRUB = [
+  '.config/opencode',
+  '.opencode',
+  '.claude',
+  '.claude.json',
+  '.agents',
+  '.local/share/opencode',
+  '.local/state/opencode',
+  '.cache/opencode',
+];
 
 // The switches the pinned opencode reads that stop it loading plugins, Claude
 // Code's files and external skills on its own. They are belt and braces: the
@@ -870,6 +883,9 @@ const AUTOLOAD_SWITCHES = {
   OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
   OPENCODE_DISABLE_EXTERNAL_SKILLS: '1',
   OPENCODE_PURE: '1',
+  // Replaces auth.json for the run: the provider key comes from the environment,
+  // and an empty credential set means no stored entry is read, wellknown or not.
+  OPENCODE_AUTH_CONTENT: '{}',
 };
 
 // The size bound for the one file the runner reads as root in the agent's home
