@@ -203,9 +203,10 @@ LABEL org.opencontainers.image.licenses="MIT"
 # CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_KILL
 # and nothing else; all six are in Docker's default set (which holds fourteen),
 # and are what a Kubernetes securityContext that drops everything must add back.
-# A start that lacks them, or does not start as root, does not crash: the runner
-# falls back to running the agent as its own account, says so in its log and in
-# every report, and the README says what to change.
+# A start that is not root and lacks them does not crash: the runner falls back to
+# running the agent as its own account, says so in its log and in every report.
+# A start that is root and lacks them refuses to start, because its one account
+# would be root; the README says what to change.
 USER root
 WORKDIR /workspace
 ENTRYPOINT ["/opt/sre-agent-opencode/runner/entrypoint.sh"]

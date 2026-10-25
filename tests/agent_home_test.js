@@ -341,14 +341,25 @@ function settleInChild(setup, home) {
     assert.equal(found.degraded, undefined);
   });
 
-  await check('a root start with every capability dropped falls back to one account and names all six', () => {
-    const found = internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, 0n);
-    assert.equal(found.mode, 'none');
-    for (const name of ['CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_FOWNER', 'CAP_KILL', 'CAP_SETGID', 'CAP_SETUID']) {
-      assert.match(found.degraded, new RegExp(name), name);
-    }
-    assert.match(found.degraded, /one account/);
-    assert.match(found.degraded, /the agent account split is off/);
+  await check('a root start with every capability dropped refuses to start, naming all six, and never degrades to the agent running as root', () => {
+    assert.throws(
+      () => internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, 0n),
+      (error) => {
+        assert.equal(error.fatal, true);
+        for (const name of ['CAP_CHOWN', 'CAP_DAC_OVERRIDE', 'CAP_FOWNER', 'CAP_KILL', 'CAP_SETGID', 'CAP_SETUID']) {
+          assert.match(error.message, new RegExp(name), name);
+        }
+        assert.match(error.message, /the agent would run as root, so the runner will not start/);
+        return true;
+      }
+    );
+  });
+
+  await check('a root start lacking only SETUID and SETGID refuses, naming those two and not the others', () => {
+    assert.throws(
+      () => internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, six & ~bits(6, 7)),
+      (error) => /lacks CAP_SETGID, CAP_SETUID/.test(error.message) && !/CAP_CHOWN/.test(error.message) && error.fatal === true
+    );
   });
 
   await check('a non-root start that names the agent account but lacks CAP_KILL falls back, naming only that one', () => {
@@ -357,6 +368,13 @@ function settleInChild(setup, home) {
     assert.equal(found.mode, 'none');
     assert.match(found.degraded, /lacks CAP_KILL \(/);
     assert.doesNotMatch(found.degraded, /lacks[^(]*CAP_SETUID/);
+  });
+
+  await check('a non-root start with every capability dropped (the v1.4.0 Kubernetes shape) falls back with the sentence', () => {
+    const found = internals.loadIdentity({ ...accountEnv, HOME: '/home/runner' }, { uid: 10001, gid: 10001 }, 0n);
+    assert.equal(found.mode, 'none');
+    assert.match(found.degraded, /the agent account split is off/);
+    assert.match(found.degraded, /CAP_SETUID/);
   });
 
   await check('a non-root start with the six capabilities is caps mode', () => {

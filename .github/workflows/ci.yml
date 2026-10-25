@@ -205,10 +205,11 @@ jobs:
 
       # A start, not a refusal: the image has to reach its first poll. The poll
       # goes to a refused local port, so nothing leaves the job and no secret is
-      # involved. Two starts: Docker's defaults (root with the six capabilities
-      # the account split takes), and the way a Kubernetes pod that drops every
-      # capability starts it, as the runner's own uid, which has to fall back to
-      # one account with a sentence and still poll, never crash on a chown.
+      # involved. Three starts: Docker's defaults (root with the six capabilities
+      # the account split takes); the way the earlier Kubernetes manifest starts
+      # it, as the runner's own uid with every capability dropped, which has to
+      # fall back to one account with a sentence and still poll, never crash on a
+      # chown; and root with every capability dropped, which has to refuse.
       - name: The image starts the runner and reaches its first poll
         env:
           IMAGE: sre-agent-opencode-runner:ci
@@ -233,6 +234,17 @@ jobs:
           grep -q 'polling http://127.0.0.1:9' "$RUNNER_TEMP/nocaps.log" || { echo "::error::a start without capabilities did not reach its first poll"; exit 1; }
           grep -q 'the agent account split is off' "$RUNNER_TEMP/nocaps.log" || { echo "::error::a start without capabilities did not say that the split is off"; exit 1; }
           if grep -qi 'EPERM\|operation not permitted' "$RUNNER_TEMP/nocaps.log"; then echo "::error::a start without capabilities failed on a chown or a chmod"; exit 1; fi
+          # Root without the capabilities is the one start that must NOT fall back:
+          # one account there is root. It refuses, naming what is missing. The
+          # workspace is a world-writable tmpfs so that the entrypoint's own
+          # writability check (root has no DAC_OVERRIDE here) does not answer first.
+          if out="$(docker run --rm --tmpfs /workspace:rw,mode=0777 --cap-drop ALL -e SRE_SERVER_URL=http://127.0.0.1:9 -e SRE_API_KEY=not-a-real-key -e SRE_MODEL=openrouter/deepseek/deepseek-v4-pro "$IMAGE" 2>&1)"; then
+            echo "::error::root without capabilities started"
+            exit 1
+          fi
+          echo "$out"
+          grep -q 'the agent would run as root, so the runner will not start' <<<"$out" || { echo "::error::root without capabilities was refused for another reason"; exit 1; }
+          if grep -q 'polling' <<<"$out"; then echo "::error::root without capabilities reached a poll"; exit 1; fi
 
   # The reusable workflow called the way a customer calls it, stopped after
   # the install and the secret mapping: proof on GitHub itself that a called

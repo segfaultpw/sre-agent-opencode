@@ -476,6 +476,8 @@ start_step="$(awk '/- name: The image starts the runner and reaches its first po
 if grep -qF 'docker run -d' <<<"$start_step" && grep -qF 'polling http://127.0.0.1:9' <<<"$start_step"; then echo "ok   CI starts the image and waits for its first poll, at a refused local port"; else echo "FAIL CI never starts the image past its configuration check"; fail=1; fi
 if grep -qF -- '--user 10001:10001 --cap-drop ALL' <<<"$start_step" && grep -qF 'the agent account split is off' <<<"$start_step"; then echo "ok   it also starts it as a pod that drops every capability does, and expects the fallback sentence instead of a crash"; else echo "FAIL the no-capability start is not in CI"; fail=1; fi
 
+if grep -qF -- '--cap-drop ALL' <<<"$start_step" && grep -qF 'the agent would run as root, so the runner will not start' <<<"$start_step"; then echo "ok   CI also starts it as root with every capability dropped and expects the refusal, never a start with the agent as root"; else echo "FAIL the root-without-capabilities refusal is not in CI"; fail=1; fi
+
 echo "--- every runs-on fallback is the Blacksmith label the file's header says it is ---"
 fallbacks="$(grep -hoE "vars\.RUNNER_[A-Z0-9]+ \|\| '[^']+'" "$ci" "$release" | sed -e "s/.*|| '//" -e "s/'\$//" | sort -u)"
 if [ -n "$fallbacks" ] && ! grep -qv '^blacksmith-' <<<"$fallbacks"; then echo "ok   every fallback is a Blacksmith label ($(tr '\n' ' ' <<<"$fallbacks"))"; else echo "FAIL a fallback is not a Blacksmith label: $(grep -v '^blacksmith-' <<<"$fallbacks" | tr '\n' ' ')"; fail=1; fi

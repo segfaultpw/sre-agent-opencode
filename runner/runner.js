@@ -73,8 +73,9 @@ const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 //         switches to the agent's account and clears the capabilities, because
 //         an ambient capability would otherwise survive into the agent.
 //   none  No agent account is configured (a developer's machine, the tests), or
-//         a start that was asked for the split and cannot make it because it
-//         lacks the capabilities (identity.degraded says which): the agent runs
+//         a start that is not root, was asked for the split and lacks the
+//         capabilities (identity.degraded says which; a root start that lacks
+//         them refuses to start, since the agent would be root): the agent runs
 //         as the runner's own account, so nothing the scrub of its environment
 //         removes is out of its reach, and the log and every report say so.
 //
@@ -129,10 +130,12 @@ function accountFrom(env, prefix) {
   return { uid, gid, home, complete: uid !== null && gid !== null && path.isAbsolute(home) };
 }
 
-// A start that asked for the split and cannot make it (a Kubernetes pod that
-// drops every capability, a unit missing one) is not a crash loop: it runs as
-// one account, as every release before 1.5.0 did, and says so wherever a person
-// would look. The sentence is the log's and the report's evidence.
+// A start that is not root, asked for the split and lacks a capability (the
+// earlier Kubernetes manifest: runAsUser 10001, every capability dropped; a unit
+// missing one) is not a crash loop: it runs as one account, as every release
+// before 1.5.0 did, and says so wherever a person would look. The sentence is
+// the log's and the report's evidence. A root start that lacks them is refused
+// instead (loadIdentity), because there the one account is root.
 function degradedIdentity(own, env, missing) {
   const list = REQUIRED_CAPABILITIES.map(([name]) => name.replace(/^CAP_/, '')).join(', ');
   return {
@@ -160,7 +163,13 @@ function loadIdentity(env, own, effective = readEffectiveCapabilities()) {
     if (runner.uid === 0 || agent.uid === 0 || runner.uid === agent.uid) {
       throw fatal('SRE_RUNNER_UID and SRE_AGENT_UID must be different accounts, and neither may be root');
     }
-    if (missing.length > 0) return degradedIdentity(own, env, missing);
+    // Never a downgrade: a root runner that cannot switch accounts would run the
+    // agent as root, which is worse than any one-account start. It refuses.
+    if (missing.length > 0) {
+      throw fatal(
+        `this start is root but lacks ${missing.join(', ')}, which switching to the agent's account takes; the agent would run as root, so the runner will not start. Give the container the capabilities (${REQUIRED_CAPABILITIES.map(([name]) => name.replace(/^CAP_/, '')).join(', ')}; Docker's default set holds them, and a Kubernetes securityContext that drops ALL has to add them back), or start it as a non-root user, which runs the agent in one account as v1.4.0 did`
+      );
+    }
     return { mode: 'root', runner, agent };
   }
   if (env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '') {

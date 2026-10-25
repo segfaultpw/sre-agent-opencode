@@ -432,9 +432,10 @@ prove_test_job root "$runner_uid" setpriv --groups=20001,20002 --
 prove_test_job caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
 
-# A start that asked for the split and cannot make it (a pod that dropped every
-# capability, a unit missing one) runs as one account, as releases before 1.5.0
-# did, says so in its log and in every report, and still answers the request.
+# A start that is not root and asked for the split but lacks a capability (a pod
+# that dropped every capability, a unit missing one) runs as one account, as
+# releases before 1.5.0 did, says so in its log and in every report, and still
+# answers the request.
 prove_degraded() {
   local label="$1" owner="$2" env_runner="$3" must_name="$4" must_not_name="$5"
   shift 5
@@ -472,7 +473,32 @@ prove_degraded() {
 
 # The first is the container started as root with every capability dropped (a
 # pod that drops ALL and adds none), the second a host start missing one.
-prove_degraded root-nocaps 0 "$runner_uid" CAP_CHOWN "" setpriv --groups=20001,20002 --bounding-set=-all --
+# A root start that cannot make the split is never degraded: the agent would run
+# as root. It refuses to start, names what is missing, and starts nothing.
+prove_root_refused() {
+  local label="root-nocaps" owner="0"
+  local ws="$work/$label-ws" runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent" out="$work/$label.out" agent_log="$work/$label.opencode.log"
+  echo "--- $label: a root start without the capabilities refuses to start and never starts the agent ---"
+  mkdir -p "$ws" "$runner_home"
+  : > "$agent_log"; chmod 666 "$agent_log"
+  start_fixture
+  queue_job "h-$label" acme/app
+  : > "$work/requests.jsonl"
+  local rc=0
+  timeout 60 setpriv --groups=20001,20002 --bounding-set=-all -- env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_RUNNER_UID="$runner_uid" SRE_RUNNER_GID="$runner_uid" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    HOME="$runner_home" STUB_OPENCODE_MODE=fix STUB_OPENCODE_LOG="$agent_log" STUB_PROBE_GIT="$real_git" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  if [ "$rc" -ne 0 ] && grep -q 'CAP_CHOWN' "$out" && grep -q 'the agent would run as root, so the runner will not start' "$out"; then echo "ok   $label: it exits non-zero with a sentence that names what is missing and why"; else echo "FAIL $label: rc=$rc out=$(head -n 3 "$out")"; fail=1; fi
+  if [ ! -s "$agent_log" ] && [ ! -e "$agent_home" ]; then echo "ok   $label: the agent was never started and no agent home was made"; else echo "FAIL $label: $(cat "$agent_log") $(ls -la "$agent_home" 2>&1)"; fail=1; fi
+  if ! grep -q 'fix-runner/queue' "$work/requests.jsonl"; then echo "ok   $label: it never polled, so it collected no request"; else echo "FAIL $label: the queue was polled"; fail=1; fi
+}
+
+prove_root_refused
 prove_degraded caps-nokill "$caps_uid" "$caps_uid" CAP_KILL CAP_SETUID setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner" --
 
