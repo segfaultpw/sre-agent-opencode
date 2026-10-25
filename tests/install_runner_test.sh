@@ -146,7 +146,7 @@ install_into() {
 install_into first
 if [ "$rc" -eq 0 ]; then echo "ok   a complete clone installs"; else echo "FAIL the installer exited $rc: $out"; fail=1; fi
 if cmp -s "$unit" "${root}${unit_file}"; then echo "ok   the unit is installed byte for byte"; else echo "FAIL the unit at ${root}${unit_file} is not the one in the repository"; fail=1; fi
-for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh runner/runner.js runner/conventional_title.js runner/entrypoint.sh; do
+for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/entrypoint.sh; do
   if [ -s "${root}/opt/sre-agent-opencode/${relative}" ]; then echo "ok   the package's ${relative} is installed"; else echo "FAIL ${relative} is missing from the installed package"; fail=1; fi
 done
 if [ -x "${root}/opt/sre-agent-opencode/runner/entrypoint.sh" ]; then echo "ok   the entrypoint is executable"; else echo "FAIL the entrypoint is not executable"; fail=1; fi
@@ -240,6 +240,7 @@ if [ "$rc" -ne 0 ]; then echo "ok   an incomplete clone refuses"; else echo "FAI
 if [ -z "$(find "$root" -mindepth 1 -print -quit)" ]; then echo "ok   an incomplete clone writes nothing"; else echo "FAIL it wrote $(find "$root" -mindepth 1 | head -n 3)"; fail=1; fi
 if grep -qF 'not a complete clone' <<<"$out"; then echo "ok   the refusal says the clone is incomplete"; else echo "FAIL output: $out"; fail=1; fi
 if grep -qF 'runner/runner.js' <<<"$out"; then echo "ok   the refusal names a file that is missing"; else echo "FAIL output: $out"; fail=1; fi
+if grep -qF 'runner/memory.js' <<<"$out"; then echo "ok   the refusal names the memory module, which the runner requires at start"; else echo "FAIL output: $out"; fail=1; fi
 
 # ProtectHome=yes in the unit, so a tool that is on PATH here but lives inside
 # a home directory is invisible to the service: the install reports success and

@@ -141,6 +141,21 @@ test('migrate never treats the runner own directories as owners', () => {
   assert.ok(fs.existsSync(path.join(ws, 'memory/acme/api/.git/HEAD')));
 });
 
+test('migrate skips a directory that cannot be an owner, such as the lost+found of a mounted disk', () => {
+  const ws = fresh();
+  put(ws, 'acme/api/.git/HEAD', 'x');
+  const lost = path.join(ws, 'lost+found');
+  fs.mkdirSync(lost);
+  fs.chmodSync(lost, 0o000);
+  try {
+    assert.deepEqual(memory.migrate(ws), ['acme/api']);
+    assert.ok(fs.existsSync(path.join(ws, 'repos/acme/api/.git/HEAD')));
+    assert.ok(fs.existsSync(lost), 'it is left where it is');
+  } finally {
+    fs.chmodSync(lost, 0o700);
+  }
+});
+
 test('migrate does not follow a symlinked owner directory', () => {
   const ws = fresh();
   const outside = fresh();

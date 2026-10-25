@@ -37,10 +37,22 @@ flagged docs/secretsauce.md
 flagged deploy.pem
 flagged a/b/key.pem
 
+# The runner copies an agent's notes into .sre-agent-memory/ and removes the
+# copy before it stages anything. A copy that survived (or one a repository
+# tracks) must still never reach a pull request, so the gate refuses a staged
+# .sre-agent-memory path at any depth. The edit fence does not name it, which
+# is why tests/gate_agreement_test.sh does not list it.
+flagged .sre-agent-memory/NOTES.md
+flagged .sre-agent-memory/scripts/check.sh
+flagged .sre-agent-memory/x
+flagged services/api/.sre-agent-memory/NOTES.md
+
 clean src/app.ex
 clean README.md
 clean docs/environment.md
 clean lib/pemdas.ex
+clean docs/.sre-agent-memory.md
+clean .sre-agent-memory-notes/x
 
 rc=0
 got="$(printf '' | bash "$script")" || rc=$?
@@ -49,5 +61,9 @@ if [ "$rc" -eq 0 ] && [ -z "$got" ]; then echo "ok   an empty list passes"; else
 rc=0
 got="$(printf 'src/app.ex\n.env\nREADME.md\nconfig/secrets.yml\n' | bash "$script")" || rc=$?
 if [ "$rc" -eq 1 ] && [ "$got" = $'.env\nconfig/secrets.yml' ]; then echo "ok   a mixed list prints only the protected paths"; else echo "FAIL mixed list: exit $rc, '$got'"; fail=1; fi
+
+rc=0
+got="$(printf 'src/app.ex\n.sre-agent-memory/NOTES.md\n' | bash "$script" 2>&1)" || rc=$?
+if [ "$rc" -eq 1 ] && [ "$got" = ".sre-agent-memory/NOTES.md" ]; then echo "ok   a staged .sre-agent-memory path is refused"; else echo "FAIL .sre-agent-memory list: exit $rc, '$got'"; fail=1; fi
 
 exit $fail

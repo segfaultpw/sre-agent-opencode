@@ -22,6 +22,13 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'autoupdate_disabled: %s\n' "${OPENCODE_DISABLE_AUTOUPDATE:-missing}"
     if [ -n "${SRE_API_KEY+set}" ]; then printf 'sees_SRE_API_KEY: yes\n'; else printf 'sees_SRE_API_KEY: no\n'; fi
     if [ -n "${SRE_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_GITHUB_TOKEN: no\n'; fi
+    printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
+    if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
+    if [ -d .sre-agent-memory ]; then
+      printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
+    else
+      printf 'memory_files: absent\n'
+    fi
   } >> "$STUB_OPENCODE_LOG"
 fi
 
@@ -29,8 +36,38 @@ if [ -n "${STUB_OPENCODE_BRIEF_OUT:-}" ]; then
   printf '%s' "$brief" > "$STUB_OPENCODE_BRIEF_OUT"
 fi
 
+# What a run can do to the notes the runner copied in. The edits include the
+# ones the runner must refuse (a symlink, a name outside the allowed set, a file
+# outside NOTES.md and scripts/, an oversized NOTES.md), because the bounds are
+# the runner's to enforce, not the agent's to keep.
+case "${STUB_OPENCODE_MEMORY:-}" in
+  edit)
+    mkdir -p .sre-agent-memory/scripts
+    printf 'the pool ceiling is 40 on the primary\n' >> .sre-agent-memory/NOTES.md
+    printf '#!/usr/bin/env bash\n# checks the pool on the primary\necho ok\n' > .sre-agent-memory/scripts/check.sh
+    rm -f .sre-agent-memory/scripts/old.sh
+    ln -s /etc/passwd .sre-agent-memory/scripts/link.sh
+    printf 'x\n' > ".sre-agent-memory/scripts/bad name"
+    printf 'x\n' > .sre-agent-memory/stray.txt
+    ;;
+  big)
+    head -c 70000 /dev/zero | tr '\0' 'a' > .sre-agent-memory/NOTES.md
+    ;;
+  wipe)
+    rm -rf .sre-agent-memory
+    ;;
+  link)
+    rm -rf .sre-agent-memory
+    ln -s /etc .sre-agent-memory
+    ;;
+esac
+
 emit() {
-  jq -cn --arg t "$1" '{type: "text", timestamp: 0, sessionID: "stub", part: {type: "text", text: $t}}'
+  local text="$1"
+  if [ -n "${STUB_OPENCODE_MEMORY_SUMMARY:-}" ]; then
+    text="${text}"$'\n\n## Memory\n'"${STUB_OPENCODE_MEMORY_SUMMARY}"
+  fi
+  jq -cn --arg t "$text" '{type: "text", timestamp: 0, sessionID: "stub", part: {type: "text", text: $t}}'
 }
 
 case "$mode" in

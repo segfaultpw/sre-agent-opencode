@@ -101,7 +101,9 @@ function migrate(workspace) {
   const { repos } = layout(base);
   const moved = [];
   for (const owner of readDirOrEmpty(base)) {
-    if (RESERVED.has(owner)) continue;
+    // A GitHub owner always passes validName; lost+found of a mounted disk and
+    // the like do not, and may not even be readable.
+    if (RESERVED.has(owner) || !validName(owner)) continue;
     const ownerDir = path.join(base, owner);
     if (!isRealDirectory(ownerDir)) continue;
     for (const name of readDirOrEmpty(ownerDir)) {
