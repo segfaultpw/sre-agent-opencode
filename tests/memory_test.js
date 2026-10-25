@@ -1,0 +1,465 @@
+'use strict';
+// Unit tests for runner/memory.js: the persistent workspace layout, the bounds
+// the runner enforces on the agent's memory directory, and the change list the
+// report carries. Run with `node tests/memory_test.js`; every input is small
+// and explicit, and the largest file written is a little over 1 MiB.
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const memory = require('../runner/memory.js');
+
+let failed = 0;
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-test-'));
+let counter = 0;
+
+function fresh() {
+  counter += 1;
+  const dir = path.join(root, `case-${counter}`);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function put(base, rel, content) {
+  const full = path.join(base, rel);
+  fs.mkdirSync(path.dirname(full), { recursive: true });
+  fs.writeFileSync(full, content);
+}
+
+function listing(base) {
+  const out = [];
+  const walk = (dir, prefix) => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const full = path.join(dir, name);
+      const stat = fs.lstatSync(full);
+      if (stat.isDirectory()) walk(full, `${prefix}${name}/`);
+      else out.push(`${prefix}${name}`);
+    }
+  };
+  walk(base, '');
+  return out;
+}
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`ok   ${name}`);
+  } catch (error) {
+    failed += 1;
+    console.log(`FAIL ${name}`);
+    console.log(String(error && error.stack ? error.stack : error).replace(/^/gm, '     '));
+  }
+}
+
+test('layout names the three directories under the workspace', () => {
+  assert.deepEqual(memory.layout('/workspace'), {
+    repos: '/workspace/repos',
+    memory: '/workspace/memory',
+    scratch: '/workspace/scratch',
+  });
+});
+
+test('layout makes a relative workspace absolute', () => {
+  const laid = memory.layout('some/where');
+  assert.ok(path.isAbsolute(laid.repos));
+  assert.ok(laid.repos.endsWith(path.join('some', 'where', 'repos')));
+});
+
+test('memoryDir for a repository object, a repository string and for no repository', () => {
+  assert.equal(memory.memoryDir('/workspace', { owner: 'acme', name: 'api' }), '/workspace/memory/acme/api');
+  assert.equal(memory.memoryDir('/workspace', 'acme/api'), '/workspace/memory/acme/api');
+  assert.equal(memory.memoryDir('/workspace', null), '/workspace/memory/_estate');
+  assert.equal(memory.memoryDir('/workspace'), '/workspace/memory/_estate');
+});
+
+test('memoryDir refuses a name with a slash, dots only, a bad character or too long', () => {
+  for (const bad of [
+    { owner: 'acme', name: '../x' },
+    { owner: 'acme', name: 'a/b' },
+    { owner: '..', name: 'api' },
+    { owner: '.', name: 'api' },
+    { owner: 'acme', name: '..' },
+    { owner: 'ac me', name: 'api' },
+    { owner: 'acme', name: '' },
+    { owner: 'acme', name: 'x'.repeat(101) },
+    { owner: '_estate', name: 'api' },
+    'acme/api/extra',
+    'acme',
+    'acme/..',
+  ]) {
+    assert.throws(() => memory.memoryDir('/workspace', bad), /memory/, JSON.stringify(bad));
+  }
+  assert.doesNotThrow(() => memory.memoryDir('/workspace', { owner: 'a'.repeat(100), name: 'x.y_z-1' }));
+});
+
+test('migrate moves an old clone under repos and is a no-op the second time', () => {
+  const ws = fresh();
+  put(ws, 'acme/api/.git/HEAD', 'ref: refs/heads/main\n');
+  put(ws, 'acme/api/README.md', 'hello');
+  put(ws, 'acme/web/.git/HEAD', 'ref: refs/heads/main\n');
+  put(ws, 'other/lib/.git/HEAD', 'ref: refs/heads/main\n');
+  fs.mkdirSync(path.join(ws, 'scratch'));
+  put(ws, 'scratch/answer.txt', 'last answer');
+  put(ws, 'acme/not-a-clone/file.txt', 'x');
+
+  const moved = memory.migrate(ws);
+  assert.deepEqual([...moved].sort(), ['acme/api', 'acme/web', 'other/lib']);
+  assert.ok(fs.existsSync(path.join(ws, 'repos/acme/api/.git/HEAD')));
+  assert.equal(fs.readFileSync(path.join(ws, 'repos/acme/api/README.md'), 'utf8'), 'hello');
+  assert.ok(fs.existsSync(path.join(ws, 'repos/other/lib/.git/HEAD')));
+  assert.ok(!fs.existsSync(path.join(ws, 'acme/api')));
+  assert.ok(!fs.existsSync(path.join(ws, 'other')), 'an owner directory left empty is removed');
+  assert.ok(fs.existsSync(path.join(ws, 'acme/not-a-clone/file.txt')), 'a directory that is not a clone stays');
+  assert.equal(fs.readFileSync(path.join(ws, 'scratch/answer.txt'), 'utf8'), 'last answer');
+
+  const before = listing(ws);
+  assert.deepEqual(memory.migrate(ws), []);
+  assert.deepEqual(listing(ws), before);
+});
+
+test('migrate on an empty or missing workspace moves nothing', () => {
+  assert.deepEqual(memory.migrate(fresh()), []);
+  assert.deepEqual(memory.migrate(path.join(root, 'does-not-exist')), []);
+});
+
+test('migrate leaves an old clone alone when the new place is taken', () => {
+  const ws = fresh();
+  put(ws, 'acme/api/.git/HEAD', 'old');
+  put(ws, 'repos/acme/api/.git/HEAD', 'new');
+  assert.deepEqual(memory.migrate(ws), []);
+  assert.equal(fs.readFileSync(path.join(ws, 'repos/acme/api/.git/HEAD'), 'utf8'), 'new');
+  assert.equal(fs.readFileSync(path.join(ws, 'acme/api/.git/HEAD'), 'utf8'), 'old');
+});
+
+test('migrate never treats the runner own directories as owners', () => {
+  const ws = fresh();
+  put(ws, 'memory/acme/api/.git/HEAD', 'x');
+  put(ws, 'scratch/acme/.git/HEAD', 'x');
+  assert.deepEqual(memory.migrate(ws), []);
+  assert.ok(fs.existsSync(path.join(ws, 'memory/acme/api/.git/HEAD')));
+});
+
+test('migrate does not follow a symlinked owner directory', () => {
+  const ws = fresh();
+  const outside = fresh();
+  put(outside, 'repo/.git/HEAD', 'x');
+  fs.symlinkSync(outside, path.join(ws, 'acme'));
+  assert.deepEqual(memory.migrate(ws), []);
+  assert.ok(fs.existsSync(path.join(outside, 'repo/.git/HEAD')));
+});
+
+test('snapshot maps relative paths to bytes and sha256, regular files only', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'abc');
+  put(dir, 'scripts/run.sh', '#!/bin/sh\n');
+  fs.symlinkSync('/etc/hostname', path.join(dir, 'link'));
+  const snap = memory.snapshot(dir);
+  assert.deepEqual([...snap.keys()].sort(), ['NOTES.md', 'scripts/run.sh']);
+  assert.equal(snap.get('NOTES.md').bytes, 3);
+  assert.equal(snap.get('NOTES.md').sha256, crypto.createHash('sha256').update('abc').digest('hex'));
+  assert.equal(snap.get('scripts/run.sh').bytes, 10);
+});
+
+test('snapshot of a missing directory is empty', () => {
+  assert.equal(memory.snapshot(path.join(root, 'nope')).size, 0);
+});
+
+test('enforce cuts nothing under the bounds', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'notes');
+  put(dir, 'scripts/a.sh', 'echo a\n');
+  put(dir, 'scripts/b.py', 'print(1)\n');
+  const previous = memory.snapshot(dir);
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.kept, ['NOTES.md', 'scripts/a.sh', 'scripts/b.py']);
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(result.notes, []);
+  assert.deepEqual(listing(dir), ['NOTES.md', 'scripts/a.sh', 'scripts/b.py']);
+});
+
+test('enforce on a missing or empty directory reports nothing', () => {
+  const empty = { kept: [], restored: [], removed: [], notes: [] };
+  assert.deepEqual(memory.enforce(path.join(root, 'nope'), new Map()), empty);
+  assert.deepEqual(memory.enforce(fresh(), new Map()), empty);
+});
+
+test('an oversized notes file keeps the previous version', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'the earlier notes\n');
+  const previous = memory.snapshot(dir);
+  fs.writeFileSync(path.join(dir, 'NOTES.md'), 'x'.repeat(memory.MAX_NOTES_BYTES + 1));
+  const result = memory.enforce(dir, previous);
+  assert.equal(fs.readFileSync(path.join(dir, 'NOTES.md'), 'utf8'), 'the earlier notes\n');
+  assert.deepEqual(result.restored, ['NOTES.md']);
+  assert.equal(result.notes.length, 1);
+  assert.match(result.notes[0], /NOTES\.md/);
+  assert.match(result.notes[0], /previous version/);
+});
+
+test('a notes file at exactly the limit is kept', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'x'.repeat(memory.MAX_NOTES_BYTES));
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(result.kept, ['NOTES.md']);
+  assert.equal(fs.statSync(path.join(dir, 'NOTES.md')).size, 65536);
+});
+
+test('an oversized notes file with no previous version is removed', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'x'.repeat(memory.MAX_NOTES_BYTES + 1));
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(result.removed, ['NOTES.md']);
+  assert.ok(!fs.existsSync(path.join(dir, 'NOTES.md')));
+  assert.equal(result.notes.length, 1);
+});
+
+test('a 51st script is removed and the earlier fifty stay', () => {
+  const dir = fresh();
+  for (let i = 0; i < 50; i += 1) put(dir, `scripts/s${String(i).padStart(2, '0')}.sh`, `echo ${i}\n`);
+  const previous = memory.snapshot(dir);
+  put(dir, 'scripts/aaa-new.sh', 'echo new\n');
+  put(dir, 'scripts/zzz-new.sh', 'echo new\n');
+  const result = memory.enforce(dir, previous);
+  assert.equal(fs.readdirSync(path.join(dir, 'scripts')).length, 50);
+  assert.deepEqual(result.removed, ['scripts/aaa-new.sh', 'scripts/zzz-new.sh']);
+  assert.ok(fs.existsSync(path.join(dir, 'scripts/s00.sh')));
+  assert.equal(result.notes.length, 2);
+});
+
+test('exactly fifty scripts are kept', () => {
+  const dir = fresh();
+  for (let i = 0; i < 50; i += 1) put(dir, `scripts/s${i}.sh`, 'x');
+  const result = memory.enforce(dir, new Map());
+  assert.equal(result.kept.length, 50);
+  assert.deepEqual(result.removed, []);
+});
+
+test('a symlink and a FIFO are removed, and a symlink never lets a file out', () => {
+  const dir = fresh();
+  const outside = fresh();
+  put(outside, 'secret.txt', 'secret');
+  put(dir, 'NOTES.md', 'ok');
+  put(dir, 'scripts/real.sh', 'echo\n');
+  fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(dir, 'scripts/link.sh'));
+  fs.symlinkSync(outside, path.join(dir, 'scripts/dirlink'));
+  execFileSync('mkfifo', [path.join(dir, 'scripts/pipe.sh')]);
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(result.removed, ['scripts/dirlink', 'scripts/link.sh', 'scripts/pipe.sh']);
+  assert.deepEqual(listing(dir), ['NOTES.md', 'scripts/real.sh']);
+  assert.ok(fs.existsSync(path.join(outside, 'secret.txt')), 'the link target is untouched');
+});
+
+test('a notes file replaced by a symlink is restored from the previous version', () => {
+  const dir = fresh();
+  const outside = fresh();
+  put(outside, 'x.md', 'outside');
+  put(dir, 'NOTES.md', 'mine');
+  const previous = memory.snapshot(dir);
+  fs.rmSync(path.join(dir, 'NOTES.md'));
+  fs.symlinkSync(path.join(outside, 'x.md'), path.join(dir, 'NOTES.md'));
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.restored, ['NOTES.md']);
+  assert.ok(!fs.lstatSync(path.join(dir, 'NOTES.md')).isSymbolicLink());
+  assert.equal(fs.readFileSync(path.join(dir, 'NOTES.md'), 'utf8'), 'mine');
+});
+
+test('a scripts directory replaced by a symlink is replaced by the previous scripts', () => {
+  const dir = fresh();
+  const outside = fresh();
+  put(dir, 'scripts/a.sh', 'echo a\n');
+  put(dir, 'scripts/b.sh', 'echo b\n');
+  const previous = memory.snapshot(dir);
+  fs.rmSync(path.join(dir, 'scripts'), { recursive: true });
+  fs.symlinkSync(outside, path.join(dir, 'scripts'));
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.restored, ['scripts/a.sh', 'scripts/b.sh']);
+  assert.ok(fs.lstatSync(path.join(dir, 'scripts')).isDirectory());
+  assert.deepEqual(listing(dir), ['scripts/a.sh', 'scripts/b.sh']);
+});
+
+test('names outside the allowed set are removed, and nesting is not kept', () => {
+  const dir = fresh();
+  put(dir, 'scripts/has space.sh', 'x');
+  put(dir, 'scripts/semi;colon.sh', 'x');
+  put(dir, 'scripts/ünï.sh', 'x');
+  put(dir, `scripts/${'n'.repeat(101)}`, 'x');
+  put(dir, 'scripts/nested/inner.sh', 'x');
+  put(dir, 'scripts/good-name_1.2.sh', 'x');
+  put(dir, 'extra.txt', 'x');
+  put(dir, 'other/dir/file', 'x');
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(listing(dir), ['scripts/good-name_1.2.sh']);
+  assert.equal(result.removed.length, 7);
+  assert.deepEqual(result.kept, ['scripts/good-name_1.2.sh']);
+});
+
+test('validName refuses a slash, dots only, an empty and an overlong name', () => {
+  for (const bad of ['a/b', '..', '.', '', 'x'.repeat(101), 'a b', 'a\0b', 'a\\b']) {
+    assert.equal(memory.validName(bad), false, JSON.stringify(bad));
+  }
+  for (const good of ['NOTES.md', 'a.sh', 'x'.repeat(100), '.hidden', '..a', 'A-b_c.1']) {
+    assert.equal(memory.validName(good), true, good);
+  }
+  assert.equal(memory.validName(undefined), false);
+});
+
+test('the directory total is held to 1 MiB by reverting what the run changed', () => {
+  const dir = fresh();
+  put(dir, 'scripts/old.sh', 'y'.repeat(600000));
+  const previous = memory.snapshot(dir);
+  put(dir, 'scripts/big-new.sh', 'z'.repeat(500000));
+  put(dir, 'scripts/small-new.sh', 'w'.repeat(1000));
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.removed, ['scripts/big-new.sh']);
+  assert.deepEqual(listing(dir), ['scripts/old.sh', 'scripts/small-new.sh']);
+  assert.equal(result.notes.length, 1);
+  assert.match(result.notes[0], /1048576/);
+});
+
+test('a script that grew past the total is restored to its previous content', () => {
+  const dir = fresh();
+  put(dir, 'scripts/a.sh', 'small\n');
+  put(dir, 'scripts/b.sh', 'y'.repeat(100000));
+  const previous = memory.snapshot(dir);
+  fs.writeFileSync(path.join(dir, 'scripts/a.sh'), 'g'.repeat(memory.MAX_DIR_BYTES));
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.restored, ['scripts/a.sh']);
+  assert.equal(fs.readFileSync(path.join(dir, 'scripts/a.sh'), 'utf8'), 'small\n');
+});
+
+test('with no previous state, the largest scripts go first until the total fits', () => {
+  const dir = fresh();
+  put(dir, 'scripts/a.sh', 'a'.repeat(600000));
+  put(dir, 'scripts/b.sh', 'b'.repeat(500000));
+  put(dir, 'scripts/c.sh', 'c'.repeat(1000));
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(result.removed, ['scripts/a.sh']);
+  assert.deepEqual(listing(dir), ['scripts/b.sh', 'scripts/c.sh']);
+});
+
+test('a total exactly at 1 MiB is kept', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'n'.repeat(memory.MAX_NOTES_BYTES));
+  put(dir, 'scripts/a.sh', 'a'.repeat(memory.MAX_DIR_BYTES - memory.MAX_NOTES_BYTES));
+  const result = memory.enforce(dir, new Map());
+  assert.deepEqual(result.removed, []);
+  assert.equal(result.kept.length, 2);
+});
+
+test('a deleted script and a rewritten script are the agent own business', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'one');
+  put(dir, 'scripts/gone.sh', 'x');
+  put(dir, 'scripts/edit.sh', 'v1');
+  const previous = memory.snapshot(dir);
+  fs.rmSync(path.join(dir, 'scripts/gone.sh'));
+  fs.writeFileSync(path.join(dir, 'scripts/edit.sh'), 'v2');
+  const result = memory.enforce(dir, previous);
+  assert.deepEqual(result.restored, []);
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(result.kept, ['NOTES.md', 'scripts/edit.sh']);
+});
+
+test('a restored script keeps its mode', () => {
+  const dir = fresh();
+  put(dir, 'scripts/run.sh', 'echo\n');
+  fs.chmodSync(path.join(dir, 'scripts/run.sh'), 0o755);
+  const previous = memory.snapshot(dir);
+  fs.rmSync(path.join(dir, 'scripts/run.sh'));
+  fs.symlinkSync('/etc/hostname', path.join(dir, 'scripts/run.sh'));
+  memory.enforce(dir, previous);
+  assert.equal(fs.statSync(path.join(dir, 'scripts/run.sh')).mode & 0o777, 0o755);
+});
+
+test('changes lists added, modified and removed, sorted by path under the prefix', () => {
+  const before = new Map([
+    ['NOTES.md', { bytes: 10, sha256: 'a' }],
+    ['scripts/keep.sh', { bytes: 5, sha256: 'k' }],
+    ['scripts/gone.sh', { bytes: 7, sha256: 'g' }],
+  ]);
+  const after = new Map([
+    ['NOTES.md', { bytes: 12, sha256: 'b' }],
+    ['scripts/keep.sh', { bytes: 5, sha256: 'k' }],
+    ['scripts/new.sh', { bytes: 3, sha256: 'n' }],
+  ]);
+  assert.deepEqual(memory.changes(before, after, 'acme/api'), [
+    { path: 'acme/api/NOTES.md', change: 'modified', bytes: 12 },
+    { path: 'acme/api/scripts/gone.sh', change: 'removed', bytes: 7 },
+    { path: 'acme/api/scripts/new.sh', change: 'added', bytes: 3 },
+  ]);
+});
+
+test('changes sees a different sha with the same size as modified', () => {
+  const before = new Map([['NOTES.md', { bytes: 4, sha256: 'a' }]]);
+  const after = new Map([['NOTES.md', { bytes: 4, sha256: 'b' }]]);
+  assert.deepEqual(memory.changes(before, after, '_estate'), [
+    { path: '_estate/NOTES.md', change: 'modified', bytes: 4 },
+  ]);
+});
+
+test('changes with nothing different is empty, and a prefix with a trailing slash is the same prefix', () => {
+  const same = new Map([['NOTES.md', { bytes: 4, sha256: 'a' }]]);
+  assert.deepEqual(memory.changes(same, new Map(same), 'acme/api'), []);
+  assert.deepEqual(memory.changes(new Map(), same, 'acme/api/'), [
+    { path: 'acme/api/NOTES.md', change: 'added', bytes: 4 },
+  ]);
+  assert.deepEqual(memory.changes(new Map(), same, ''), [{ path: 'NOTES.md', change: 'added', bytes: 4 }]);
+});
+
+test('changes caps at 50 entries, keeping the first by path', () => {
+  const after = new Map();
+  for (let i = 0; i < 60; i += 1) after.set(`scripts/s${String(i).padStart(2, '0')}.sh`, { bytes: i, sha256: String(i) });
+  const listed = memory.changes(new Map(), after, 'acme/api');
+  assert.equal(listed.length, 50);
+  assert.equal(listed[0].path, 'acme/api/scripts/s00.sh');
+  assert.equal(listed[49].path, 'acme/api/scripts/s49.sh');
+  assert.ok(listed.every((entry) => entry.change === 'added'));
+});
+
+test('changes sorts by code unit, not by locale', () => {
+  const after = new Map([
+    ['scripts/b', { bytes: 1, sha256: '1' }],
+    ['scripts/B', { bytes: 1, sha256: '2' }],
+    ['NOTES.md', { bytes: 1, sha256: '3' }],
+  ]);
+  assert.deepEqual(
+    memory.changes(new Map(), after, 'r').map((entry) => entry.path),
+    ['r/NOTES.md', 'r/scripts/B', 'r/scripts/b'],
+  );
+});
+
+test('changes drops a path longer than the 300 characters the contract allows', () => {
+  const long = `scripts/${'n'.repeat(100)}`;
+  const after = new Map([[long, { bytes: 1, sha256: '1' }]]);
+  assert.equal(memory.changes(new Map(), after, 'p'.repeat(250)).length, 0);
+  assert.equal(memory.changes(new Map(), after, 'p'.repeat(150)).length, 1);
+});
+
+test('snapshot, enforce and changes agree end to end on one run', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'first\n');
+  put(dir, 'scripts/probe.sh', 'echo probe\n');
+  const before = memory.snapshot(dir);
+  put(dir, 'NOTES.md', 'first\nsecond\n');
+  put(dir, 'scripts/new.sh', 'echo new\n');
+  fs.rmSync(path.join(dir, 'scripts/probe.sh'));
+  const result = memory.enforce(dir, before);
+  assert.deepEqual(result.removed, []);
+  const after = memory.snapshot(dir);
+  assert.deepEqual(memory.changes(before, after, 'acme/api'), [
+    { path: 'acme/api/NOTES.md', change: 'modified', bytes: 13 },
+    { path: 'acme/api/scripts/new.sh', change: 'added', bytes: 9 },
+    { path: 'acme/api/scripts/probe.sh', change: 'removed', bytes: 11 },
+  ]);
+});
+
+fs.rmSync(root, { recursive: true, force: true });
+
+if (failed > 0) {
+  console.log(`${failed} test(s) failed`);
+  process.exit(1);
+}
+console.log('all memory tests passed');
