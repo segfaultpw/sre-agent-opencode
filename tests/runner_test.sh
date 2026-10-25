@@ -27,6 +27,9 @@ fixture_pids=()
 cleanup() {
   if [ -n "$fixture_pid" ]; then kill "$fixture_pid" 2>/dev/null || true; fi
   for pid in "${fixture_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  if [ -f "$work/escaped.pids" ]; then
+    while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$work/escaped.pids"
+  fi
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -506,9 +509,9 @@ echo "--- 19. a process that outlives the kill still gets the request reported -
 # run_once is what turns that back into a failure here.
 start_fixture escaped
 queue_one h-escaped acme/app
-export STUB_OPENCODE_MODE=escape STUB_OPENCODE_SLEEP=120
+export STUB_OPENCODE_MODE=escape STUB_OPENCODE_SLEEP=120 STUB_ESCAPED_PIDS="$work/escaped.pids"
 run_once escaped
-unset STUB_OPENCODE_SLEEP
+unset STUB_OPENCODE_SLEEP STUB_ESCAPED_PIDS
 export STUB_OPENCODE_MODE=fix
 if [ "$rc" -eq 0 ]; then echo "ok   the pass returns rather than waiting on a pipe nobody will close"; else echo "FAIL exited $rc, which is the wall clock: $(tail -3 "$out")"; fail=1; fi
 if [ "$(count_path /report)" -eq 1 ]; then echo "ok   the request is reported"; else echo "FAIL the request was never reported"; fail=1; fi
@@ -516,7 +519,12 @@ if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   it 
 if jq -e '.evidence.timed_out' <<<"$report" >/dev/null; then echo "ok   the report says the run hit its time bound"; else echo "FAIL evidence: $report"; fail=1; fi
 if jq -e '.evidence.abandoned_process' <<<"$report" >/dev/null; then echo "ok   the report says a process may still be running on the machine"; else echo "FAIL evidence: $report"; fail=1; fi
 if ! grep -q ' push ' "$git_log"; then echo "ok   nothing is published from a run that was killed"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
-pkill -f 'sleep 120' 2>/dev/null || true
+if [ -s "$work/escaped.pids" ]; then
+  while read -r pid; do kill "$pid" 2>/dev/null || true; done < "$work/escaped.pids"
+  echo "ok   the escaped process is stopped by the PID the stub recorded"
+else
+  echo "FAIL the stub recorded no escaped PID"; fail=1
+fi
 stop_fixture
 
 echo "--- 20. a queue answering two requests is worked one at a time ---"

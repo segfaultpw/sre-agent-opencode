@@ -1764,7 +1764,9 @@ function modelVerdict(agent, timeoutMs) {
   }
   if (agent.code !== 0) {
     const why = agent.errors.join('; ') || oneLine(agent.stderr || '', 160) || 'no error was printed';
-    return { ok: false, detail: `opencode exited ${agent.code}: ${why}` };
+    // A null code means the process never ran (spawn failed) or a signal ended it.
+    const how = agent.code === null || agent.code === undefined ? 'could not be started or was stopped' : `exited ${agent.code}`;
+    return { ok: false, detail: `opencode ${how}: ${why}` };
   }
   const answer = oneLine(String(agent.finalMessage || '').split('\n').find((line) => line.trim()) || '', 200);
   if (!answer) return { ok: false, detail: 'opencode finished without an answer' };

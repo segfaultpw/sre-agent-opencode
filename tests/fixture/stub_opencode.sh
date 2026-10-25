@@ -283,7 +283,10 @@ case "$mode" in
     # waiting for the stream to end means never reporting the request at all.
     # setsid is what puts it outside the group. A plain background job would
     # be killed with its parent and would prove nothing.
+    # Its PID goes to STUB_ESCAPED_PIDS so the test stops exactly this process,
+    # never every `sleep` on the machine by name.
     setsid sleep "${STUB_OPENCODE_SLEEP:-120}" &
+    echo "$!" >> "${STUB_ESCAPED_PIDS:-/dev/null}"
     sleep "${STUB_OPENCODE_SLEEP:-120}"
     ;;
   *)
