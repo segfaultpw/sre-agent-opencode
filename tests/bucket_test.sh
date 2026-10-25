@@ -125,6 +125,19 @@ queue_one() {
        token: $token}]' > "$queue_file"
 }
 
+# A test job as the platform queues it (see tests/runner_test.sh).
+queue_test_job() {
+  jq -n --arg id "$1" --arg repo "$2" --arg base "$server_url" --arg token "$handoff_token" \
+    '[{handoff_id: $id,
+       subject_id: "77777777-2222-3333-4444-555555555555",
+       repo_full_name: null,
+       test: true,
+       test_repo_full_name: (if $repo == "" then null else $repo end),
+       brief_url: ($base + "/api/handoffs/" + $id + "/brief"),
+       report_url: ($base + "/api/handoffs/" + $id + "/report"),
+       token: $token}]' > "$queue_file"
+}
+
 reset_aws() {
   rm -rf "$ctl/uploaded" "$ctl/bucket_tree" "$ctl/aws_fail" "$ctl/aws_fail_on" "$ctl/aws_partial_fail" \
     "$ctl/aws_fail_first" "$ctl/aws_kill_runner" "$ctl/aws_exit2" "$ctl/aws_hang" "$ctl/aws_sleep"
@@ -595,6 +608,7 @@ check "the uploaded script is the saved script" cmp -s "$ctl/uploaded/acme-sre-m
 check "what the runner cut (a symlink, a bad name, a stray file) is never uploaded" test -z "$(grep -E 'link.sh|bad name|stray' "$ctl/aws_calls.log" || true)"
 check "every call was made after the brief was fetched and before the report was posted" test "$(sort -u "$ctl/aws_seen.log" | tr '\n' ' ')" = "1 "
 check_jqf "the run's result carries the mirror's answer for the report" '.mirror.ok == true' "$work/mirror.result.json"
+check_jq "the report's memory names the bucket, beside the changes and the summary" '.memory.bucket == "acme-sre-memory" and (.memory.changes | length) == 3 and .memory.summary == "Estate note added."' "$report"
 check "every aws call saw the AWS variables and none of the runner's other credentials" test "$(sort -u "$ctl/aws_env.log" | grep -v '^$' | tr '\n' '|')" = "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY |"
 check "the agent's environment holds no SRE_MEMORY_ variable" grep -qx 'memory_env: ' "$opencode_log"
 check "the AWS secret is in no log line and no report" test -z "$(grep -lF "$aws_secret" "$work"/*.out "$fixture_log" 2>/dev/null || true)"
@@ -662,6 +676,7 @@ else
   check "the log says the memory could not be saved" grep -qF 'could not be saved' "$work/unsaved.out"
   check "the earlier note stands" test "$(cat "$workspace/memory/_estate/NOTES.md")" = "$original_note"
   check_jqf "no change is reported for it" '.changes == []' "$work/unsaved.result.json"
+  check_jq "and the report body carries no memory key" 'has("memory") | not' "$report"
   check "nothing is mirrored for a save that did not happen" test "$(calls)" -eq 0
   check_jqf "and the result has no mirror answer" '.mirror == null' "$work/unsaved.result.json"
   stop_fixture
@@ -782,6 +797,7 @@ check "the 50 scripts the run removed were deleted from the bucket" test "$(grep
 check "the 50 scripts the run added and the changed note were uploaded" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 51
 check "the last of the added scripts is among them" test -f "$ctl/uploaded/acme-sre-memory/memory/_estate/scripts/b50"
 check_jqf "and the mirror says it made them all" '.mirror.ok == true and .mirror.calls == 101' "$work/churn.result.json"
+check_jq "the report body itself carries fifty changes and the bucket's name" '(.memory.changes | length) == 50 and .memory.bucket == "acme-sre-memory"' "$report"
 stop_fixture
 
 echo "--- 16. a bucket that never answers: the mirror stops at its limit, the report goes out, the next job mirrors what is left ---"
@@ -1070,6 +1086,71 @@ stop_fixture
 
 echo "--- 22b. the mirror's loop has no flag of its own for a call that timed out ---"
 check "a call's time limit is the time left, so a call that times out leaves none and a flag could never matter" test -z "$(grep -nw stopped "$pkg/runner/bucket.js" || true)"
+
+echo "--- 23. a test job writes a marker object to the bucket and removes it again, and says so ---"
+reset_aws
+fresh_workspace
+start_fixture test_bucket
+queue_test_job h-test-bucket ""
+export STUB_OPENCODE_MODE=oneline
+BUCKET_V="acme-sre-memory"
+PREFIX_V="fleet"
+run_driver test_bucket
+estate_marker="$workspace/memory/_estate/scripts/.runner-test"
+check "the job exits 0 and is reported as not_validated" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check_jq "every step passed, the bucket step among them" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check_jq "the bucket step names the bucket and the prefix" '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/")' "$report"
+check "the marker was put under the prefix, in the estate's scripts" test "$(grep -cxF "$(argline s3 cp "$estate_marker" s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "and removed from the bucket" test "$(grep -cxF "$(argline s3 rm s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "the put came before the removal" test "$(grep -nF 's3'"$us"'cp'"$us$estate_marker" "$ctl/aws_calls.log" | head -n 1 | cut -d: -f1)" -lt "$(grep -nF 's3'"$us"'rm'"$us" "$ctl/aws_calls.log" | head -n 1 | cut -d: -f1)"
+check "nothing is left in the bucket" test -z "$(find "$ctl/uploaded" -type f -print -quit 2>/dev/null)"
+check "nothing is left on the volume: no marker, no directory the test made" test ! -e "$estate_marker" -a ! -e "$workspace/memory/_estate"
+check "the mirror's calls were made after the brief was fetched and before the report was posted" test "$(tail -n 2 "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "1 "
+check_jqf "the result carries the mirror's answer" '.mirror.ok == true and .mirror.pending == 0' "$work/test_bucket.result.json"
+check "no journal and no pending path are left" test ! -e "$workspace/.memory-mirror-pending"
+check "no shell ran anything in the workspace name" test -z "$(pwned)"
+stop_fixture
+
+echo "--- 23b. a bucket that refuses the marker fails the bucket step with the aws error, and the removal is retried by the next job ---"
+reset_aws
+fresh_workspace
+printf '.runner-test' > "$ctl/aws_fail_on"
+start_fixture test_bucket_denied
+queue_test_job h-test-bucket-denied ""
+run_driver test_bucket_denied
+check "the job is still reported, as not_validated" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check_jq "the steps before the bucket pass, the bucket fails with the aws error, reported is ok" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("AccessDenied")) and (.test.steps[4].detail | length) <= 300' "$report"
+check_jq "the summary is one sentence naming the step" '(.summary | contains("the bucket step")) and (.summary | test("\n") | not)' "$report"
+check "nothing was uploaded" test ! -e "$ctl/uploaded"
+check "no marker file is left on the volume" test -z "$(find "$workspace/memory" -name '.runner-test' -print -quit 2>/dev/null)"
+check_jqf "the removal of the marker waits in the journal, as a removal" '.paths["_estate/scripts/.runner-test"] == "removed"' "$workspace/.memory-mirror-pending"
+stop_fixture
+rm -f "$ctl/aws_fail_on"
+: > "$ctl/aws_calls.log"
+start_fixture test_bucket_retry
+queue_one h-test-bucket-retry
+export STUB_OPENCODE_MODE=diagnose
+run_driver test_bucket_retry
+check "the next ordinary job removes the marker from the bucket, once" test "$(grep -cxF "$(argline s3 rm s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "and the journal is empty again" test ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 23c. a restore that has not succeeded fails the bucket step, naming the restore ---"
+reset_aws
+fresh_workspace
+printf -- '--recursive' > "$ctl/aws_fail_on"
+start_fixture test_bucket_restore
+queue_test_job h-test-bucket-restore ""
+export STUB_OPENCODE_MODE=oneline
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_driver test_bucket_restore
+check_jq "the bucket step fails and says the restore has not succeeded" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("restore"))' "$report"
+check "no marker was put into a bucket whose restore is pending" test -z "$(grep -v -- '--recursive' "$ctl/aws_calls.log" || true)"
+stop_fixture
+rm -f "$ctl/aws_fail_on"
+export STUB_OPENCODE_MODE=diagnose
+
 
 echo "--- 11. the entrypoint refuses a bucket it cannot reach, and runs without one ---"
 bash_bin="$(command -v bash)"

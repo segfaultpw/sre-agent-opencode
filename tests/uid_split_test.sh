@@ -332,6 +332,64 @@ prove_bucket root "$runner_uid" setpriv --groups=20001,20002 --
 prove_bucket caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
 
+# A test job (runner/runner.js, runTestJob) checks the same split: the model is
+# asked as the agent's account, with none of the runner's variables, while the
+# clone, the memory directory and the mirror stay the runner's own.
+prove_test_job() {
+  local label="$1" owner="$2"
+  shift 2
+  local prefix=("$@")
+  local ws="$work/$label-test-ws" runner_home="$work/home/$label-test-runner" agent_home="$work/home/$label-test-agent"
+  local probe="$work/$label-test.probe" survivor="$work/$label-test.survivor" out="$work/$label-test.out"
+  local uidlog="$work/$label-test.git-uids" id="h-$label-test"
+  echo "--- $label: a test job asks the model as the agent's account and does everything else as the runner's ---"
+  mkdir -p "$ws/memory/acme/app" "$runner_home" "$agent_home"
+  printf 'the earlier notes\n' > "$ws/memory/acme/app/NOTES.md"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  : > "$probe"; : > "$survivor"; : > "$uidlog"
+  chmod 666 "$probe" "$survivor" "$uidlog"
+  printf '%s' "$uidlog" > "$work/ctl/git_uid_log"
+  printf '%s' "$work/$label-test.gh-uids" > "$work/ctl/gh_uid_log"
+  start_fixture
+  jq -n --arg id "$id" --arg base "$server_url" --arg token "$handoff_token" \
+    '[{handoff_id: $id, subject_id: "77777777-2222-3333-4444-555555555555", repo_full_name: null,
+       test: true, test_repo_full_name: "acme/app",
+       brief_url: ($base + "/api/handoffs/" + $id + "/brief"), report_url: ($base + "/api/handoffs/" + $id + "/report"),
+       token: $token}]' > "$work/queue.json"
+  local rc=0
+  timeout 120 "${prefix[@]}" env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    HOME="$runner_home" \
+    AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
+    STUB_OPENCODE_MODE=oneline STUB_OPENCODE_PROBE="$probe" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor" \
+    STUB_PROBE_GIT="$real_git" STUB_EXPECT_GH_TOKEN="$github_token" STUB_RUNNER_TOKEN="$github_token" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  local report
+  report="$(jq -c 'select(.path | endswith("/'"$id"'/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
+  survivors+=("$(cat "$survivor" 2>/dev/null || true)")
+  if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null; then echo "ok   $label: all six steps pass"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if grep -qx "id: $agent_uid:$agent_uid" "$probe" && grep -qx 'groups: ' "$probe" && grep -qx 'cap_eff: 0000000000000000' "$probe"; then echo "ok   $label: the model is asked as the agent's uid and gid, with no group and no capability"; else echo "FAIL $label: $(grep -E '^(id|groups|cap_eff):' "$probe")"; fail=1; fi
+  if grep -qx 'token_env: ' "$probe" && grep -qx 'aws_env: ' "$probe"; then echo "ok   $label: it holds no poll key, no runner variable and no AWS variable"; else echo "FAIL $label: $(grep -E 'token_env|aws_env' "$probe")"; fail=1; fi
+  if grep -qx 'memory_list: denied' "$probe" && grep -qx 'memory_write: denied' "$probe" && grep -qx 'runner_environ: denied' "$probe"; then echo "ok   $label: it can neither read nor write the memory directory, and cannot read the runner's environment"; else echo "FAIL $label: $(grep -E 'memory|runner_environ' "$probe")"; fail=1; fi
+  if [ -s "$uidlog" ] && ! grep -qvx "$owner" "$uidlog"; then echo "ok   $label: every git call ran as the runner's account ($(wc -l < "$uidlog") calls)"; else echo "FAIL $label: git uids: $(sort -u "$uidlog" | tr '\n' ' ')"; fail=1; fi
+  if [ "$(stat -c %u "$ws/scratch")" = "$owner" ] && [ "$(stat -c '%a %u' "$ws/memory")" = "700 $owner" ]; then echo "ok   $label: the scratch directory is the runner's again once the model has answered, and memory/ is 0700"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/scratch" "$ws/memory")"; fail=1; fi
+  if [ ! -e "$ws/memory/acme/app/.runner-test" ] && [ "$(cat "$ws/memory/acme/app/NOTES.md")" = "the earlier notes" ] && [ "$(stat -c %u "$ws/memory/acme/app/NOTES.md")" = "$owner" ]; then echo "ok   $label: the memory marker is gone and the notes are untouched"; else echo "FAIL $label: $(ls -la "$ws/memory/acme/app")"; fail=1; fi
+  local pid
+  pid="$(cat "$survivor")"
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then echo "ok   $label: a process the model call left behind is killed when it ends"; else echo "FAIL $label: survivor $pid is still running"; fail=1; fi
+  if ! "$real_git" -c safe.directory='*' --git-dir="$remote" rev-parse --verify --quiet "refs/heads/sre-agent/$id" >/dev/null 2>&1; then echo "ok   $label: nothing is pushed"; else echo "FAIL $label: the branch exists in the repository"; fail=1; fi
+  if ! grep -qF "$github_token" "$out" "$work/requests.jsonl"; then echo "ok   $label: the repository token is in no log line and no report"; else echo "FAIL $label: the token was logged or reported"; fail=1; fi
+}
+
+prove_test_job root "$runner_uid" setpriv --groups=20001,20002 --
+prove_test_job caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
+  --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
+
 echo "--- a root runner without the account ids refuses to start ---"
 start_fixture
 rc=0

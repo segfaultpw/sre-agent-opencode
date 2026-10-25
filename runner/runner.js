@@ -1314,7 +1314,7 @@ function splitMemorySummary(message, hadBlock) {
 // fences handed over the way fix.yml hands them over. The runner's own
 // credentials are stripped from the child's environment: the agent has a
 // shell, so anything left there is reachable, and it needs none of them.
-async function runAgent(config, workspace, prompt) {
+async function runAgent(config, workspace, prompt, options = {}) {
   const env = {
     ...process.env,
     OPENCODE_CONFIG_CONTENT: agentConfigContent(),
@@ -1372,7 +1372,7 @@ async function runAgent(config, workspace, prompt) {
     env,
     input: prompt,
     as: 'agent',
-    timeoutMs: config.runTimeoutMs,
+    timeoutMs: options.timeoutMs || config.runTimeoutMs,
   });
 
   const texts = [];
@@ -1568,6 +1568,41 @@ async function publish(config, workspace, message, brief, result) {
   return url;
 }
 
+// The report's two optional keys (the wire contract). An older platform reads
+// the keys it knows by name and ignores these, so they only ever add to a body
+// that is complete without them.
+//
+// memory: what the run changed in its notes and scripts, at most fifty entries
+// (paths relative to the memory directory), the agent's own summary at most 500
+// characters, and the name of the bucket the changes were mirrored to, or null.
+// A run that changed nothing sends no key at all.
+function memoryReport(result) {
+  const changes = Array.isArray(result.memoryChanges) ? result.memoryChanges.slice(0, memory.MAX_CHANGES) : [];
+  if (changes.length === 0) return {};
+  return {
+    memory: {
+      changes,
+      summary: oneLine(result.memorySummary || '', MEMORY_SUMMARY_MAX),
+      bucket: result.memoryBucket || null,
+    },
+  };
+}
+
+// test: the steps of a test job, each with a boolean ok and a detail of at most
+// 300 characters on one line. Only a test job sets result.test.
+function testReport(result) {
+  if (!Array.isArray(result.test)) return {};
+  return {
+    test: {
+      steps: result.test.map((step) => ({
+        name: step.name,
+        ok: step.ok === true,
+        detail: oneLine(redact(step.detail || ''), TEST_DETAIL_MAX),
+      })),
+    },
+  };
+}
+
 // Step 7. Report. This is the only thing that ends the request, so it runs in
 // a finally: a crash between the run and the report leaves the platform
 // waiting 45 minutes for its sweep to fail the row.
@@ -1578,6 +1613,8 @@ async function report(job, result) {
     actions: result.actions,
     evidence: result.evidence,
     ...(result.pr_url ? { pr_url: result.pr_url } : {}),
+    ...memoryReport(result),
+    ...testReport(result),
   });
 
   for (let attempt = 1; attempt <= REPORT_ATTEMPTS; attempt += 1) {
@@ -1628,6 +1665,235 @@ function isDecline(message) {
   return /^declined:/i.test(message.trim());
 }
 
+// not_validated is the only outcome this runner ever sends. The platform's
+// vocabulary also holds validated_fixed and false_positive: the first
+// belongs to a door that verified the fix in the running system, which this
+// runner cannot do because it cannot deploy, and the second is a judgement
+// about the request that the agent is not asked to make. Reporting
+// validated_fixed for an unmerged draft pull request put "reported
+// validated fixed for this card" on the card for a change nothing had run.
+function newResult(config) {
+  return {
+    outcome: 'not_validated',
+    summary: '',
+    actions: [],
+    evidence: { runner_version: `v${config.version}`, model: config.model },
+    // For the report of what the run did to its memory. memoryChanges is the
+    // report's list (at most fifty); memoryMirror is every change, which is what
+    // the bucket is told.
+    memoryChanges: [],
+    memoryMirror: [],
+    memorySummary: '',
+    memoryNotes: [],
+    // The bucket's name for the report's memory.bucket, or null.
+    memoryBucket: memoryBucketName(config),
+    // The mirror's answer ({ok, calls, pending, error?}) when a bucket is
+    // configured and the mirror had something to do; null otherwise. Named
+    // mirror, not bucket: the report's memory.bucket is the bucket's name.
+    mirror: null,
+  };
+}
+
+// The test job. An organization admin presses "Run a test job" in SRE Agent and
+// the platform queues a job of the ordinary shape with `"test": true`, a null
+// repo_full_name and the repository to clone in test_repo_full_name (null:
+// scratch). Nothing in it is a fix request: no pull request is opened and
+// nothing is pushed. The report carries six steps, in the order collected,
+// cloned, model, memory, bucket, reported, so a person can see that collection,
+// the clone, the model, the memory directory and the bucket all work from this
+// machine. The first step that fails is reported with its sentence and every
+// step after it as not run; `reported` is always ok, because the report
+// arriving is its proof.
+const TEST_DETAIL_MAX = 300;
+const TEST_MARKER = '.runner-test';
+const TEST_NOT_RUN = 'not run';
+const TEST_MODEL_TIMEOUT_MS = 120_000;
+// Fixed, and sent with none of a brief or of the memory: this is the whole input
+// of the model step. The agent is the same sre-fix agent a fix runs as, with its
+// fences, so a pass shows that the key, the model name and the agent all work.
+const TEST_MODEL_PROMPT =
+  'This is a connectivity check from the self-hosted runner, not a fix request. Reply with one short line of plain text that says you are working. Do not run any command, read any file or use any tool.';
+
+function memoryBucketName(config) {
+  return config.memoryBucket && config.memoryBucket.bucket ? config.memoryBucket.bucket : null;
+}
+
+// Makes `target` and every directory above it below `root` the runner's own,
+// and returns the ones it had to create, so a test can take back exactly what
+// it made and leave the memory directory as it found it.
+function makeTrackedDirectories(root, target) {
+  settleDir(root, 0o700);
+  const created = [];
+  let current = root;
+  for (const part of path.relative(root, target).split(path.sep)) {
+    current = path.join(current, part);
+    let existed = true;
+    try {
+      fs.lstatSync(current);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      existed = false;
+    }
+    settleDir(current, 0o700);
+    if (!existed) created.push(current);
+  }
+  return created;
+}
+
+function removeTrackedDirectories(created) {
+  for (const dir of [...created].reverse()) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      // Not empty, or gone already: either way it is not the test's to remove.
+    }
+  }
+}
+
+function writeTestMarker(file) {
+  fs.rmSync(file, { force: true });
+  fs.writeFileSync(file, `written by the runner test job at ${new Date().toISOString()}\n`, { mode: 0o600, flag: 'wx' });
+  ownByRunner(file);
+}
+
+function modelVerdict(agent, timeoutMs) {
+  if (agent.timedOut) {
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    const stray = agent.abandoned ? '; a process it started did not exit and may still be running' : '';
+    return { ok: false, detail: `the model did not answer within ${seconds} second${seconds === 1 ? '' : 's'}${stray}` };
+  }
+  if (agent.code !== 0) {
+    const why = agent.errors.join('; ') || oneLine(agent.stderr || '', 160) || 'no error was printed';
+    return { ok: false, detail: `opencode exited ${agent.code}: ${why}` };
+  }
+  const answer = oneLine(String(agent.finalMessage || '').split('\n').find((line) => line.trim()) || '', 200);
+  if (!answer) return { ok: false, detail: 'opencode finished without an answer' };
+  return { ok: true, detail: `the model answered: ${answer}` };
+}
+
+// The test job's sentence for the platform's card, and for a platform that does
+// not read the steps: one sentence that names the step that failed.
+function testSummary(config, steps, failed) {
+  if (!failed) return `Test job finished: every step passed on runner v${config.version}.`;
+  const skipped = steps.filter((step) => step.detail === TEST_NOT_RUN).length;
+  const tail = skipped > 0 ? `, so the ${skipped} step${skipped === 1 ? '' : 's'} after it ${skipped === 1 ? 'was' : 'were'} not run` : '';
+  return `Test job finished: the ${failed.name} step failed (${failed.detail})${tail}.`;
+}
+
+async function runTestJob(config, job) {
+  const result = newResult(config);
+  result.test = [];
+  let failed = null;
+  let repo = null;
+  const memoryRoot = memory.layout(config.workspace).memory;
+  const memoryDirectory = () => memory.memoryDir(config.workspace, repo ? { owner: repo.owner, name: repo.name } : null);
+
+  const step = async (name, run) => {
+    if (failed) {
+      result.test.push({ name, ok: false, detail: TEST_NOT_RUN });
+      return;
+    }
+    let outcome;
+    try {
+      outcome = (await run()) || {};
+    } catch (error) {
+      outcome = { ok: false, detail: error.message };
+    }
+    const ok = outcome.ok === true;
+    const detail = oneLine(redact(outcome.detail || (ok ? 'ok' : 'failed')), TEST_DETAIL_MAX);
+    result.test.push({ name, ok, detail });
+    log(ok ? 'info' : 'warn', `test job ${job.handoff_id}: ${name}: ${ok ? 'ok' : 'failed'}: ${detail}`);
+    if (!ok) failed = { name, detail };
+  };
+
+  try {
+    await step('collected', async () => {
+      const brief = await fetchBrief(job);
+      result.actions.push('fetched the brief');
+      return { ok: true, detail: `took the job off the queue and fetched its brief (${Buffer.byteLength(brief)} bytes)` };
+    });
+
+    await step('cloned', async () => {
+      const named = typeof job.test_repo_full_name === 'string' ? job.test_repo_full_name.trim() : '';
+      if (!named) return { ok: true, detail: 'no repository is set to the self-hosted runner, so a scratch directory is used' };
+      const wanted = parseRepo(named);
+      const workspace = await prepareCheckout(config, job, wanted);
+      repo = wanted;
+      result.evidence.test_repository = wanted.fullName;
+      result.actions.push(`checked out ${wanted.fullName} at ${workspace.defaultBranch}, and pushed nothing`);
+      return { ok: true, detail: `cloned ${wanted.fullName} at ${workspace.defaultBranch}; nothing is pushed` };
+    });
+
+    await step('model', async () => {
+      const scratch = prepareScratch(config);
+      writeAgent(config, scratch.dir);
+      const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
+      let agent;
+      try {
+        await handOver(scratch.dir);
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs });
+      } finally {
+        await reclaim(scratch.dir);
+      }
+      result.actions.push(`asked model ${config.model} for one line through opencode run`);
+      return modelVerdict(agent, timeoutMs);
+    });
+
+    await step('memory', async () => {
+      const dir = memoryDirectory();
+      const label = path.relative(memoryRoot, dir);
+      const created = makeTrackedDirectories(memoryRoot, dir);
+      const marker = path.join(dir, TEST_MARKER);
+      try {
+        writeTestMarker(marker);
+        fs.rmSync(marker);
+      } catch (error) {
+        return { ok: false, detail: `could not write and remove ${TEST_MARKER} in memory/${label}: ${error.code || error.message}` };
+      } finally {
+        fs.rmSync(marker, { force: true });
+        removeTrackedDirectories(created);
+      }
+      return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${label} and removed it again` };
+    });
+
+    await step('bucket', async () => {
+      const settings = bucketSettings(config);
+      if (!settings) return { ok: true, detail: 'no bucket configured' };
+      const dir = memoryDirectory();
+      const label = path.relative(memoryRoot, dir);
+      const scripts = path.join(dir, memory.SCRIPTS);
+      const marker = path.join(scripts, TEST_MARKER);
+      const key = `${label}/${memory.SCRIPTS}/${TEST_MARKER}`;
+      const created = makeTrackedDirectories(memoryRoot, scripts);
+      let put;
+      let size;
+      try {
+        writeTestMarker(marker);
+        size = fs.statSync(marker).size;
+        put = await bucket.mirror(settings, [{ path: key, change: 'added', bytes: size }]);
+      } finally {
+        fs.rmSync(marker, { force: true });
+        removeTrackedDirectories(created);
+      }
+      // The same mirror a fix goes through: the marker is put, then removed, and
+      // a removal that fails stays in the journal for the next request.
+      const removal = await bucket.mirror(settings, [{ path: key, change: 'removed', bytes: size }]);
+      const error = put.ok ? removal.error : put.error;
+      result.mirror = { ok: Boolean(put.ok && removal.ok), calls: (put.calls || 0) + (removal.calls || 0), pending: removal.pending || 0 };
+      if (error) result.mirror.error = error;
+      if (!result.mirror.ok) return { ok: false, detail: `the bucket did not take the marker: ${error || 'no answer'}` };
+      return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/${memory.SCRIPTS}/ and removed it again` };
+    });
+  } finally {
+    result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
+    result.actions.push('ran the test job: no fix was run and nothing was pushed');
+    result.summary = testSummary(config, result.test, failed);
+    await report(job, result);
+    jobSecret = null;
+  }
+  return result;
+}
+
 async function handleJob(config, job) {
   identity = config.identity || NO_IDENTITY;
   if (!job || !job.handoff_id || !job.report_url || !job.token) {
@@ -1636,36 +1902,15 @@ async function handleJob(config, job) {
   }
 
   jobSecret = job.token;
-  log('info', 'collected a fix request', {
+  log('info', job.test === true ? 'collected a test job' : 'collected a fix request', {
     handoff_id: job.handoff_id,
     subject_id: job.subject_id || null,
     repo_full_name: job.repo_full_name || null,
   });
 
-  // not_validated is the only outcome this runner ever sends. The platform's
-  // vocabulary also holds validated_fixed and false_positive: the first
-  // belongs to a door that verified the fix in the running system, which this
-  // runner cannot do because it cannot deploy, and the second is a judgement
-  // about the request that the agent is not asked to make. Reporting
-  // validated_fixed for an unmerged draft pull request put "reported
-  // validated fixed for this card" on the card for a change nothing had run.
-  const result = {
-    outcome: 'not_validated',
-    summary: '',
-    actions: [],
-    evidence: { runner_version: `v${config.version}`, model: config.model },
-    // For the report of what the run did to its memory; the report body does
-    // not carry them yet. memoryChanges is the report's list (at most fifty);
-    // memoryMirror is every change, which is what the bucket is told.
-    memoryChanges: [],
-    memoryMirror: [],
-    memorySummary: '',
-    memoryNotes: [],
-    // The mirror's answer ({ok, calls, pending, error?}) when a bucket is
-    // configured and the mirror had something to do; null otherwise. Named
-    // mirror, not bucket: the report's memory.bucket is the bucket's name.
-    mirror: null,
-  };
+  if (job.test === true) return runTestJob(config, job);
+
+  const result = newResult(config);
 
   try {
     const brief = await fetchBrief(job);

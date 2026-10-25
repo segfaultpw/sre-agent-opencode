@@ -236,6 +236,14 @@ case "$mode" in
   diagnose)
     emit "The failures come from the checkout service exhausting its database pool during the nightly reindex. The change belongs in acme/checkout, whose pool size is set in its own deployment configuration."
     ;;
+  oneline)
+    # The runner's test job asks the model for one line, with no brief: this is
+    # the answer a working model gives.
+    emit "Ready, and working."
+    ;;
+  silent)
+    # Exits cleanly having said nothing: a model that returned no text.
+    ;;
   nochange)
     emit "Read the brief and the repository and found the behaviour already correct on this branch."
     ;;
