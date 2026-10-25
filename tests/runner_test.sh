@@ -1279,6 +1279,24 @@ unset SRE_MEMORY_BUCKET SRE_MEMORY_PREFIX
 rm -f "$work/bin/aws"
 stop_fixture
 
+echo "--- 45c. a test job does not touch a repository another instance is working on ---"
+# The marker lands in the same memory tree a fix run saves into, so the test
+# takes the repository's lease for its marker steps: busy is an honest failed
+# step, never a write into somebody else's save.
+start_fixture testbusy
+queue_test_job h-test-busy acme/app
+export STUB_OPENCODE_MODE=oneline
+mkdir -p "$workspace/locks/acme"
+printf 'beta %s %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once testbusy
+export STUB_OPENCODE_MODE=fix
+if jq -e '.test.steps[3].ok == false and (.test.steps[3].detail | test("another runner instance .*acme/app.*marker was not written"))' <<<"$report" >/dev/null; then echo "ok   the memory step fails with the busy sentence and writes nothing"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps[4] == {name: "bucket", ok: false, detail: "not run"}' <<<"$report" >/dev/null; then echo "ok   the bucket step after it is not run, as after any failed step"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   no marker was written into the busy repository's memory"; else echo "FAIL left: $(find "$workspace/memory" -name '.runner-test')"; fail=1; fi
+if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "reported"]' <<<"$report" >/dev/null; then echo "ok   all six steps are still reported, in order"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+rm -f "$workspace/locks/acme/app.lock"
+stop_fixture
+
 echo "--- 46. a test report is the ordinary body plus the test key ---"
 # Older platforms read named keys only, so the two optional keys are additions
 # and never replacements: a platform that ignores test still gets a valid report.
@@ -1451,6 +1469,65 @@ queue_one h-lockfifo acme/app
 SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once lockfifo
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ ! -e "$workspace/locks/acme/app.lock" ] && grep -q 'is not a lock file' "$out"; then echo "ok   a lock file that is a FIFO is treated as stale, not read, and replaced"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
 rm -f "$workspace/locks/acme/app.lock"
+stop_fixture
+
+echo "--- 52b. the stale bound follows SRE_RUN_TIMEOUT_SECONDS, and only the file system's clock decides staleness ---"
+start_fixture raised
+queue_one h-raised acme/app
+mkdir -p "$workspace/locks/acme"
+printf 'ghost 999999 %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
+touch -d '46 minutes ago' "$workspace/locks/acme/app.lock"
+run_timeout=5400
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once raised
+run_timeout=60
+if jq -e '.evidence.busy_repository == "acme/app"' <<<"$report" >/dev/null; then echo "ok   with SRE_RUN_TIMEOUT_SECONDS=5400 a lock 46 minutes old is live, not stale"; else echo "FAIL report: $report"; fail=1; fi
+if [ -e "$workspace/locks/acme/app.lock" ]; then echo "ok   the live lock was left for its holder"; else echo "FAIL the lock was taken anyway"; fail=1; fi
+rm -f "$workspace/locks/acme/app.lock"
+printf 'ghost 999999 2026-01-01T00:00:00.000Z\n' > "$workspace/locks/acme/app.lock"
+touch -d '101 minutes ago' "$workspace/locks/acme/app.lock"
+start_fixture raisedgone
+queue_one h-raisedgone acme/app
+run_timeout=5400
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once raisedgone
+run_timeout=60
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a lock past the raised bound (the timeout plus ten minutes) is taken over"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+# Only the volume's mtime is the staleness clock: a written timestamp older
+# than the bound changes nothing while the file was just touched.
+printf 'ghost 999999 2026-01-01T00:00:00.000Z\n' > "$workspace/locks/acme/app.lock"
+touch "$workspace/locks/acme/app.lock"
+start_fixture clockskew
+queue_one h-clockskew acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once clockskew
+if jq -e '.evidence.busy_repository == "acme/app"' <<<"$report" >/dev/null && [ -e "$workspace/locks/acme/app.lock" ]; then echo "ok   an old written timestamp with a fresh mtime is a live lock: the file system's clock is the only one that counts"; else echo "FAIL report: $report"; fail=1; fi
+rm -f "$workspace/locks/acme/app.lock"
+stop_fixture
+
+echo "--- 52c. a half-written lock is replaced at once, and one this account cannot read is waited for ---"
+mkdir -p "$workspace/locks/acme"
+: > "$workspace/locks/acme/app.lock"
+start_fixture emptylock
+queue_one h-emptylock acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once emptylock
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && grep -q 'is not a lock file' "$out"; then echo "ok   an empty lock file is replaced at once, not waited out"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+printf 'not a lock at all\n' > "$workspace/locks/acme/app.lock"
+start_fixture junklock
+queue_one h-junklock acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once junklock
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a lock whose instance, pid or time does not parse is replaced at once"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+printf 'other 999999 %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
+chmod 000 "$workspace/locks/acme/app.lock"
+start_fixture blindlock
+queue_one h-blindlock acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once blindlock
+if jq -e '.evidence.busy_repository == "acme/app"' <<<"$report" >/dev/null && [ -e "$workspace/locks/acme/app.lock" ] && grep -q 'could not be read' "$out" && ! grep -q 'is not a lock file' "$out"; then echo "ok   a lock this account cannot read is waited for and reported busy, never replaced"; else echo "FAIL report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+chmod 600 "$workspace/locks/acme/app.lock"; rm -f "$workspace/locks/acme/app.lock"
+stop_fixture
+
+echo "--- 52d. a run that releases cleanly leaves no takeover warning behind ---"
+start_fixture cleanrelease
+queue_one h-cleanrelease acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha run_once cleanrelease
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && ! grep -q 'was taken over' "$out"; then echo "ok   the lease is cleared at its release, so no takeover warning follows a clean run"; else echo "FAIL rc=$rc out: $(grep -n "taken over" "$out" || true)"; fail=1; fi
 stop_fixture
 
 echo "--- 53. the poll body names the runner's instance, with the split off as well ---"

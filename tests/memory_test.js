@@ -157,6 +157,9 @@ test('split takes the memory root from SRE_MEMORY_ROOT and refuses what it canno
   const laid = memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: '/data/notes' });
   assert.equal(laid.memory, '/data/notes');
   assert.equal(laid.stateBase, '/data');
+  // The locks follow the memory they guard, so two workspaces pointed at one
+  // memory root still coordinate.
+  assert.equal(laid.locks, '/data/locks');
   assert.throws(() => memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: 'notes' }), /SRE_MEMORY_ROOT/);
   assert.throws(() => memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: '/shared' }), /SRE_MEMORY_ROOT/);
   // The default memory root still works when spelled out.

@@ -43,10 +43,15 @@ const RUNNER_DISABLED_CODE = 'runner_disabled';
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
 // so with the split off nothing changes, lock files included). A lock names
-// the instance, the process and the moment it was taken; a holder silent for
-// 45 minutes is assumed gone, a run being bounded well below that. A live one
-// is polled for once a second and waited for at most SRE_LOCK_WAIT_SECONDS.
+// the instance, the process and the moment it was taken; a holder silent past
+// the stale bound is assumed gone. The bound is at least 45 minutes and always
+// above SRE_RUN_TIMEOUT_SECONDS plus a cleanup margin, so a slow but live run
+// (a raised timeout) never has its lock read stale. A live one is polled for
+// once a second and waited for at most SRE_LOCK_WAIT_SECONDS.
 const LOCK_STALE_MS = 45 * 60 * 1000;
+// What the run's own cleanup may take past its time bound before another
+// instance is allowed to conclude nobody is coming back.
+const LOCK_STALE_MARGIN_MS = 10 * 60 * 1000;
 // "<instance up to 100> <pid> <iso time>\n" fits in far less than this; the
 // bound is what makes an oversized file read as stale rather than read whole.
 const LOCK_CONTENT_MAX_BYTES = 256;
@@ -335,6 +340,10 @@ function loadConfig() {
     layout,
     instance: layout.instance,
     lockWaitMs: lockWaitSeconds * 1000,
+    // At least 45 minutes, and above the run timeout plus its margin, so the
+    // staleness rule can never steal the lock of a run that is still inside
+    // SRE_RUN_TIMEOUT_SECONDS or cleaning up after it.
+    lockStaleMs: Math.max(LOCK_STALE_MS, timeoutSeconds * 1000 + LOCK_STALE_MARGIN_MS),
     // {bucket, prefix}; bucket is '' when the operator configured none.
     memoryBucket,
     githubToken: process.env.SRE_GITHUB_TOKEN || '',
@@ -568,6 +577,11 @@ function bucketSettings(config) {
     memoryRoot: config.layout.memory,
     deadlineMs: chosen.deadlineMs,
     state: config.memoryState,
+    // Held around each journal read-modify-write and each marker write, never
+    // across an aws call: a pool shares the journal and the markers, so one
+    // instance's save must never clobber another's. The mirror stops with an
+    // honest error when the lock cannot be had, and the paths stay pending.
+    mutex: (run) => withStateLock(config, run, 'the mirror shared state write'),
     log,
     own: ownByRunner,
     run: async (command, args, options = {}) => {
@@ -1083,16 +1097,23 @@ function pidIsAlive(pid) {
   }
 }
 
-// {state: 'absent' | 'bad' | 'ok', mtimeMs, takenMs, instance, pid} for a lock
-// file. 'bad' is a shape no lock ever has: a link, a FIFO, a directory or an
-// oversized file, which is treated as stale rather than read.
+// {state: 'absent' | 'bad' | 'unreadable' | 'ok', mtimeMs, takenMs, instance, pid}
+// for a lock file. 'bad' is a shape no lock this runner ever writes: a link, a
+// FIFO, a directory, an oversized file, or one whose instance, pid or timestamp
+// does not parse (the window between a crash and the write, a partial write on a
+// full volume), and it is replaced at once rather than waited out. 'unreadable'
+// is a file this account cannot open at all (a mixed-uid pool), which is
+// neither replaceable (unlink would fail the same way) nor readable, so it is
+// waited for like a live lock and reported as busy when it never clears.
 function readHeldLock(file) {
   const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
   let fd;
   try {
     fd = fs.openSync(file, flags);
   } catch (error) {
-    return { state: error.code === 'ENOENT' ? 'absent' : 'bad' };
+    if (error.code === 'ENOENT') return { state: 'absent' };
+    if (error.code === 'ELOOP' || error.code === 'ENOTDIR') return { state: 'bad' };
+    return { state: 'unreadable', reason: error.code || 'unreadable' };
   }
   try {
     const stat = fs.fstatSync(fd);
@@ -1106,12 +1127,15 @@ function readHeldLock(file) {
     }
     const [named, numbered, stamped] = content.toString('utf8', 0, read).trim().split(/\s+/);
     const taken = Date.parse(stamped || '');
+    const instance = /^[A-Za-z0-9._-]{1,100}$/.test(named) ? named : null;
+    const pid = /^[0-9]+$/.test(numbered || '') ? Number.parseInt(numbered, 10) : null;
+    if (instance === null || pid === null || !Number.isFinite(taken)) return { state: 'bad' };
     return {
       state: 'ok',
       mtimeMs: stat.mtimeMs,
-      takenMs: Number.isFinite(taken) ? taken : null,
-      instance: /^[A-Za-z0-9._-]{1,100}$/.test(named) ? named : null,
-      pid: /^[0-9]+$/.test(numbered || '') ? Number.parseInt(numbered, 10) : null,
+      takenMs: taken,
+      instance,
+      pid,
     };
   } finally {
     fs.closeSync(fd);
@@ -1125,6 +1149,11 @@ function readHeldLock(file) {
 async function acquireLock(file, options = {}) {
   const instance = options.instance || memory.DEFAULT_INSTANCE;
   const deadline = Date.now() + (options.waitMs === undefined ? LOCK_WAIT_SECONDS * 1000 : options.waitMs);
+  // The mtime is the only staleness clock: the file system stamps it, so a
+  // writer whose clock is skewed cannot have a just-taken lock read stale, and
+  // the written timestamp stays what the log names.
+  const staleMs = options.staleMs === undefined ? LOCK_STALE_MS : options.staleMs;
+  let warnedUnreadable = false;
   settleDir(path.dirname(file), 0o700);
   for (;;) {
     try {
@@ -1146,12 +1175,20 @@ async function acquireLock(file, options = {}) {
     if (held.state === 'absent') continue;
     const ageMs = (from) => (from === null || from === undefined ? null : Date.now() - from);
     const mtimeAge = ageMs(held.mtimeMs);
-    const takenAge = ageMs(held.takenMs);
-    const silent = (age) => age !== null && age > LOCK_STALE_MS;
+    const silent = (age) => age !== null && age > staleMs;
     if (held.state === 'bad') {
-      log('warn', `the lock ${file} is not a lock file (a link or a special file was left in its place), so it was replaced`);
-    } else if (silent(mtimeAge) || silent(takenAge)) {
-      log('warn', `the lock ${file} was held by instance ${held.instance || 'unknown'} (pid ${held.pid || 'unknown'}) more than 45 minutes ago, so it is assumed gone and was replaced`);
+      log('warn', `the lock ${file} is not a lock file (a link, a special file or an unreadable half-written one was left in its place), so it was replaced`);
+    } else if (held.state === 'unreadable') {
+      if (!warnedUnreadable) {
+        log('warn', `the lock ${file} could not be read (${held.reason}), so it is waited for; another account owns it`);
+        warnedUnreadable = true;
+      }
+      if (Date.now() >= deadline) return { ok: false, file, holder: held };
+      await sleep(Math.min(LOCK_POLL_MS, Math.max(0, deadline - Date.now())));
+      continue;
+    } else if (silent(mtimeAge)) {
+      const minutes = Math.max(1, Math.round(staleMs / 60_000));
+      log('warn', `the lock ${file} was held by instance ${held.instance || 'unknown'} (pid ${held.pid || 'unknown'}, taken ${new Date(held.takenMs).toISOString()}) more than ${minutes} minutes ago, so it is assumed gone and was replaced`);
     } else if (held.instance === instance && !pidIsAlive(held.pid)) {
       log('info', `the lock ${file} was left by this instance's own pid ${held.pid || 'unknown'}, which is gone, so it was taken back`);
     } else {
@@ -1167,7 +1204,7 @@ async function acquireLock(file, options = {}) {
 // another instance after 45 minutes is theirs to release, not this one's to
 // unlink. An absent lock is nothing (the release already ran).
 function releaseLock(lock) {
-  if (!lock || !lock.ok) return;
+  if (!lock || !lock.ok || !lock.file) return;
   const held = readHeldLock(lock.file);
   if (held.state === 'absent') return;
   if (held.state === 'ok' && held.instance === lock.instance && held.pid === process.pid) {
@@ -1185,7 +1222,7 @@ function releaseLock(lock) {
 async function acquireRepoLease(config, repo) {
   if (!config.layout.perInstance) return null;
   const file = repoLockPath(config.layout, repo);
-  const lock = await acquireLock(file, { instance: config.layout.instance, waitMs: config.lockWaitMs });
+  const lock = await acquireLock(file, { instance: config.layout.instance, waitMs: config.lockWaitMs, staleMs: config.lockStaleMs });
   if (lock.ok) return lock;
   log('warn', `${repo ? repo.fullName : 'the estate notes'} are being worked on by another runner instance (${lock.holder.instance || 'unknown'}, pid ${lock.holder.pid || 'unknown'}); this request reports that it was not run`);
   return { busy: lock.holder, file };
@@ -1201,6 +1238,7 @@ async function withStateLock(config, run, what) {
   const lock = await acquireLock(path.join(config.layout.locks, '_state.lock'), {
     instance: config.layout.instance,
     waitMs: config.lockWaitMs,
+    staleMs: config.lockStaleMs,
   });
   if (!lock.ok) {
     log('warn', `the shared memory state lock is held by instance ${lock.holder.instance || 'unknown'}, so ${what} was not tried now and the next request tries it again`);
@@ -2358,6 +2396,25 @@ function testSummary(config, steps, failed) {
   return `Test job finished: the ${failed.name} step failed (${failed.detail})${tail}.`;
 }
 
+// The repository's lease for a test job's marker steps, with a busy answer
+// that says so rather than a wedge: the marker is skipped, the step fails with
+// this sentence, and nothing of another instance's run is touched. The same
+// lease the fix path takes, because the marker lands in the same memory tree.
+async function testRepoLease(config, repo) {
+  if (!config.layout.perInstance) return { ok: true, file: null };
+  const lock = await acquireLock(repoLockPath(config.layout, repo), {
+    instance: config.layout.instance,
+    waitMs: config.lockWaitMs,
+    staleMs: config.lockStaleMs,
+  });
+  return lock.ok ? lock : { ok: false, holder: lock.holder };
+}
+
+function testBusyDetail(holder, repo) {
+  const whose = repo ? repo.fullName : 'the estate notes';
+  return `another runner instance (${holder.instance || 'unknown'}, pid ${holder.pid || 'unknown'}) is working on ${whose}, so the marker was not written`;
+}
+
 async function runTestJob(config, job) {
   const result = newResult(config);
   result.test = [];
@@ -2422,6 +2479,8 @@ async function runTestJob(config, job) {
     });
 
     await step('memory', async () => {
+      const lease = await testRepoLease(config, repo);
+      if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
       const dir = memoryDirectory();
       const label = path.relative(memoryRoot, dir);
       const created = makeTrackedDirectories(memoryRoot, dir);
@@ -2434,6 +2493,7 @@ async function runTestJob(config, job) {
       } finally {
         fs.rmSync(marker, { force: true });
         removeTrackedDirectories(created);
+        releaseLock(lease);
       }
       return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${label} and removed it again` };
     });
@@ -2444,6 +2504,8 @@ async function runTestJob(config, job) {
     await step('bucket', async () => {
       const settings = bucketSettings(config);
       if (!settings) return { ok: true, detail: 'no bucket configured' };
+      const lease = await testRepoLease(config, repo);
+      if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
       const dir = memoryDirectory();
       const label = path.relative(memoryRoot, dir);
       const marker = path.join(dir, TEST_MARKER);
@@ -2455,6 +2517,7 @@ async function runTestJob(config, job) {
       } finally {
         fs.rmSync(marker, { force: true });
         removeTrackedDirectories(created);
+        releaseLock(lease);
       }
       if (!answer.ok) return { ok: false, detail: answer.error };
       return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/ and removed it again` };
@@ -2556,7 +2619,10 @@ async function handleJob(config, job) {
         // The repository's lease ends with the save and the home: this is the
         // brief's span, held until the memory is closed and the agent's home
         // is the runner's again, and never into the staging and the push.
+        // Cleared here so the backstop below never reads another instance's
+        // fresh lock as a takeover of this one.
         releaseLock(lease);
+        lease = null;
       }
     }
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);

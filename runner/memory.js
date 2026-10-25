@@ -138,7 +138,12 @@ function split(env = process.env) {
     agentHome: path.join(instanceDir, 'agent-home'),
     memory,
     stateBase: path.dirname(memory),
-    locks: path.join(workspace, 'locks'),
+    // Beside the memory root, not the workspace: the locks guard the shared
+    // memory tree, so they follow it wherever SRE_MEMORY_ROOT points, and two
+    // workspaces on one memory root coordinate. In the default shape the
+    // memory root is <workspace>/memory, so this is <workspace>/locks as it
+    // always was.
+    locks: path.join(path.dirname(memory), 'locks'),
   };
 }
 

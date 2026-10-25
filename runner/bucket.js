@@ -221,10 +221,26 @@ function stateExists(config, name) {
 }
 
 // What an earlier process left half done: a staging directory or a state file
-// being written. Nothing in them is ever used.
+// being written. Nothing in them is ever used. The name carries the pid of the
+// process that was writing, so in a pool only this pid's own leftovers and a
+// dead pid's are removed: a live neighbour's half-written state is theirs to
+// finish, and deleting it would make their save throw.
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
 function removeStale(config) {
   for (const name of entries(workspaceDir(config))) {
-    if (STALE_STATE.test(name)) fs.rmSync(path.join(workspaceDir(config), name), { recursive: true, force: true });
+    if (!STALE_STATE.test(name)) continue;
+    const pid = Number.parseInt(name.match(/(\d+)$/)?.[1] || '', 10);
+    if (Number.isInteger(pid) && pid !== process.pid && pidAlive(pid)) continue;
+    fs.rmSync(path.join(workspaceDir(config), name), { recursive: true, force: true });
   }
 }
 
@@ -344,55 +360,83 @@ function saveJournal(config, journal) {
 
 // After a run: one `aws s3 cp` per added or modified file and one `aws s3 rm`
 // per removed one, keys under the prefix, for these changes and for whatever an
-// earlier request left in the journal. The journal is written before the first
-// call and a path leaves it when its call succeeds, so nothing a stop, a
-// failure or the time limit cuts is forgotten. While a restore has not
-// succeeded the calls are not made at all. A failing call is logged and the
+// earlier request left in the journal. Every journal read-modify-write and
+// every marker write runs inside the shared state lock the runner passes in
+// (never an aws call inside it), so two instances mirroring at once combine
+// rather than clobber; a lock that cannot be had stops the mirror and leaves
+// every path pending. The journal is written before the first call and a path
+// leaves it when its call succeeds, so nothing a stop, a failure or the time
+// limit cuts is forgotten. While a restore has not succeeded the calls are
+// not made at all. A failing call is logged and the
 // rest still run; one that times out has used all the time that was left, so it
 // ends the mirror, because the bucket is not answering. Nothing here ever
 // throws into the request.
 async function mirror(config, changes) {
   if (!config || !config.bucket) return { ok: true, skipped: 'no bucket is configured' };
   const refused = [];
-  let journal = loadJournal(config);
-  if (journal.lost) {
-    // The paths it held are gone: journal the whole volume now, so this request
-    // carries them to the bucket instead of the next one.
-    firstSync(config);
-    journal = loadJournal(config);
-  }
-  for (const change of Array.isArray(changes) ? changes : []) {
-    const rel = change && change.path;
-    const kind = change && change.change;
-    const shape = classify(rel);
-    if (shape.leftover) continue;
-    if (shape.error) {
-      refused.push(`${firstLine(rel) || '(empty)'}: ${shape.error}`);
-    } else if (!KINDS.has(kind)) {
-      refused.push(`${rel}: ${firstLine(kind) || '(none)'} is not a change the mirror knows`);
-    } else {
-      journal.set(rel, kind);
+
+  // One journal read-modify-write: a fresh load, the caller's mutation, the
+  // save, all inside the shared state lock when the runner gave one (a pool
+  // shares the journal and the markers, so one instance's save must never
+  // clobber another's), and never an aws call inside it. A busy lock stops the
+  // mirror with an honest error: every path stays pending for the next one.
+  const journalWrite = async (mutate) => {
+    const run = () => {
+      const journal = mutate(loadJournal(config));
+      saveJournal(config, journal);
+      return journal;
+    };
+    if (!config.mutex) return { ok: true, journal: run() };
+    const answer = await config.mutex(run);
+    if (answer === null) return { ok: false };
+    return { ok: true, journal: answer };
+  };
+
+  const boot = await journalWrite((journal) => {
+    if (journal.lost) {
+      // The paths it held are gone: journal the whole volume now, so this
+      // request carries them to the bucket instead of the next one.
+      firstSync(config);
+      journal = loadJournal(config);
     }
+    for (const change of Array.isArray(changes) ? changes : []) {
+      const rel = change && change.path;
+      const kind = change && change.change;
+      const shape = classify(rel);
+      if (shape.leftover) continue;
+      if (shape.error) {
+        refused.push(`${firstLine(rel) || '(empty)'}: ${shape.error}`);
+      } else if (!KINDS.has(kind)) {
+        refused.push(`${rel}: ${firstLine(kind) || '(none)'} is not a change the mirror knows`);
+      } else {
+        journal.set(rel, kind);
+      }
+    }
+    return journal;
+  });
+  if (!boot.ok) {
+    const error = 'the shared memory state lock was held by another runner instance, so nothing was mirrored; the next request tries it again';
+    say(config, 'warn', `memory bucket: ${error}`);
+    return { ok: false, calls: 0, pending: Array.isArray(changes) ? changes.length : 0, error };
   }
   const refusedText = () => (refused.length > 0 ? `${refused.length} path${refused.length === 1 ? '' : 's'} not mirrored (first: ${refused[0]})` : '');
   for (const problem of refused) say(config, 'warn', `memory bucket: not mirrored, ${problem}`);
-  if (journal.size === 0 && refused.length === 0) return { ok: true, calls: 0, idle: true };
-  if (journal.size === 0) return { ok: false, calls: 0, pending: 0, error: Array.from(refusedText()).slice(0, ERROR_MAX).join('') };
-
-  saveJournal(config, journal);
+  if (boot.journal.size === 0 && refused.length === 0) return { ok: true, calls: 0, idle: true };
+  if (boot.journal.size === 0) return { ok: false, calls: 0, pending: 0, error: Array.from(refusedText()).slice(0, ERROR_MAX).join('') };
   if (restorePending(config)) {
-    const error = `the restore from the bucket has not succeeded, so nothing was mirrored (${journal.size} path${journal.size === 1 ? '' : 's'} wait for it)`;
+    const error = `the restore from the bucket has not succeeded, so nothing was mirrored (${boot.journal.size} path${boot.journal.size === 1 ? '' : 's'} wait for it)`;
     say(config, 'warn', `memory bucket: ${error}`);
-    return { ok: false, calls: 0, pending: journal.size, error: Array.from(error).slice(0, ERROR_MAX).join('') };
+    return { ok: false, calls: 0, pending: boot.journal.size, error: Array.from(error).slice(0, ERROR_MAX).join('') };
   }
 
-  const total = journal.size;
   const deadlineMs = Number.isFinite(config.deadlineMs) && config.deadlineMs > 0 ? config.deadlineMs : MIRROR_DEADLINE_MS;
   const started = Date.now();
   const failed = [];
   let calls = 0;
   let notTried = 0;
-  for (const rel of [...journal.keys()].sort()) {
+  let pending = 0;
+  let stateWrite = { ok: true };
+  for (const rel of [...boot.journal.keys()].sort()) {
     const remaining = deadlineMs - (Date.now() - started);
     if (remaining <= 0) {
       notTried += 1;
@@ -400,7 +444,7 @@ async function mirror(config, changes) {
     }
     const shape = classify(rel);
     const uri = `s3://${config.bucket}/${config.prefix}${shape.segments.join('/')}`;
-    const kind = journal.get(rel);
+    const kind = boot.journal.get(rel);
     let args;
     if (kind === 'removed') {
       args = ['s3', 'rm', uri, '--only-show-errors'];
@@ -409,7 +453,8 @@ async function mirror(config, changes) {
       if (source.error) {
         refused.push(`${rel}: ${source.error}`);
         say(config, 'warn', `memory bucket: not mirrored, ${rel}: ${source.error}`);
-        journal.delete(rel);
+        stateWrite = await journalWrite((journal) => (journal.delete(rel), journal));
+        if (!stateWrite.ok) break;
         continue;
       }
       args = ['s3', 'cp', source.local, uri, '--only-show-errors'];
@@ -422,33 +467,46 @@ async function mirror(config, changes) {
       result = { code: null, stdout: '', stderr: error.message, timedOut: false };
     }
     if (result.code === 0) {
-      journal.delete(rel);
-      saveJournal(config, journal);
+      stateWrite = await journalWrite((journal) => (journal.delete(rel), journal));
     } else {
       failed.push(`aws s3 ${args[1]} ${rel}: ${failureText(result)}`);
     }
+    if (!stateWrite.ok) break;
   }
-  saveJournal(config, journal);
-  if (journal.size === 0 && config.state && config.state.syncing) {
-    writeSyncMarker(config);
-    config.state.syncing = false;
-    say(config, 'info', 'memory bucket: the first sync of the volume to the bucket is complete');
+  if (stateWrite.ok) {
+    // The first sync's marker is written only when the journal on the disk is
+    // empty, read under the same lock, so one instance cannot mark the sync
+    // complete while another still holds paths.
+    stateWrite = await journalWrite((journal) => {
+      if (journal.size === 0 && config.state && config.state.syncing) {
+        writeSyncMarker(config);
+        config.state.syncing = false;
+        say(config, 'info', 'memory bucket: the first sync of the volume to the bucket is complete');
+      }
+      return journal;
+    });
+  }
+  if (stateWrite.ok) {
+    const finalRead = await journalWrite((journal) => journal);
+    if (finalRead.ok) pending = finalRead.journal.size;
   }
 
   for (const problem of failed) say(config, 'warn', `memory bucket: ${problem}`);
-  const pending = journal.size;
-  if (failed.length === 0 && notTried === 0 && refused.length === 0) {
+  const total = boot.journal.size;
+  if (failed.length === 0 && notTried === 0 && refused.length === 0 && stateWrite.ok) {
     if (calls > 0) say(config, 'info', `memory bucket: mirrored ${calls} change${calls === 1 ? '' : 's'} to s3://${config.bucket}/${config.prefix}`);
     return { ok: true, calls, pending: 0 };
   }
   const parts = [];
+  if (!stateWrite.ok) parts.push('the shared memory state lock was held by another runner instance');
   if (failed.length > 0) parts.push(`${failed.length} of ${calls} aws calls failed (first: ${failed[0]})`);
   if (notTried > 0) {
     parts.push(`${notTried} of ${total} not tried: the mirror stops after ${Math.round(deadlineMs / 1000)} s or at the first call that gets no answer, and they wait for the next request`);
   }
   if (refused.length > 0) parts.push(refusedText());
+  if (parts.length === 0) parts.push('the mirror did not finish cleanly');
   const error = Array.from(parts.join('; ')).slice(0, ERROR_MAX).join('');
-  if (notTried > 0 || failed.length > 0) say(config, 'warn', `memory bucket: ${pending} path${pending === 1 ? ' is' : 's are'} still waiting to be mirrored`);
+  say(config, 'warn', `memory bucket: ${pending} path${pending === 1 ? ' is' : 's are'} still waiting to be mirrored`);
   return { ok: false, calls, pending, error };
 }
 

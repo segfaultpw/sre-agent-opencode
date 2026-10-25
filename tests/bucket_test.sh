@@ -1334,7 +1334,89 @@ check "every file of the shared memory reached the bucket" test -s "$ctl/uploade
 check "the journal emptied behind them" test ! -e "$workspace/.memory-mirror-pending"
 check "one first-sync marker stands for both" test -e "$workspace/.memory-first-sync"
 check "and no lock file outlives the two requests" test -z "$(find "$workspace/locks" -type f -print -quit)"
+# The locks make the journal and marker writes atomic; the uploads themselves
+# are idempotent, so a file may reach the bucket once per instance and never
+# more often than that.
+per_file_puts="$(grep -c "s3${us}cp${us}.*memory/acme/api/NOTES.md" "$ctl/aws_calls.log")"
+check "no file was put more than once per instance" test "$per_file_puts" -le 2
 stop_fixture
+
+echo "--- 26b. the mirror's journal writes run inside the shared state lock, and a lock that cannot be had is answered honestly ---"
+cat > "$work/unit-mirror.js" <<'EOF2'
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+const bucket = require(path.join(process.argv[2], 'runner', 'bucket.js'));
+const workspace = process.argv[3];
+const log = process.argv[4];
+const emit = (value) => console.log(JSON.stringify(value));
+const count = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).length : 0);
+const run = async (command, args) => {
+  const result = spawnSync(command, args, { encoding: 'utf8' });
+  return { code: result.status, stdout: result.stdout || '', stderr: result.stderr || '', timedOut: false };
+};
+const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'memory/', workspace, run, log: () => {}, state: {}, ...extra });
+
+(async () => {
+  fs.mkdirSync(path.join(workspace, 'memory/acme/api'), { recursive: true });
+  fs.mkdirSync(path.join(workspace, 'memory/beta/web'), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'memory/acme/api/NOTES.md'), 'alpha notes\n');
+  fs.writeFileSync(path.join(workspace, 'memory/beta/web/NOTES.md'), 'beta notes\n');
+  fs.rmSync(path.join(workspace, '.memory-first-sync'), { force: true });
+
+  // A real serializing mutex, the promise-chain shape withStateLock gives the
+  // mirror across processes: one load-merge-save at a time.
+  let chain = Promise.resolve();
+  const mutex = (fn) => {
+    const next = chain.then(() => fn());
+    chain = next.catch(() => {});
+    return next;
+  };
+
+  const before = count();
+  const [alpha, beta] = await Promise.all([
+    bucket.mirror(settings({ mutex }), [{ path: 'acme/api/NOTES.md', change: 'modified', bytes: 12 }]),
+    bucket.mirror(settings({ mutex }), [{ path: 'beta/web/NOTES.md', change: 'modified', bytes: 11 }]),
+  ]);
+  emit({ kind: 'combine', alpha, beta, journal: fs.existsSync(path.join(workspace, '.memory-mirror-pending')), calls: count() - before });
+
+  const busyBefore = count();
+  const busy = await bucket.mirror(settings({ mutex: async () => null }), [{ path: 'acme/api/NOTES.md', change: 'modified', bytes: 12 }]);
+  emit({ kind: 'busy', busy, calls: count() - busyBefore, journal: fs.existsSync(path.join(workspace, '.memory-mirror-pending')) });
+
+  // removeStale runs inside a restore: a live foreign pid's half-written state
+  // is theirs to finish, a dead pid's and this process's own are removed.
+  fs.rmSync(path.join(workspace, 'memory'), { recursive: true, force: true });
+  const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+  fs.writeFileSync(path.join(workspace, `.memory-mirror-pending.tmp-${sleeper.pid}`), '{}\n');
+  fs.writeFileSync(path.join(workspace, `.memory-restore-pending.tmp-${sleeper.pid}`), '{}\n');
+  fs.mkdirSync(path.join(workspace, `.memory-restore-987654321`), { recursive: true });
+  fs.writeFileSync(path.join(workspace, `.memory-mirror-pending.tmp-${process.pid}`), '{}\n');
+  fs.writeFileSync(path.join(workspace, '.memory-restore-pending'), '{}\n');
+  const restore = await bucket.restore(settings({ state: {} }));
+  const alive = fs.existsSync(path.join(workspace, `.memory-mirror-pending.tmp-${sleeper.pid}`));
+  const aliveSecond = fs.existsSync(path.join(workspace, `.memory-restore-pending.tmp-${sleeper.pid}`));
+  const dead = fs.existsSync(path.join(workspace, `.memory-restore-987654321`));
+  const own = fs.existsSync(path.join(workspace, `.memory-mirror-pending.tmp-${process.pid}`));
+  sleeper.kill('SIGKILL');
+  emit({ kind: 'stale-cleanup', restore, alive, aliveSecond, dead, own });
+})();
+EOF2
+reset_aws
+fresh_workspace
+mkdir -p "$workspace/memory"
+(cd "$work" && PATH="$work/bin:$PATH" node --max-old-space-size=256 "$work/unit-mirror.js" "$pkg" "$workspace" "$ctl/aws_calls.log") > "$work/unit-mirror.out" 2>&1 || { echo "FAIL the unit mirror driver failed: $(cat "$work/unit-mirror.out")"; fail=1; }
+combine="$(jq -c 'select(.kind == "combine")' "$work/unit-mirror.out")"
+busy="$(jq -c 'select(.kind == "busy")' "$work/unit-mirror.out")"
+stale="$(jq -c 'select(.kind == "stale-cleanup")' "$work/unit-mirror.out")"
+# The fresh load under the lock is the point: the second mirror's boot carries
+# the first's still-pending path as well as its own, so a path may be uploaded
+# more than once (idempotent) and neither save clobbers the other.
+if [ "$(jq -r '.alpha.ok and .beta.ok' <<<"$combine")" = true ] && [ "$(jq -r '.journal' <<<"$combine")" = false ] && [ "$(jq -r '.calls' <<<"$combine")" -ge 2 ]; then echo "ok   two mirrors under one serializing lock upload both paths and leave no journal"; else echo "FAIL combine: $combine"; fail=1; fi
+if [ -s "$ctl/uploaded/acme-sre-memory/memory/acme/api/NOTES.md" ] && [ -s "$ctl/uploaded/acme-sre-memory/memory/beta/web/NOTES.md" ]; then echo "ok   both mirrors' paths reached the bucket"; else echo "FAIL uploads: $(find "$ctl/uploaded" -type f | sort | tr '\n' ' ')"; fail=1; fi
+if jq -e '.busy.ok == false and (.busy.error | test("shared memory state lock"))' <<<"$busy" >/dev/null && [ "$(jq -r '.calls' <<<"$busy")" -eq 0 ]; then echo "ok   a busy state lock stops the mirror with the honest error and makes no aws call"; else echo "FAIL busy: $busy"; fail=1; fi
+if jq -e '.alive and .aliveSecond and (.dead | not) and (.own | not)' <<<"$stale" >/dev/null; then echo "ok   a live neighbour's half-written state is theirs, a dead pid's and this process's own are cleaned"; else echo "FAIL stale cleanup: $stale"; fail=1; fi
 
 echo "--- 11. the entrypoint refuses a bucket it cannot reach, and runs without one ---"
 bash_bin="$(command -v bash)"
