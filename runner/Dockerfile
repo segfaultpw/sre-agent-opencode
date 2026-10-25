@@ -148,10 +148,11 @@ RUN set -eux; \
 # Two unprivileged accounts. The agent has a shell, so what its account can
 # reach is what the agent can reach; it therefore is not the runner's account.
 # The runner's holds the workspace, the memory directory, the git directories
-# and the runner's git and gh state; the agent's holds a home of its own, on the
-# volume (/workspace/agent-home, which the runner creates owned by the agent and
-# closed to everyone else) so that what it installs survives between requests,
-# and is handed one work tree at a time. The ids are fixed rather than allocated, because an
+# and the runner's git and gh state; the agent's holds a home for each repository
+# on the volume (/workspace/agent-home/<owner>/<repo>, which the runner creates,
+# hands to the agent for the length of one run and takes back, and empties of
+# everything opencode would load by itself) so that what it installs survives
+# between requests, and is handed one work tree at a time. The ids are fixed rather than allocated, because an
 # operator who mounts a host directory at /workspace has to be able to chown it
 # to something, and that something must not move between releases (10001 is the
 # account earlier releases ran everything as, so an existing volume keeps
@@ -200,8 +201,11 @@ LABEL org.opencontainers.image.licenses="MIT"
 # the agent's account and to hand it one checkout at a time; the entrypoint
 # resolves the two accounts and runner/runner.js does the switching. It needs
 # CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_KILL
-# and nothing else, which is Docker's default set, and is what a Kubernetes
-# securityContext that drops everything must add back.
+# and nothing else; all six are in Docker's default set (which holds fourteen),
+# and are what a Kubernetes securityContext that drops everything must add back.
+# A start that lacks them, or does not start as root, does not crash: the runner
+# falls back to running the agent as its own account, says so in its log and in
+# every report, and the README says what to change.
 USER root
 WORKDIR /workspace
 ENTRYPOINT ["/opt/sre-agent-opencode/runner/entrypoint.sh"]

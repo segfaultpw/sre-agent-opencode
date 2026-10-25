@@ -156,8 +156,18 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   # round): is it on the workspace, which is the volume the agent writes (its
   # home and checkouts live there); is it under one of the directories every
   # account can write, named here because they are where an agent looks first;
-  # and is any directory above it, or the file itself, writable by every
-  # account, which covers the ones nobody named (a mount with the wrong mode).
+  # and is any directory above it, or the file itself, one the agent's account
+  # can write, which covers the ones nobody named (a mount with the wrong mode).
+  #
+  # "Can write" is a question about the agent's uid and gid, not about the mode
+  # alone: the account owns it, or its group can write it, or anyone can, except
+  # in a sticky directory, where only an entry's owner can replace or remove it.
+  # The mount point of a ConfigMap or projected volume is a world-writable
+  # sticky directory on a read-only volume holding root-owned links and files,
+  # so a script mounted there, the natural way, is out of the agent's reach and
+  # is accepted; the same mode on a directory the agent owns is not. The
+  # agent's supplementary groups are cleared when it is started, so only its
+  # primary group counts.
   setup_given="$(realpath -m -s -- "$setup")"
   setup_real="$(realpath -e -- "$setup")"
   open_dirs=(/tmp /var/tmp /dev/shm /run/lock /var/lock)
@@ -184,9 +194,20 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   for start in "${setup_given%/*}" "$setup_real"; do
     current="${start:-/}"
     while :; do
-      mode="$(stat -L -c '%a' -- "$current" 2>/dev/null || echo 0)"
-      if (( (8#${mode}) & 8#002 )); then
-        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, and ${current} on the way to it is writable by every account; the agent can replace what is there and the script runs as root, so put it in a place only root writes, in the image" >&2
+      read -r mode owner group < <(stat -L -c '%a %u %g' -- "$current" 2>/dev/null || echo "0 0 0")
+      bits=$((8#${mode}))
+      sticky_dir=0
+      if [ -d "$current" ] && (( bits & 8#1000 )); then sticky_dir=1; fi
+      reason=""
+      if [ "$owner" = "$SRE_AGENT_UID" ]; then
+        reason="owned by the agent account"
+      elif (( bits & 8#002 )) && [ "$sticky_dir" = 0 ]; then
+        reason="writable by every account"
+      elif (( bits & 8#020 )) && [ "$group" = "$SRE_AGENT_GID" ] && [ "$sticky_dir" = 0 ]; then
+        reason="writable by the agent's group"
+      fi
+      if [ -n "$reason" ]; then
+        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, and ${current} on the way to it is ${reason}; the agent can replace what is there and the script runs as root, so put it in a place only root writes, in the image" >&2
         exit 1
       fi
       if [ "$current" = "/" ]; then break; fi

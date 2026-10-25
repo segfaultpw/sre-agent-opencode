@@ -137,7 +137,23 @@ cat > "$work/bin/setpriv" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-chmod +x "$work/bin/id" "$work/bin/getent" "$work/bin/setpriv"
+# A test cannot chown to uid 10002 without privilege, so the one lookup the
+# entrypoint makes of a file's owner and group is answered from the name: a path
+# with agent-owned in it belongs to the agent's uid, one with agent-group in it
+# to the agent's group. Every other path, and every other call, is the real stat.
+cat > "$work/bin/stat" <<'STATEOF'
+#!/usr/bin/env bash
+real=/usr/bin/stat
+if [ "$#" -eq 5 ] && [ "$1" = -L ] && [ "$2" = -c ] && [ "$3" = '%a %u %g' ] && [ "$4" = -- ]; then
+  read -r mode uid gid < <("$real" -L -c '%a %u %g' -- "$5") || exit 1
+  case "$5" in *agent-owned*) uid=10002 ;; esac
+  case "$5" in *agent-group*) gid=10002 ;; esac
+  echo "$mode $uid $gid"
+else
+  exec "$real" "$@"
+fi
+STATEOF
+chmod +x "$work/bin/id" "$work/bin/getent" "$work/bin/setpriv" "$work/bin/stat"
 
 # Stands in for every command the entrypoint checks for. node also records the
 # argv it was execed with, which is how a case proves the runner was started
@@ -373,6 +389,56 @@ done
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/ok.sh"
 if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a script in a directory of its own, outside those, still runs"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 
+echo "--- a setup script is refused when the agent's account can replace it, and only then ---"
+# What the entrypoint asks is whether the agent can write the file or a directory
+# above it: it owns it, its group can write it, or anyone can, except in a
+# sticky directory, where only an entry's owner can replace it. The mount point
+# of a ConfigMap is a world-writable sticky directory on a read-only volume,
+# holding root-owned links (..data -> a timestamped directory) to root-owned
+# files; mounting the script there is the natural way to supply one.
+cm="$setup_dir/configmap"
+mkdir -p "$cm/..2026_10_25_00_00_00.1234"
+cp "$setup_dir/ok.sh" "$cm/..2026_10_25_00_00_00.1234/setup.sh"
+chmod 0755 "$cm/..2026_10_25_00_00_00.1234" "$cm/..2026_10_25_00_00_00.1234/setup.sh"
+ln -s ..2026_10_25_00_00_00.1234 "$cm/..data"
+ln -s ..data/setup.sh "$cm/setup.sh"
+chmod 1777 "$cm"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$cm/setup.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a script mounted from a ConfigMap (a sticky world-writable mount point, ..data links, root-owned files) runs"; else echo "FAIL a ConfigMap layout was refused: rc=$rc out=$out"; fail=1; fi
+sticky="$setup_dir/sticky-open"
+mkdir -p "$sticky"
+cp "$setup_dir/ok.sh" "$sticky/setup.sh"
+chmod 0755 "$sticky/setup.sh"
+chmod 1777 "$sticky"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$sticky/setup.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a root-owned script in a sticky world-writable directory runs: the agent can add files there and cannot replace this one"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+agent_owned="$setup_dir/agent-owned"
+mkdir -p "$agent_owned"
+cp "$setup_dir/ok.sh" "$agent_owned/setup.sh"
+chmod 0755 "$agent_owned" "$agent_owned/setup.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$agent_owned/setup.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'owned by the agent account' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a script in a directory the agent account owns is refused, though no mode bit says so"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+chmod 1777 "$agent_owned"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$agent_owned/setup.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'owned by the agent account' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   being sticky does not excuse a directory the agent owns"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+agent_group="$setup_dir/agent-group"
+mkdir -p "$agent_group"
+cp "$setup_dir/ok.sh" "$agent_group/setup.sh"
+chmod 0755 "$agent_group/setup.sh"
+chmod 0775 "$agent_group"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$agent_group/setup.sh"
+if [ "$rc" -ne 0 ] && grep -qF "writable by the agent's group" <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a directory the agent's group can write is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+chmod 0755 "$agent_group"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$agent_group/setup.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   the same directory without group write runs"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+group_dir="$setup_dir/other-group-writable"
+mkdir -p "$group_dir"
+cp "$setup_dir/ok.sh" "$group_dir/setup.sh"
+chmod 0755 "$group_dir/setup.sh"
+chmod 0775 "$group_dir"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$group_dir/setup.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   write by some other group is no write by the agent, whose supplementary groups are cleared"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+
 echo "--- the workflows build the image on both architectures ---"
 # Every runs-on in this repository's own workflows reads the organization's
 # runner switch, so a month's Actions minutes running out moves the job to
@@ -393,6 +459,26 @@ check "$ci" 'platform: linux/arm64' 'CI builds arm64'
 check "$ci" 'vars.RUNNER_ARM64' 'the arm64 leg runs on a native arm64 runner'
 check "$ci" 'push: false' 'CI builds the image without publishing it'
 check "$ci" 'bash tests/image_test.sh' 'CI runs this test'
+
+echo "--- CI checks the image as the account the agent runs as, and that it starts as root ---"
+# The image starts as root (the Dockerfile's USER, pinned above), so a docker run
+# with no --user is root: "not root" and "cannot write the fences" are both false
+# there whatever the file modes say. The checks that mean something about the
+# agent run as the agent, and the default is asserted separately.
+step="$(awk '/- name: The image carries what the runner shells out to/ { found = 1; print; next } found && /^      - name:/ { exit } found { print }' "$ci")"
+if grep -qF -- 'docker run --rm --user agent -e HOME=/tmp --entrypoint bash' <<<"$step"; then echo "ok   the in-container checks run with --user agent, with a HOME that account can write (its own is made by the runner at start)"; else echo "FAIL the in-container checks do not run as the agent account"; fail=1; fi
+# shellcheck disable=SC2016 # the text searched for is the literal command in ci.yml
+if grep -qF 'test "$(id -u)" -eq 10002' <<<"$step" && ! grep -qF -- '-ne 0' <<<"$step"; then echo "ok   they assert the uid is the agent's, not merely that it is not root"; else echo "FAIL the uid assertion is not the agent's: $(grep -n 'id -u' <<<"$step")"; fail=1; fi
+if grep -qF '! test -w /opt/sre-agent-opencode/config/opencode.json' <<<"$step"; then echo "ok   they assert the fences are not writable by that account"; else echo "FAIL the writability assertion is gone"; fail=1; fi
+if grep -qF "docker inspect -f '{{.Config.User}}' \"\$IMAGE\"" <<<"$step" && grep -qE '!= *"?root"?' <<<"$step"; then echo "ok   they assert the image's default user is root, which is what the Dockerfile pins and the runner needs"; else echo "FAIL the image's default user is not asserted"; fail=1; fi
+
+start_step="$(awk '/- name: The image starts the runner and reaches its first poll/ { found = 1; print; next } found && /^      - name:/ { exit } found && /^  [a-z]/ { exit } found { print }' "$ci")"
+if grep -qF 'docker run -d' <<<"$start_step" && grep -qF 'polling http://127.0.0.1:9' <<<"$start_step"; then echo "ok   CI starts the image and waits for its first poll, at a refused local port"; else echo "FAIL CI never starts the image past its configuration check"; fail=1; fi
+if grep -qF -- '--user 10001:10001 --cap-drop ALL' <<<"$start_step" && grep -qF 'the agent account split is off' <<<"$start_step"; then echo "ok   it also starts it as a pod that drops every capability does, and expects the fallback sentence instead of a crash"; else echo "FAIL the no-capability start is not in CI"; fail=1; fi
+
+echo "--- every runs-on fallback is the Blacksmith label the file's header says it is ---"
+fallbacks="$(grep -hoE "vars\.RUNNER_[A-Z0-9]+ \|\| '[^']+'" "$ci" "$release" | sed -e "s/.*|| '//" -e "s/'\$//" | sort -u)"
+if [ -n "$fallbacks" ] && ! grep -qv '^blacksmith-' <<<"$fallbacks"; then echo "ok   every fallback is a Blacksmith label ($(tr '\n' ' ' <<<"$fallbacks"))"; else echo "FAIL a fallback is not a Blacksmith label: $(grep -v '^blacksmith-' <<<"$fallbacks" | tr '\n' ' ')"; fail=1; fi
 
 check "$release" "$image" 'the release publishes the runner image'
 check "$release" 'push: true' 'the release publishes rather than only building'
