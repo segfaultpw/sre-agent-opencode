@@ -51,9 +51,36 @@ jobs:
       # fixture platform.
       - run: node --check runner/runner.js
       - run: node --check runner/conventional_title.js
+      - run: node --check runner/memory.js
+      - run: node --check runner/bucket.js
+      - run: node tests/memory_test.js
+      - run: node tests/bundle_test.js
+      - run: node tests/agent_home_test.js
       - run: bash tests/runner_test.sh
+      - run: bash tests/bucket_test.sh
+      - run: bash tests/secret_trim_test.sh
+      - run: bash tests/uid_split_ci_test.sh
       - run: bash tests/image_test.sh
       - run: bash tests/install_runner_test.sh
+
+  # Root is needed to switch uids, so this one runs where passwordless sudo
+  # exists. The test itself fails, rather than skips, when it runs in CI and
+  # cannot switch uids, and the two success lines are asserted here as well so a
+  # run that printed nothing cannot pass.
+  uid-split:
+    name: the agent runs as its own account
+    runs-on: ${{ vars.RUNNER_X64 || 'blacksmith-4vcpu-ubuntu-2404' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: This runner has passwordless sudo
+        run: sudo -n true
+      - name: Prove the split with real uids
+        run: |
+          set -o pipefail
+          bash tests/uid_split_test.sh | tee "$RUNNER_TEMP/uid_split.out"
+          grep -qxF 'ok   root: the request ends in a pull request' "$RUNNER_TEMP/uid_split.out"
+          grep -qxF 'ok   caps: the request ends in a pull request' "$RUNNER_TEMP/uid_split.out"
+          if grep -q '^FAIL\|^SKIP' "$RUNNER_TEMP/uid_split.out"; then exit 1; fi
 
   dry-run:
     name: opencode loads the config and the agent
@@ -109,7 +136,19 @@ jobs:
           IMAGE: sre-agent-opencode-runner:ci
         run: |
           set -euo pipefail
-          docker run --rm --entrypoint bash "$IMAGE" -c '
+          # The image starts as root: the runner needs it to start every agent
+          # run as the agent's account (runner/Dockerfile, USER root). So the
+          # default is asserted as exactly that, and the checks about what the
+          # agent can do run as the agent; as root, "not root" and "cannot write
+          # the fences" are both false whatever the file modes say.
+          user="$(docker inspect -f '{{.Config.User}}' "$IMAGE")"
+          if [ "$user" != "root" ]; then
+            echo "::error::the image's default user is '${user}', and the runner needs root to start the agent as its own account"
+            exit 1
+          fi
+          # HOME is a directory the agent can write: its own home, /workspace/agent-home,
+          # is made by the runner when it starts, and opencode wants to write under HOME.
+          docker run --rm --user agent -e HOME=/tmp --entrypoint bash "$IMAGE" -c '
             set -eux
             node --version
             git --version
@@ -117,9 +156,11 @@ jobs:
             opencode --version
             kubectl version --client
             aws --version
-            test "$(id -u)" -ne 0
+            test "$(id -u)" -eq 10002
             node --check /opt/sre-agent-opencode/runner/runner.js
             node --check /opt/sre-agent-opencode/runner/conventional_title.js
+            node --check /opt/sre-agent-opencode/runner/memory.js
+            node --check /opt/sre-agent-opencode/runner/bucket.js
             # Every file the runner reads out of the package at run time. A
             # build context rule that excluded one of these would produce an
             # image that builds and then fails its first job.
@@ -161,6 +202,49 @@ jobs:
               exit 1
             fi
           done
+
+      # A start, not a refusal: the image has to reach its first poll. The poll
+      # goes to a refused local port, so nothing leaves the job and no secret is
+      # involved. Three starts: Docker's defaults (root with the six capabilities
+      # the account split takes); the way the earlier Kubernetes manifest starts
+      # it, as the runner's own uid with every capability dropped, which has to
+      # fall back to one account with a sentence and still poll, never crash on a
+      # chown; and root with every capability dropped, which has to refuse.
+      - name: The image starts the runner and reaches its first poll
+        env:
+          IMAGE: sre-agent-opencode-runner:ci
+        run: |
+          set -euo pipefail
+          start() {
+            local label="$1"
+            shift
+            local id
+            id="$(docker run -d "$@" -e SRE_SERVER_URL=http://127.0.0.1:9 -e SRE_API_KEY=not-a-real-key -e SRE_MODEL=openrouter/deepseek/deepseek-v4-pro "$IMAGE")"
+            for _ in $(seq 1 80); do
+              if docker logs "$id" 2>&1 | grep -q 'polling http://127.0.0.1:9'; then break; fi
+              sleep 0.25
+            done
+            docker logs "$id" > "$RUNNER_TEMP/${label}.log" 2>&1 || true
+            docker rm -f "$id" > /dev/null
+            cat "$RUNNER_TEMP/${label}.log"
+          }
+          start default
+          grep -q 'polling http://127.0.0.1:9, running as root, starting the agent as uid 10002 and git as uid 10001' "$RUNNER_TEMP/default.log" || { echo "::error::the default start did not reach its first poll with the account split"; exit 1; }
+          start nocaps --user 10001:10001 --cap-drop ALL
+          grep -q 'polling http://127.0.0.1:9' "$RUNNER_TEMP/nocaps.log" || { echo "::error::a start without capabilities did not reach its first poll"; exit 1; }
+          grep -q 'the agent account split is off' "$RUNNER_TEMP/nocaps.log" || { echo "::error::a start without capabilities did not say that the split is off"; exit 1; }
+          if grep -qi 'EPERM\|operation not permitted' "$RUNNER_TEMP/nocaps.log"; then echo "::error::a start without capabilities failed on a chown or a chmod"; exit 1; fi
+          # Root without the capabilities is the one start that must NOT fall back:
+          # one account there is root. It refuses, naming what is missing. The
+          # workspace is a world-writable tmpfs so that the entrypoint's own
+          # writability check (root has no DAC_OVERRIDE here) does not answer first.
+          if out="$(docker run --rm --tmpfs /workspace:rw,mode=0777 --cap-drop ALL -e SRE_SERVER_URL=http://127.0.0.1:9 -e SRE_API_KEY=not-a-real-key -e SRE_MODEL=openrouter/deepseek/deepseek-v4-pro "$IMAGE" 2>&1)"; then
+            echo "::error::root without capabilities started"
+            exit 1
+          fi
+          echo "$out"
+          grep -q 'the agent would run as root, so the runner will not start' <<<"$out" || { echo "::error::root without capabilities was refused for another reason"; exit 1; }
+          if grep -q 'polling' <<<"$out"; then echo "::error::root without capabilities reached a poll"; exit 1; fi
 
   # The reusable workflow called the way a customer calls it, stopped after
   # the install and the secret mapping: proof on GitHub itself that a called

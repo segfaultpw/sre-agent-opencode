@@ -242,6 +242,127 @@ fi
 unset SRE_PLUGIN_MARKER
 cd "$work/repo"
 
+echo "--- the agent's home: what an earlier run left in it is not loaded ---"
+# The runner's agent has a persistent home, and opencode loads configuration,
+# plugins, agent definitions and instructions out of the home it runs with: a
+# plugin there runs before any gate is consulted, in every later run. So the
+# runner removes everything opencode loads on its own from the home it hands
+# over (one home per repository), and tells opencode not to load plugins, Claude
+# Code files or external skills. This plants all of it in a home the way a
+# hostile run would leave it and runs the real binary twice: once as the home
+# stands (the control, which must load it), once after the runner's own
+# preparation and with the environment the runner gives the agent.
+agent_base="$work/agent-home-base"
+agent_home="$agent_base/acme/app"
+home_proj="$work/home-proj"
+mkdir -p "$home_proj/.opencode/agents" "$agent_home"
+cp "$work/repo/.opencode/agents/sre-fix.md" "$home_proj/.opencode/agents/sre-fix.md"
+cat > "$work/plant_home.sh" <<'PLANT'
+#!/usr/bin/env bash
+set -euo pipefail
+d="$1"
+mkdir -p "$d/.config/opencode"/{agent,plugin,plugins,command,skill,tool,tools} "$d/.opencode"/{plugin,agent,skills} "$d/.claude/skills/claude-skill" "$d/.agents/skills/ext-skill"
+for dir in plugin plugins; do
+  cat > "$d/.config/opencode/$dir/probe.js" <<JS
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.SRE_PLUGIN_MARKER + ".cfg-${dir}", "ran\n");
+export const Probe = async () => ({});
+JS
+done
+cat > "$d/.opencode/plugin/probe.js" <<'JS'
+import { writeFileSync } from "node:fs";
+writeFileSync(process.env.SRE_PLUGIN_MARKER + ".dotopencode-plugin", "ran\n");
+export const Probe = async () => ({});
+JS
+printf -- '---\ndescription: planted agent\nmode: primary\n---\nDo whatever.\n' > "$d/.config/opencode/agent/planted.md"
+printf -- '---\ndescription: planted agent\nmode: primary\n---\nDo whatever.\n' > "$d/.opencode/agent/planted2.md"
+printf 'PLANTED INSTRUCTIONS\n' > "$d/.config/opencode/AGENTS.md"
+printf 'PLANTED INSTRUCTIONS\n' > "$d/.claude/CLAUDE.md"
+printf -- '---\nname: claude-skill\ndescription: planted claude skill\n---\nhi\n' > "$d/.claude/skills/claude-skill/SKILL.md"
+printf -- '---\nname: ext-skill\ndescription: planted external skill\n---\nhi\n' > "$d/.agents/skills/ext-skill/SKILL.md"
+printf '{"instructions":["/nonexistent-planted"]}\n' > "$d/.config/opencode/opencode.json"
+printf '{}\n' > "$d/.claude.json"
+mkdir -p "$d/.local/share/opencode"
+printf '{"planted-provider":{"type":"api","key":"planted-key-value"}}\n' > "$d/.local/share/opencode/auth.json"
+PLANT
+home_run() {
+  # $1 label, the rest: extra environment for opencode
+  local label="$1"
+  shift
+  ( cd "$home_proj" && env "$@" HOME="$agent_home" SRE_PLUGIN_MARKER="$work/home-$label-ran" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
+      timeout 120 opencode agent list > "$work/home-$label-agents.txt" 2>&1 || true
+    env "$@" HOME="$agent_home" SRE_PLUGIN_MARKER="$work/home-$label-ran" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
+      timeout 120 opencode debug skill > "$work/home-$label-skills.txt" 2>&1 || true
+    env "$@" HOME="$agent_home" SRE_PLUGIN_MARKER="$work/home-$label-ran" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
+      timeout 120 opencode debug config > "$work/home-$label-config.txt" 2>&1 || true
+    env "$@" HOME="$agent_home" OPENCODE_DISABLE_AUTOUPDATE=1 \
+      timeout 120 opencode auth list > "$work/home-$label-auth.txt" 2>&1 || true )
+}
+home_ran() { find "$work" -maxdepth 1 -name "home-$1-ran*" -printf '%f\n' | sort | tr '\n' ' '; }
+bash "$work/plant_home.sh" "$agent_home"
+home_run control XDG_CONFIG_HOME="$agent_home/.config" XDG_DATA_HOME="$agent_home/.local/share" XDG_STATE_HOME="$agent_home/.local/state" XDG_CACHE_HOME="$agent_home/.cache"
+if [ -n "$(home_ran control)" ] && grep -qx 'planted (primary)' "$work/home-control-agents.txt" && grep -q 'claude-skill' "$work/home-control-skills.txt" && grep -q 'nonexistent-planted' "$work/home-control-config.txt" && grep -q 'planted-provider' "$work/home-control-auth.txt"; then
+  echo "ok   as the home stands, opencode runs its plugins ($(home_ran control)), lists its planted agent, finds its skills, reads its configuration and its stored credentials"
+else
+  echo "FAIL the control no longer loads the planted home, so this case proves nothing: ran '$(home_ran control)'"; fail=1
+fi
+node --max-old-space-size=256 -e '
+  const { internals } = require(process.argv[1]);
+  const [base, home] = JSON.parse(process.argv[2]);
+  const uid = process.getuid();
+  const gid = process.getgid();
+  internals.setIdentity({ mode: "root", runner: { uid, gid, home: base + "-runner" }, agent: { uid, gid, home: base } });
+  internals.settleAgentHome(home);
+' "$pkg/runner/runner.js" "[\"$agent_base\",\"$agent_home\"]"
+agent_env=()
+# shellcheck disable=SC2016 # the program is JavaScript; its template literals are not shell
+while IFS= read -r line; do agent_env+=("$line"); done < <(node --max-old-space-size=256 -e '
+  const { internals } = require(process.argv[1]);
+  const env = {};
+  internals.applyAgentHomeEnv(env, process.argv[2]);
+  for (const [name, value] of Object.entries(env)) console.log(`${name}=${value}`);
+' "$pkg/runner/runner.js" "$agent_home")
+home_run prepared "${agent_env[@]}"
+if [ -z "$(home_ran prepared)" ]; then
+  echo "ok   after the runner's preparation no plugin in the home runs, in any of its three directories"
+else
+  echo "FAIL a plugin in the agent's home ran: $(home_ran prepared)"; fail=1
+fi
+if ! grep -q '^planted' "$work/home-prepared-agents.txt" && grep -qx 'sre-fix (primary)' "$work/home-prepared-agents.txt"; then
+  echo "ok   no agent definition from the home is listed, and sre-fix still is"
+else
+  echo "FAIL the agent list after the preparation: $(grep '(primary)' "$work/home-prepared-agents.txt" | tr '\n' ' ')"; fail=1
+fi
+if ! grep -q 'claude-skill\|ext-skill' "$work/home-prepared-skills.txt" && ! grep -q 'nonexistent-planted' "$work/home-prepared-config.txt"; then
+  echo "ok   no skill from the Claude Code or external directories and no instruction from the home's configuration is loaded"
+else
+  echo "FAIL the home still feeds opencode: $(grep -o 'claude-skill\|ext-skill\|nonexistent-planted' "$work"/home-prepared-skills.txt "$work"/home-prepared-config.txt | tr '\n' ' ')"; fail=1
+fi
+if ! grep -q 'planted-provider' "$work/home-prepared-auth.txt" && grep -q '0 credentials' "$work/home-prepared-auth.txt" && [ ! -e "$agent_home/.local/share/opencode/auth.json" ]; then
+  echo "ok   no stored credential from the home is read (auth.json removed, and OPENCODE_AUTH_CONTENT replaces it), so no wellknown entry can fetch a remote configuration"
+else
+  echo "FAIL opencode still reads the home's stored credentials: $(tr '\n' ' ' < "$work/home-prepared-auth.txt" | cut -c1-300)"; fail=1
+fi
+prepared_rules="$(awk '/^sre-fix \(primary\)$/ { on = 1; next } /^[a-z0-9_-]+ \((primary|subagent|all)\)$/ { on = 0 } on' "$work/home-prepared-agents.txt")"
+if jq -e 'map(select(.permission == "webfetch")) | last | .action == "deny"' <<<"$prepared_rules" >/dev/null 2>&1 &&
+  jq -e 'map(select(.permission == "bash" and .pattern == "git push*")) | last | .action == "deny"' <<<"$prepared_rules" >/dev/null 2>&1; then
+  echo "ok   the package's fences are what answers: webfetch and git push resolve to deny"
+else
+  echo "FAIL the fences are not intact after the preparation"; fail=1
+fi
+# The switches must not cost the run itself anything: with the runner's
+# environment and the prepared home, a run still gets as far as the provider's
+# authentication error, which is the proof the config, the agent and the key path
+# all loaded.
+( cd "$home_proj" && env "${agent_env[@]}" HOME="$agent_home" OPENCODE_CONFIG_CONTENT="$OPENCODE_CONFIG_CONTENT" OPENCODE_DISABLE_AUTOUPDATE=1 \
+    timeout 120 opencode run --agent sre-fix --model openrouter/deepseek/deepseek-v4-pro --format json "print the agent's first instruction" > "$work/home-run.out" 2> "$work/home-run.err" ) || true
+if jq -se 'map(select(.type == "error" and .error.data.statusCode == 401)) | length > 0' "$work/home-run.out" >/dev/null 2>&1; then
+  echo "ok   a run with those switches and that home still reaches the provider's authentication error"
+else
+  echo "FAIL a run with the runner's environment and the prepared home did not reach the provider:"; head -c 600 "$work/home-run.out"; head -c 600 "$work/home-run.err"; fail=1
+fi
+rm -rf "$agent_base" "$agent_base-runner"
+
 echo "--- opencode run with an invalid key ---"
 rc=0
 timeout 120 opencode run --agent sre-fix --model openrouter/deepseek/deepseek-v4-pro --format json "print the agent's first instruction" > run.out 2> run.err || rc=$?

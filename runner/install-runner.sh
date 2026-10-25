@@ -18,6 +18,8 @@ SERVICE=sre-agent-fix-runner
 PACKAGE_DIR=/opt/sre-agent-opencode
 STATE_DIR=/var/lib/sre-agent-fix-runner
 WORKSPACE_DIR=/var/lib/sre-agent-fix-runner/workspace
+AGENT_ACCOUNT=sre-agent-fix-agent
+AGENT_HOME="${STATE_DIR}/agent-home"
 ENV_DIR=/etc/sre-agent-fix-runner
 ENV_FILE=/etc/sre-agent-fix-runner/env
 UNIT_FILE=/etc/systemd/system/sre-agent-fix-runner.service
@@ -79,7 +81,7 @@ fi
 # The files the runner reads at run time. A clone that is missing one of them
 # would install a runner that starts and fails its first job.
 for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
-  runner/runner.js runner/conventional_title.js runner/entrypoint.sh runner/sre-agent-fix-runner.service; do
+  runner/runner.js runner/conventional_title.js runner/memory.js runner/bucket.js runner/entrypoint.sh runner/sre-agent-fix-runner.service; do
   if [ ! -f "${source_root}/${relative}" ]; then
     lack "${source_root} has no ${relative}, so this is not a complete clone of the package" \
       "git clone https://github.com/segfaultpw/sre-agent-opencode && cd sre-agent-opencode"
@@ -118,6 +120,11 @@ for tool in node git gh opencode; do
   fi
 done
 
+if ! command -v setpriv >/dev/null 2>&1; then
+  lack "setpriv is not on PATH, and it is how the runner starts the agent as its own account" \
+    "install util-linux from your distribution"
+fi
+
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "refusing to install: nothing has been written" >&2
   for line in "${missing[@]}"; do printf '  %-8s %s\n' missing "$line" >&2; done
@@ -137,6 +144,21 @@ if ! getent passwd "$SERVICE" >/dev/null 2>&1; then
   echo "created the ${SERVICE} account"
 fi
 
+# The agent's own account. The agent has a shell, so what its account can reach
+# is what the agent can reach, and it is not the runner's: it holds no
+# capability, cannot read the runner's environment or the memory directory, and
+# is handed one checkout and one repository's home at a time. Its homes are
+# inside the one path the unit makes writable.
+if ! getent group "$AGENT_ACCOUNT" >/dev/null 2>&1; then
+  groupadd --system "$AGENT_ACCOUNT"
+  echo "created the ${AGENT_ACCOUNT} group"
+fi
+if ! getent passwd "$AGENT_ACCOUNT" >/dev/null 2>&1; then
+  useradd --system --gid "$AGENT_ACCOUNT" --home-dir "$AGENT_HOME" --no-create-home \
+    --shell /usr/sbin/nologin --comment "SRE Agent fix runner, the agent's own account" "$AGENT_ACCOUNT"
+  echo "created the ${AGENT_ACCOUNT} account"
+fi
+
 package_path="$(at "$PACKAGE_DIR")"
 state_path="$(at "$STATE_DIR")"
 workspace_path="$(at "$WORKSPACE_DIR")"
@@ -144,10 +166,20 @@ env_path="$(at "$ENV_FILE")"
 unit_path="$(at "$UNIT_FILE")"
 
 install -d -m 0755 "$package_path"
-install -d -m 0750 "$state_path"
-install -d -m 0750 "$workspace_path"
+# 0711 on all three: the agent's account walks through them to the home it is
+# handed for a run and to the checkout it is handed, and cannot list them. What
+# the runner keeps for itself (the memory directory, the clones of other
+# repositories) is 0700 inside. The agent-home directory is the runner's too: it
+# holds one home per repository, each the agent's only for the length of that
+# repository's run (the runner hands it over and takes it back), so no run can
+# enter the home of a repository that is not under way. The runner re-asserts
+# every one of these modes at start.
+agent_home_path="$(at "$AGENT_HOME")"
+install -d -m 0711 "$state_path"
+install -d -m 0711 "$workspace_path"
+install -d -m 0711 "$agent_home_path"
 install -d -m 0750 "$(at "$ENV_DIR")"
-chown "${SERVICE}:${SERVICE}" "$state_path" "$workspace_path"
+chown "${SERVICE}:${SERVICE}" "$state_path" "$workspace_path" "$agent_home_path"
 
 # The package is root-owned and not writable by the account the agent runs
 # under, so a run cannot edit the fences the next run will load.
@@ -173,7 +205,7 @@ chmod 0755 "${staging}/runner/entrypoint.sh"
 # What the runner opens on its first job, checked in the staged tree while the
 # old one is still in place.
 for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
-  scripts/strip_repo_config.sh runner/runner.js runner/conventional_title.js runner/entrypoint.sh; do
+  scripts/strip_repo_config.sh scripts/init_agent_repo.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/bucket.js runner/entrypoint.sh; do
   if [ ! -f "${staging}/${relative}" ]; then
     echo "the staged package is missing ${relative}; nothing was replaced" >&2
     exit 1

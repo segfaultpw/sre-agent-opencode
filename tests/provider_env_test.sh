@@ -42,6 +42,20 @@ expect nvidia/moonshotai/kimi-k2-instruct NVIDIA_API_KEY
 expect opencode/kimi-k2 OPENCODE_API_KEY
 expect vercel/anthropic/claude-sonnet-4-5 AI_GATEWAY_API_KEY
 
+# The runner trims every one of these it finds in its environment (see
+# tests/secret_trim_test.sh), so --all must list exactly the variables the
+# per-model lookups above answer with.
+want_all="$(printf '%s\n' ANTHROPIC_API_KEY OPENAI_API_KEY GOOGLE_GENERATIVE_AI_API_KEY OPENROUTER_API_KEY XAI_API_KEY GROQ_API_KEY MISTRAL_API_KEY DEEPSEEK_API_KEY TOGETHER_API_KEY FIREWORKS_API_KEY CEREBRAS_API_KEY MOONSHOT_API_KEY DEEPINFRA_API_KEY HF_TOKEN ZHIPU_API_KEY MINIMAX_API_KEY NVIDIA_API_KEY OPENCODE_API_KEY AI_GATEWAY_API_KEY | LC_ALL=C sort)"
+got_all="$(bash "$script" --all 2>&1 | LC_ALL=C sort)" || true
+if [ "$got_all" = "$want_all" ]; then echo "ok   --all lists every provider variable once"; else echo "FAIL --all: expected $want_all, got $got_all"; fail=1; fi
+
+# The list the runner trims is a copy in runner/runner.js, because the runner
+# does not shell out for it; the two must not drift.
+if command -v node >/dev/null 2>&1; then
+  runner_list="$(node -e 'console.log(require(process.argv[1]).PROVIDER_KEY_VARIABLES.join("\n"))' "$here/../runner/runner.js" | LC_ALL=C sort)"
+  if [ "$runner_list" = "$want_all" ]; then echo "ok   the runner trims exactly the variables --all lists"; else echo "FAIL the runner's list differs from --all: $runner_list"; fail=1; fi
+fi
+
 refuse amazon-bedrock/anthropic.claude-sonnet-4-5
 refuse azure/gpt-5
 refuse ollama/llama3

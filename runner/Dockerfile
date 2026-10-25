@@ -31,6 +31,7 @@ ARG OPENCODE_VERSION=1.18.29
 ARG KUBECTL_VERSION=v1.37.0
 ARG GH_VERSION=2.100.0
 ARG AWSCLI_VERSION=2.36.40
+ARG MISE_VERSION=2026.10.12
 
 # git and gh are what the runner publishes with, bash is what every script in
 # this package is written in, jq is what those scripts parse with, and less is
@@ -50,12 +51,19 @@ ARG AWSCLI_VERSION=2.36.40
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
+        build-essential \
         ca-certificates \
         curl \
         git \
         jq \
         less \
+        make \
+        python3 \
+        python3-pip \
+        python3-venv \
         unzip \
+        util-linux \
+        xz-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -111,6 +119,21 @@ RUN set -eux; \
     rm -rf /tmp/aws /tmp/awscli.zip; \
     aws --version
 
+# mise, so that the agent can install language runtimes as itself, without root,
+# into its own home (MISE_DATA_DIR is set under it). Checked against a digest
+# like the other clients; a bump belongs in the CHANGELOG.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) arch=x64; sha=72404716768b5b044cbd5170136d3d795cbd592658b6e932b66f0f8d67a54875 ;; \
+      arm64) arch=arm64; sha=31bbf697b289fde4b5623b223af288edd9ef86298ce9ecff705ac867f6f27e09 ;; \
+      *) echo "no mise build for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/mise "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${arch}"; \
+    echo "${sha}  /tmp/mise" | sha256sum -c -; \
+    install -m 0755 /tmp/mise /usr/local/bin/mise; \
+    rm -f /tmp/mise; \
+    mise --version
+
 RUN set -eux; \
     dir="gh_${GH_VERSION}_linux_${TARGETARCH}"; \
     base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"; \
@@ -122,14 +145,27 @@ RUN set -eux; \
     rm -rf "/tmp/${dir}.tar.gz" /tmp/gh_checksums.txt "/tmp/${dir}"; \
     gh --version
 
-# One unprivileged account for the runner and, through it, for the agent it
-# starts. The agent has a shell, so what the account can reach is what the
-# agent can reach. The id is fixed rather than allocated, because an operator
-# who mounts a host directory at /workspace has to be able to chown it to
-# something, and that something must not move between releases.
+# Two unprivileged accounts. The agent has a shell, so what its account can
+# reach is what the agent can reach; it therefore is not the runner's account.
+# The runner's holds the workspace, the memory directory, the git directories
+# and the runner's git and gh state; the agent's holds a home for each repository
+# on the volume (/workspace/agent-home/<owner>/<repo>, which the runner creates,
+# hands to the agent for the length of one run and takes back, and empties of
+# everything opencode would load by itself) so that what it installs survives
+# between requests, and is handed one work tree at a time. The ids are fixed rather than allocated, because an
+# operator who mounts a host directory at /workspace has to be able to chown it
+# to something, and that something must not move between releases (10001 is the
+# account earlier releases ran everything as, so an existing volume keeps
+# working).
 RUN groupadd --gid 10001 runner \
     && useradd --uid 10001 --gid runner \
-       --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner
+       --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner \
+    && groupadd --gid 10002 agent \
+    && useradd --uid 10002 --gid agent \
+       --home-dir /workspace/agent-home --no-create-home --shell /usr/sbin/nologin agent \
+    && chmod 0700 /home/runner
+ENV SRE_RUNNER_USER=runner
+ENV SRE_AGENT_USER=agent
 
 # The package stays owned by root and is not writable by the account the agent
 # runs under, so a run cannot edit the fences that the next run will load.
@@ -145,7 +181,8 @@ RUN chown -R root:root /opt/sre-agent-opencode \
 # The checkouts and the agent's own state. Mount a volume here to keep clones
 # between restarts; nothing in it is needed to recover a job, since a job that
 # was collected and lost is failed by the platform's sweep.
-RUN mkdir -p /workspace && chown runner:runner /workspace
+# 0711: the agent walks through it to reach its checkout and cannot list it.
+RUN mkdir -p /workspace && chown runner:runner /workspace && chmod 0711 /workspace
 ENV SRE_WORKSPACE=/workspace
 # For every opencode in this image, not only the one the runner starts for the
 # agent. The pinned binary is what enforces the fences, and an update that
@@ -160,6 +197,16 @@ LABEL org.opencontainers.image.source="https://github.com/segfaultpw/sre-agent-o
 LABEL org.opencontainers.image.description="Answers SRE Agent fix requests with opencode on a machine you own"
 LABEL org.opencontainers.image.licenses="MIT"
 
-USER runner
+# Root, in the container only. The runner needs it to start every agent run as
+# the agent's account and to hand it one checkout at a time; the entrypoint
+# resolves the two accounts and runner/runner.js does the switching. It needs
+# CAP_SETUID, CAP_SETGID, CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER and CAP_KILL
+# and nothing else; all six are in Docker's default set (which holds fourteen),
+# and are what a Kubernetes securityContext that drops everything must add back.
+# A start that is not root and lacks them does not crash: the runner falls back to
+# running the agent as its own account, says so in its log and in every report.
+# A start that is root and lacks them refuses to start, because its one account
+# would be root; the README says what to change.
+USER root
 WORKDIR /workspace
 ENTRYPOINT ["/opt/sre-agent-opencode/runner/entrypoint.sh"]
