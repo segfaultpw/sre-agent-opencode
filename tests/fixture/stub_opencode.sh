@@ -51,12 +51,48 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'other_write: %s\n' "$(allowed bash -c ": > '$ws/repos/acme/other/planted'")"
     printf 'own_write: %s\n' "$(allowed bash -c ": >> README.md")"
     printf 'home_write: %s\n' "$(allowed bash -c ": >> '$HOME/probe'")"
-    if [ -d .git ]; then
-      printf 'git_status: %s\n' "$(if "${STUB_PROBE_GIT:?}" status --porcelain >/dev/null 2>&1; then echo ok; else echo failed; fi)"
+    # What a CI job does: install a tool into the home and find it again on a
+    # later run, clone a repository, commit in the clone.
+    if command -v sre-fixture-tool >/dev/null 2>&1; then
+      printf 'tool: found %s\n' "$(sre-fixture-tool)"
     else
-      echo 'git_status: ok'
+      mkdir -p "$HOME/.local/bin"
+      printf '#!/bin/sh\necho fixture-tool-ok\n' > "$HOME/.local/bin/sre-fixture-tool"
+      chmod 755 "$HOME/.local/bin/sre-fixture-tool"
+      printf 'tool: installed\n'
+    fi
+    printf 'path_first: %s\n' "${PATH%%:*}"
+    printf 'path_has_mise_shims: %s\n' "$(case ":$PATH:" in *":$HOME/.local/share/mise/shims:"*) echo yes ;; *) echo no ;; esac)"
+    printf 'npm_prefix: %s\n' "${NPM_CONFIG_PREFIX:-}"
+    printf 'mise_data_dir: %s\n' "${MISE_DATA_DIR:-}"
+    printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|GH_TOKEN|GITHUB_TOKEN|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
+    printf 'git_user: %s\n' "$("${STUB_PROBE_GIT:?}" config --global user.name 2>/dev/null || echo none)"
+    if [ -n "${STUB_CLONE_SOURCE:-}" ]; then
+      clone_dir="$(mktemp -d)/clone"
+      if "$STUB_PROBE_GIT" clone -q "$STUB_CLONE_SOURCE" "$clone_dir" >/dev/null 2>&1; then
+        echo 'clone_local: ok'
+        if "$STUB_PROBE_GIT" -C "$clone_dir" commit -q --allow-empty -m probe >/dev/null 2>&1; then echo 'commit_local: ok'; else echo 'commit_local: failed'; fi
+      else
+        echo 'clone_local: failed'
+      fi
+    fi
+    printf 'tree_git: %s\n' "$(if [ -e .git ]; then echo present; else echo absent; fi)"
+    printf 'git_in_tree: %s\n' "$(if "${STUB_PROBE_GIT:?}" status --porcelain >/dev/null 2>&1; then echo works; else echo none; fi)"
+    gd="${STUB_PROBE_GITDIR:-}"
+    if [ -n "$gd" ]; then
+      printf 'gitdir_list: %s\n' "$(allowed ls "$gd")"
+      writable=denied
+      for target in commondir objects/info/alternates info/grafts info/attributes config.worktree refs/replace/x config hooks/pre-commit HEAD; do
+        if ( : >> "$gd/$target" ) 2>/dev/null; then writable="allowed:$target"; fi
+      done
+      printf 'gitdir_write: %s\n' "$writable"
     fi
   } >> "$STUB_OPENCODE_PROBE"
+  if [ -n "${STUB_PLANT_MARKER:-}" ]; then
+    mkdir -p .git
+    printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n' "$STUB_PLANT_MARKER" "${STUB_PLANT_MARKER}.fsmonitor" > .git/config
+    printf '* filter=evil\n' > .gitattributes
+  fi
   setsid sleep 300 </dev/null >/dev/null 2>&1 &
   printf '%s\n' "$!" > "${STUB_PROBE_SURVIVOR:?}"
 fi
@@ -88,6 +124,14 @@ case "${STUB_OPENCODE_MEMORY:-}" in
   link)
     rm -rf .sre-agent-memory
     ln -s /etc .sre-agent-memory
+    ;;
+  plant)
+    # What an agent that owns its tree can leave for the runner's git: a .git
+    # of its own with a filter and an fsmonitor in it, and attributes that name
+    # the filter. The runner never discovers a repository from the tree.
+    mkdir -p .git
+    printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n' "${STUB_PLANT_MARKER:?}" "${STUB_PLANT_MARKER}.fsmonitor" > .git/config
+    printf '* filter=evil\n' > .gitattributes
     ;;
   copyout)
     # Memory content under another name: no path rule can see this, so the

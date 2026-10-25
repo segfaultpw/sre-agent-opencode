@@ -44,9 +44,13 @@ check "$dockerfile" 'groupadd --gid 10001 runner' 'the runner account has a fixe
 check "$dockerfile" 'useradd --uid 10001 --gid runner' 'the runner account is created with that id'
 check "$dockerfile" 'groupadd --gid 10002 agent' 'the agent has a group of its own'
 check "$dockerfile" 'useradd --uid 10002 --gid agent' 'the agent account is a second, unprivileged account'
-check "$dockerfile" '--home-dir /home/agent --create-home' 'the agent has a home of its own to keep opencode state in'
-check "$dockerfile" 'chmod 0700 /home/runner /home/agent' 'both homes are closed to every other account'
+check "$dockerfile" '--home-dir /workspace/agent-home --no-create-home' 'the agent home is on the workspace volume, so what it installs there survives between requests (the runner creates and closes it at start)'
+check "$dockerfile" 'chmod 0700 /home/runner' 'the runner home is closed to every other account'
 check "$dockerfile" 'chmod 0711 /workspace' 'the workspace can be walked through but not listed by the agent'
+check "$dockerfile" 'ARG MISE_VERSION=' 'mise is pinned to a version, so the agent can install language runtimes as itself without root'
+check "$dockerfile" 'mise-v${MISE_VERSION}-linux-${arch}' 'mise is downloaded from its release for the architecture being built'
+check "$dockerfile" '/usr/local/bin/mise' 'mise is on the PATH of every account, root-owned and not writable by the agent'
+check "$dockerfile" 'mise --version' 'mise is installed and proved at build time'
 check "$dockerfile" 'ENV SRE_RUNNER_USER=runner' 'the entrypoint is told which account the runner files belong to'
 check "$dockerfile" 'ENV SRE_AGENT_USER=agent' 'the entrypoint is told which account the agent runs as'
 check "$dockerfile" 'util-linux' 'setpriv, which a runner without root starts the agent through, is installed by name'
@@ -118,7 +122,7 @@ cat > "$work/bin/getent" <<'EOF'
 #!/usr/bin/env bash
 case "$2" in
   runner) echo "runner:x:10001:10001::/home/runner:/usr/sbin/nologin" ;;
-  agent) echo "agent:x:10002:10002::/home/agent:/usr/sbin/nologin" ;;
+  agent) echo "agent:x:10002:10002::/workspace/agent-home:/usr/sbin/nologin" ;;
   *) exit 2 ;;
 esac
 EOF
@@ -220,13 +224,13 @@ run_as() {
     bash "$entrypoint" 2>&1)" || rc=$?
 }
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent
-if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=10001:10001:/home/runner agent=10002:10002:/home/agent' "$STUB_LOG"; then echo "ok   as root it hands the runner both accounts' ids and homes"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=10001:10001:/home/runner agent=10002:10002:/workspace/agent-home' "$STUB_LOG"; then echo "ok   as root it hands the runner both accounts' ids and homes"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=nobody-here
 if [ "$rc" -ne 0 ] && grep -qF 'nobody-here' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   as root a missing agent account refuses to start, naming it"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=agent SRE_AGENT_USER=agent
 if [ "$rc" -ne 0 ] && grep -qF 'different accounts' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   as root one account for both refuses to start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=1000 SRE_AGENT_USER=agent
-if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=10002:10002:/home/agent' "$STUB_LOG"; then echo "ok   without root, a named agent account is resolved and the runner keeps its own"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=10002:10002:/workspace/agent-home' "$STUB_LOG"; then echo "ok   without root, a named agent account is resolved and the runner keeps its own"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 mkdir -p "$work/nosetpriv"
 for tool in node git gh opencode id getent; do cp "$work/bin/$tool" "$work/nosetpriv/$tool"; done
 : > "$STUB_LOG"

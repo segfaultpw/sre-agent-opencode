@@ -1,7 +1,8 @@
 'use strict';
 // The runner's persistent workspace and the memory the agent keeps in it.
 //
-//   <workspace>/repos/<owner>/<repo>/      clones, reused between requests
+//   <workspace>/repos/<owner>/<repo>/      work trees, reused between requests
+//   <workspace>/gitdirs/<owner>/<repo>/    the git directory of each work tree
 //   <workspace>/memory/<owner>/<repo>/     NOTES.md and scripts/<name>
 //   <workspace>/memory/_estate/            the same, for requests naming no repository
 //   <workspace>/scratch/                   untargeted runs
@@ -30,7 +31,7 @@ const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // Top-level names the runner owns. An old clone under an owner called one of
 // these cannot be told from the runner's own directory, so it is not migrated
 // and is cloned again under repos/.
-const RESERVED = new Set(['repos', 'memory', 'scratch']);
+const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home']);
 
 function validName(name) {
   return typeof name === 'string' && NAME_PATTERN.test(name) && !/^\.+$/.test(name);
@@ -40,6 +41,7 @@ function layout(workspace) {
   const base = path.resolve(workspace);
   return {
     repos: path.join(base, 'repos'),
+    gitdirs: path.join(base, 'gitdirs'),
     memory: path.join(base, 'memory'),
     scratch: path.join(base, 'scratch'),
   };

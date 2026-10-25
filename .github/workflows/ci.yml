@@ -54,9 +54,28 @@ jobs:
       - run: node --check runner/memory.js
       - run: node tests/memory_test.js
       - run: bash tests/runner_test.sh
-      - run: bash tests/uid_split_test.sh
+      - run: bash tests/uid_split_ci_test.sh
       - run: bash tests/image_test.sh
       - run: bash tests/install_runner_test.sh
+
+  # Root is needed to switch uids, so this one runs where passwordless sudo
+  # exists. The test itself fails, rather than skips, when it runs in CI and
+  # cannot switch uids, and the two success lines are asserted here as well so a
+  # run that printed nothing cannot pass.
+  uid-split:
+    name: the agent runs as its own account
+    runs-on: ${{ vars.RUNNER_X64 || 'ubuntu-24.04' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: This runner has passwordless sudo
+        run: sudo -n true
+      - name: Prove the split with real uids
+        run: |
+          set -o pipefail
+          bash tests/uid_split_test.sh | tee "$RUNNER_TEMP/uid_split.out"
+          grep -qxF 'ok   root: the request ends in a pull request' "$RUNNER_TEMP/uid_split.out"
+          grep -qxF 'ok   caps: the request ends in a pull request' "$RUNNER_TEMP/uid_split.out"
+          if grep -q '^FAIL\|^SKIP' "$RUNNER_TEMP/uid_split.out"; then exit 1; fi
 
   dry-run:
     name: opencode loads the config and the agent

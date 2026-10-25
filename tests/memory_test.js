@@ -53,9 +53,10 @@ function test(name, fn) {
   }
 }
 
-test('layout names the three directories under the workspace', () => {
+test('layout names the four directories under the workspace', () => {
   assert.deepEqual(memory.layout('/workspace'), {
     repos: '/workspace/repos',
+    gitdirs: '/workspace/gitdirs',
     memory: '/workspace/memory',
     scratch: '/workspace/scratch',
   });
@@ -135,10 +136,15 @@ test('migrate leaves an old clone alone when the new place is taken', () => {
 
 test('migrate never treats the runner own directories as owners', () => {
   const ws = fresh();
+  put(ws, 'agent-home/acme/.git/HEAD', 'x');
+  put(ws, 'gitdirs/acme/api/HEAD', 'x');
+  put(ws, 'gitdirs/acme/api/.git/HEAD', 'x');
   put(ws, 'memory/acme/api/.git/HEAD', 'x');
   put(ws, 'scratch/acme/.git/HEAD', 'x');
   assert.deepEqual(memory.migrate(ws), []);
   assert.ok(fs.existsSync(path.join(ws, 'memory/acme/api/.git/HEAD')));
+  assert.ok(fs.existsSync(path.join(ws, 'gitdirs/acme/api/.git/HEAD')), 'a git directory is not moved under repos');
+  assert.ok(fs.existsSync(path.join(ws, 'agent-home/acme/.git/HEAD')), 'the agent home is not an owner');
 });
 
 test('migrate skips a directory that cannot be an owner, such as the lost+found of a mounted disk', () => {

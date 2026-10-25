@@ -84,29 +84,31 @@ cat > "$work/bin/git" <<EOF
 # Records every call with the credential masked, then runs the real git with
 # the GitHub URL pointed at the fixture remote on disk. The log is how a case
 # proves the runner reached for github.com, and how the untargeted case proves
-# it never reached for git at all. FAKE_GIT_FAIL_PUSH makes a push fail with
-# the unmasked URL on stderr, which is how a real git reports one, so the case
-# that follows can prove the runner redacts what it logs and reports.
+# it never reached for git at all. A file named fail_push in the control
+# directory makes a push fail with the unmasked URL on stderr, which is how a
+# real git reports one, so the case that follows can prove the runner redacts
+# what it logs and reports. The runner starts git and gh with a minimal
+# environment, so the paths and switches here are baked in or read from files,
+# never taken from variables.
 set -euo pipefail
 # The runner puts the same two settings in front of every call, so that a hook
 # or a command-running setting left in a reused clone never runs. The raw log
 # keeps them (a case checks every call carried them); the ordinary log and the
 # argument positions below do not, so a case reads the call itself.
-if [ -n "\${FAKE_GIT_RAW_LOG:-}" ]; then
-  # hardened-env marks a call whose environment already carries the settings
-  # (a git that a script or gh starts); the flags are on the runner's own.
-  if [ "\${GIT_CONFIG_KEY_0:-}" = "core.hooksPath" ] && [ "\${GIT_CONFIG_KEY_1:-}" = "core.fsmonitor" ]; then marker=hardened-env; else marker=plain-env; fi
-  printf '%s %s\n' "\$marker" "\$*" >> "\$FAKE_GIT_RAW_LOG"
-fi
+# hardened-env marks a call whose environment already carries the settings
+# (a git that a script or gh starts); the flags are on the runner's own.
+if [ "\${GIT_CONFIG_KEY_0:-}" = "core.hooksPath" ] && [ "\${GIT_CONFIG_KEY_1:-}" = "core.fsmonitor" ] && [ "\${GIT_CONFIG_KEY_2:-}" = "core.attributesFile" ] && [ "\${GIT_CONFIG_NOSYSTEM:-}" = "1" ] && [ "\${GIT_NO_REPLACE_OBJECTS:-}" = "1" ] && [ "\${GIT_ATTR_NOSYSTEM:-}" = "1" ]; then marker=hardened-env; else marker=plain-env; fi
+printf '%s %s\n' "\$marker" "\$*" >> "$work/git_raw.log"
+# What a git call can see of the runner's own environment, which must be none
+# of its credentials: only the variables the call needs are passed to it.
+env | cut -d= -f1 | grep -E '^(SRE_|AWS_|ECS_|GH_|GITHUB_|OPENROUTER|ANTHROPIC)' >> "$work/git_leaks.log" || true
 hardening=()
-if [ "\${1:-}" = "-c" ] && [ "\${2:-}" = "core.hooksPath=/dev/null" ] && [ "\${3:-}" = "-c" ] && [ "\${4:-}" = "core.fsmonitor=false" ]; then
-  hardening=(-c core.hooksPath=/dev/null -c core.fsmonitor=false)
-  shift 4
+if [ "\${1:-}" = "-c" ] && [ "\${2:-}" = "core.hooksPath=/dev/null" ] && [ "\${3:-}" = "-c" ] && [ "\${4:-}" = "core.fsmonitor=false" ] && [ "\${5:-}" = "-c" ] && [ "\${6:-}" = "core.attributesFile=/dev/null" ]; then
+  hardening=(-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.attributesFile=/dev/null)
+  shift 6
 fi
-if [ -n "\${FAKE_GIT_LOG:-}" ]; then
-  printf '%s\n' "\$*" | sed -e 's#://[^@ ]*@#://[redacted]@#g' >> "\$FAKE_GIT_LOG"
-fi
-if [ -n "\${FAKE_GIT_FAIL_PUSH:-}" ] && [ "\${3:-}" = "push" ]; then
+printf '%s\n' "\$*" | sed -e 's#://[^@ ]*@#://[redacted]@#g' >> "$git_log"
+if [ -e "$work/ctl/fail_push" ] && [ "\${3:-}" = "push" ]; then
   printf 'fatal: could not read from remote repository: git %s\n' "\$*" >&2
   exit 128
 fi
@@ -115,7 +117,7 @@ for a in "\$@"; do
   # Only a URL is redirected. The commit identity is a github.com address too,
   # and rewriting it would make git reject the config rather than the remote.
   case "\$a" in
-    https://*github.com/*) args+=("\${FAKE_GIT_REMOTE:-$remote}") ;;
+    https://*github.com/*) args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
     *) args+=("\$a") ;;
   esac
 done
@@ -128,13 +130,14 @@ cat > "$work/bin/gh" <<EOF
 # Stands in for gh: records the call and the body the runner wrote, and
 # answers with the URL a real gh prints on stdout.
 set -euo pipefail
-printf '%s\n' "\$*" >> "\$FAKE_GH_LOG"
+printf '%s\n' "\$*" >> "$gh_log"
+env | cut -d= -f1 | grep -E '^(SRE_API|SRE_MODEL|AWS_|ECS_|OPENROUTER|ANTHROPIC)' >> "$work/gh_leaks.log" || true
 body=""
 while [ \$# -gt 0 ]; do
   if [ "\$1" = "--body-file" ]; then body="\$2"; fi
   shift
 done
-if [ -n "\$body" ]; then cp "\$body" "\$FAKE_GH_BODY"; fi
+if [ -n "\$body" ]; then cp "\$body" "$gh_body"; fi
 printf '%s\n' "$pr_url"
 EOF
 chmod +x "$work/bin/gh"
@@ -142,8 +145,9 @@ chmod +x "$work/bin/gh"
 install -m 755 "$here/fixture/stub_opencode.sh" "$work/bin/opencode"
 
 export PATH="$work/bin:$PATH"
-export FAKE_GIT_LOG="$git_log" FAKE_GH_LOG="$gh_log" FAKE_GH_BODY="$gh_body"
-export FAKE_GIT_RAW_LOG="$work/git_raw.log"
+mkdir -p "$work/ctl"
+: > "$work/git_leaks.log"
+: > "$work/gh_leaks.log"
 export STUB_OPENCODE_LOG="$opencode_log" STUB_OPENCODE_BRIEF_OUT="$brief_seen"
 export FIXTURE_PORT_FILE="$port_file" FIXTURE_API_KEY="$api_key"
 export FIXTURE_HANDOFF_TOKEN="$handoff_token" FIXTURE_BRIEF_FILE="$brief_file"
@@ -235,7 +239,7 @@ queue_one h-targeted acme/app
 export STUB_OPENCODE_MODE=fix
 run_once targeted
 if [ "$rc" -eq 0 ]; then echo "ok   a targeted job exits 0"; else echo "FAIL a targeted job exited $rc: $(cat "$out")"; fail=1; fi
-if grep -q '^clone https://\[redacted\]@github.com/acme/app.git ' "$git_log"; then echo "ok   the named repository is cloned from github.com"; else echo "FAIL clone call: $(cat "$git_log")"; fail=1; fi
+if grep -q '^clone --separate-git-dir=[^ ]*/gitdirs/acme/app https://\[redacted\]@github.com/acme/app.git ' "$git_log"; then echo "ok   the named repository is cloned from github.com"; else echo "FAIL clone call: $(cat "$git_log")"; fail=1; fi
 if grep -q -- '--agent sre-fix' "$opencode_log"; then echo "ok   the agent is started as sre-fix"; else echo "FAIL opencode argv: $(cat "$opencode_log")"; fail=1; fi
 if grep -q -- "--model $model" "$opencode_log"; then echo "ok   the configured model is passed to the agent"; else echo "FAIL opencode argv: $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "default_agent: sre-fix" "$opencode_log"; then echo "ok   the config travels through OPENCODE_CONFIG_CONTENT with sre-fix as the default agent"; else echo "FAIL config: $(cat "$opencode_log")"; fail=1; fi
@@ -244,7 +248,7 @@ if grep -qx "sees_SRE_API_KEY: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_
 if grep -qx "autoupdate_disabled: 1" "$opencode_log"; then echo "ok   the agent cannot update the binary that enforces its fences"; else echo "FAIL autoupdate: $(cat "$opencode_log")"; fail=1; fi
 if grep -qxF "$marker" "$brief_seen"; then echo "ok   the brief reaches the agent on stdin"; else echo "FAIL the agent did not receive the brief"; fail=1; fi
 if grep -q "sre-agent-opencode:v${version}" "$workspace/repos/acme/app/.opencode/agents/sre-fix.md"; then echo "ok   the agent file is written into the checkout with the version stamped in"; else echo "FAIL the agent file is missing or unstamped"; fail=1; fi
-if grep -qx '.opencode/' "$workspace/repos/acme/app/.git/info/exclude"; then echo "ok   the agent file is excluded from git"; else echo "FAIL .opencode/ is not excluded"; fail=1; fi
+if grep -qx '.opencode/' "$workspace/gitdirs/acme/app/info/exclude"; then echo "ok   the agent file is excluded from git"; else echo "FAIL .opencode/ is not excluded"; fail=1; fi
 if branch_exists sre-agent/h-targeted; then echo "ok   the branch is pushed to the repository"; else echo "FAIL sre-agent/h-targeted was not pushed"; fail=1; fi
 if grep -q 'pr create --repo acme/app --base main --head sre-agent/h-targeted' "$gh_log" && grep -q -- '--draft' "$gh_log"; then echo "ok   a draft pull request is opened against the default branch"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the pull request body carries the marker from the brief and the version stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
@@ -413,9 +417,9 @@ stop_fixture
 echo "--- 14. a failure that echoes a credential is redacted before it is logged or reported ---"
 start_fixture redacted
 queue_one h-redacted acme/app
-export FAKE_GIT_FAIL_PUSH=1
+touch "$work/ctl/fail_push"
 run_once redacted
-unset FAKE_GIT_FAIL_PUSH
+rm -f "$work/ctl/fail_push"
 if grep -qF '[redacted]' "$out"; then echo "ok   the credential in git's own error is replaced in the log"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
 if jq -e '.evidence.error | test("\\[redacted\\]")' <<<"$report" >/dev/null; then echo "ok   the credential is replaced in the report as well"; else echo "FAIL evidence: $report"; fail=1; fi
 if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a failed push is reported as not_validated"; else echo "FAIL outcome: $report"; fail=1; fi
@@ -546,7 +550,7 @@ if [ "$rc" -eq 0 ]; then echo "ok   a start with an old layout exits 0"; else ec
 if [ -d "$workspace/repos/acme/legacy/.git" ] && [ -f "$workspace/repos/acme/legacy/README.md" ]; then echo "ok   the old clone is moved under repos/"; else echo "FAIL the old clone is not under repos/: $(find "$workspace" -maxdepth 3 -name legacy)"; fail=1; fi
 if [ ! -e "$workspace/acme/legacy" ]; then echo "ok   nothing is left at the old place"; else echo "FAIL $workspace/acme/legacy is still there"; fail=1; fi
 if grep -q 'moved 1 existing clone under repos/: acme/legacy' "$out"; then echo "ok   the log says which clone moved"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
-if [ -d "$workspace/repos/acme/app/.git" ] && [ ! -e "$workspace/acme/app" ]; then echo "ok   a new clone is made under repos/<owner>/<repo>"; else echo "FAIL the clone of acme/app is not under repos/"; fail=1; fi
+if [ -d "$workspace/repos/acme/app" ] && [ -d "$workspace/gitdirs/acme/app" ] && [ ! -e "$workspace/repos/acme/app/.git" ] && [ ! -e "$workspace/acme/app" ]; then echo "ok   a new clone is a work tree under repos/<owner>/<repo> and a git directory under gitdirs/<owner>/<repo>, with no .git in the tree"; else echo "FAIL the clone of acme/app is not laid out that way: $(find "$workspace/repos/acme/app" -maxdepth 1 -name '.git*')"; fail=1; fi
 stop_fixture
 
 seed_memory() {
@@ -572,7 +576,7 @@ run_once memory
 cp "$brief_seen" "$work/brief_memory1.md"
 if [ "$rc" -eq 0 ]; then echo "ok   a run with memory exits 0"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
 if grep -qx "memory_files: NOTES.md scripts/old.sh scripts/pool.sh " "$opencode_log"; then echo "ok   the agent finds the repository's notes and scripts in .sre-agent-memory/ before it starts"; else echo "FAIL memory_files: $(grep memory_files "$opencode_log")"; fail=1; fi
-if grep -qx '.sre-agent-memory/' "$workspace/repos/acme/app/.git/info/exclude"; then echo "ok   the copy is excluded from git"; else echo "FAIL .sre-agent-memory/ is not excluded: $(cat "$workspace/repos/acme/app/.git/info/exclude")"; fail=1; fi
+if grep -qx '.sre-agent-memory/' "$workspace/gitdirs/acme/app/info/exclude"; then echo "ok   the copy is excluded from git"; else echo "FAIL .sre-agent-memory/ is not excluded: $(cat "$workspace/gitdirs/acme/app/info/exclude")"; fail=1; fi
 nonce1="$(grep -oE '^<!-- sre-agent-memory:[0-9a-f]{8} -->$' "$work/brief_memory1.md" | head -n 1 | sed -E 's/^<!-- sre-agent-memory:([0-9a-f]{8}) -->$/\1/')"
 if [ -n "$nonce1" ]; then echo "ok   the prompt carries an opening marker with an 8 hex nonce"; else echo "FAIL no opening marker in the prompt"; fail=1; fi
 open_line="$(grep -nxF "<!-- sre-agent-memory:${nonce1} -->" "$work/brief_memory1.md" | head -n 1 | cut -d: -f1)"
@@ -744,37 +748,50 @@ stop_fixture
 
 echo "--- 31. a reused clone cannot run its own hooks or settings, and keeps nothing ignored between requests ---"
 # The workspace persists across requests and across task replacements, so what
-# a run leaves in a clone is what the next request's git calls meet.
+# a run leaves in a clone is what the next request's git calls meet. The
+# planted state is in the git directory, which is where it would be if anything
+# had been able to write there; the runner rebuilds it either way.
 clone="$workspace/repos/acme/app"
-mkdir -p "$clone/.git/hooks"
-printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$work/hook-ran" > "$clone/.git/hooks/pre-commit"
-chmod +x "$clone/.git/hooks/pre-commit"
+gitdir="$workspace/gitdirs/acme/app"
+mkdir -p "$gitdir/hooks"
+printf '#!/bin/sh\ntouch "%s"\nexit 1\n' "$work/hook-ran" > "$gitdir/hooks/pre-commit"
+chmod +x "$gitdir/hooks/pre-commit"
 # hooksPath is set here because a machine's own global setting would otherwise
 # stand in front of the clone's hooks directory and hide the case.
-printf '[core]\n\thooksPath = %s\n\tfsmonitor = touch %s\n[alias]\n\tstatus = !touch %s\n' "$clone/.git/hooks" "$work/fsmonitor-ran" "$work/alias-ran" >> "$clone/.git/config"
+printf '[core]\n\thooksPath = %s\n\tfsmonitor = touch %s\n[alias]\n\tstatus = !touch %s\n' "$gitdir/hooks" "$work/fsmonitor-ran" "$work/alias-ran" >> "$gitdir/config"
 printf 'left behind\n' > "$clone/ignored-leftover.tmp"
-printf 'ignored-leftover.tmp\n' >> "$clone/.git/info/exclude"
+printf 'ignored-leftover.tmp\n' >> "$gitdir/info/exclude"
 : > "$work/git_raw.log"
 start_fixture hardened
 queue_one h-hardened acme/app
 export STUB_OPENCODE_MODE=fix
 run_once hardened
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request is answered with a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
-if [ ! -e "$work/hook-ran" ]; then echo "ok   a hook left in .git/hooks does not run"; else echo "FAIL the pre-commit hook ran"; fail=1; fi
-if [ ! -e "$work/fsmonitor-ran" ] && [ ! -e "$work/alias-ran" ]; then echo "ok   a command in .git/config does not run"; else echo "FAIL a command from .git/config ran"; fail=1; fi
-if ! grep -qE 'fsmonitor|alias' "$clone/.git/config" && grep -qF "url = https://github.com/acme/app.git" "$clone/.git/config"; then echo "ok   .git/config is the runner's own, with the clean origin URL"; else echo "FAIL .git/config: $(cat "$clone/.git/config")"; fail=1; fi
+if [ ! -e "$work/hook-ran" ]; then echo "ok   a hook left in the git directory does not run"; else echo "FAIL the pre-commit hook ran"; fail=1; fi
+if [ ! -e "$work/fsmonitor-ran" ] && [ ! -e "$work/alias-ran" ]; then echo "ok   a command in the git directory's config does not run"; else echo "FAIL a command from the config ran"; fail=1; fi
+if ! grep -qE 'fsmonitor|alias' "$gitdir/config" && grep -qF "url = https://github.com/acme/app.git" "$gitdir/config"; then echo "ok   the config is the runner's own, with the clean origin URL"; else echo "FAIL config: $(cat "$gitdir/config")"; fail=1; fi
 if [ ! -e "$clone/ignored-leftover.tmp" ]; then echo "ok   an ignored file from an earlier request is cleaned"; else echo "FAIL the ignored file survived"; fail=1; fi
-if [ -s "$work/git_raw.log" ] && ! grep -q '^plain-env ' "$work/git_raw.log"; then echo "ok   every git call, the runner's own and the ones its scripts start, ran with the hook and fsmonitor settings in its environment ($(wc -l < "$work/git_raw.log") calls)"; else echo "FAIL calls without them: $(grep '^plain-env ' "$work/git_raw.log" | head -n 3)"; fail=1; fi
-if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false ' "$work/git_raw.log")" -ge 8 ] && ! grep -v -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false ' "$work/git_raw.log" | grep -qv -E '^hardened-env (rev-parse|update-index|ls-files) '; then echo "ok   the runner's own git calls carry the settings as arguments too; only its scripts' calls rely on the environment"; else echo "FAIL calls: $(grep -v -E ' -c core\.hooksPath=/dev/null ' "$work/git_raw.log" | head -n 5)"; fail=1; fi
+if [ -s "$work/git_raw.log" ] && ! grep -q '^plain-env ' "$work/git_raw.log"; then echo "ok   every git call, the runner's own and the ones its scripts start, ran with the hook, fsmonitor, attributes and replace-object settings in its environment ($(wc -l < "$work/git_raw.log") calls)"; else echo "FAIL calls without them: $(grep '^plain-env ' "$work/git_raw.log" | head -n 3)"; fail=1; fi
+if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log")" -ge 8 ] && ! grep -v -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log" | grep -qv -E '^hardened-env (rev-parse|update-index|ls-files) '; then echo "ok   the runner's own git calls carry the settings as arguments too; only its scripts' calls rely on the environment"; else echo "FAIL calls: $(grep -v -E ' -c core\.hooksPath=/dev/null ' "$work/git_raw.log" | head -n 5)"; fail=1; fi
+unnamed="$(grep -E ' (add|commit|push|checkout|clean|diff|fetch|ls-files) ' "$work/git_raw.log" | grep -v -E '^hardened-env (rev-parse|update-index|ls-files) ' | grep -v -- '--git-dir=' || true)"
+if [ -z "$unnamed" ]; then echo "ok   every call that works on the tree names the runner's git directory and the tree explicitly"; else echo "FAIL calls: $(head -n 3 <<<"$unnamed")"; fail=1; fi
+if [ ! -s "$work/git_leaks.log" ] && [ ! -s "$work/gh_leaks.log" ]; then echo "ok   no git or gh call saw the poll key, the model setting or a provider or AWS variable"; else echo "FAIL leaks: $(sort -u "$work/git_leaks.log" "$work/gh_leaks.log" | tr '\n' ' ')"; fail=1; fi
 stop_fixture
 
-echo "--- 31b. a .git that is no longer a directory is not trusted ---"
-rm -rf "$clone/.git"
-printf 'gitdir: /nonexistent\n' > "$clone/.git"
-start_fixture gitfile
-queue_one h-gitfile acme/app
-run_once gitfile
-if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ -d "$clone/.git" ]; then echo "ok   the clone is made again and the request is answered"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+echo "--- 31b. an old clone with its git directory inside the tree is replaced, not adopted ---"
+# What an earlier release left: .git inside the checkout, written by an agent
+# that ran as the runner's own account. Nothing in it is trusted, so the clone
+# is made again into the runner's git directory.
+rm -rf "$gitdir" "$clone"
+mkdir -p "$clone/.git/hooks"
+"$real_git" init -q -b main "$clone"
+printf '#!/bin/sh\ntouch "%s"\n' "$work/legacy-hook-ran" > "$clone/.git/hooks/pre-commit"
+chmod +x "$clone/.git/hooks/pre-commit"
+start_fixture legacygit
+queue_one h-legacygit acme/app
+run_once legacygit
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ -d "$gitdir" ] && [ ! -e "$clone/.git" ] && [ ! -e "$work/legacy-hook-ran" ]; then echo "ok   the clone is made again into the runner's git directory and the old one is gone"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if grep -q 'git directory inside the checkout' "$out"; then echo "ok   the log says why"; else echo "FAIL output: $(cat "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 32. a repository that tracks .sre-agent-memory is refused with the reason ---"
@@ -787,11 +804,11 @@ printf 'x\n' > "$work/seed2/README.md"
 "$real_git" -C "$work/seed2" add -A
 "$real_git" -C "$work/seed2" -c user.name=seed -c user.email=seed@example.invalid commit -q -m "seed"
 "$real_git" -C "$work/seed2" push -q "$remote2" main
-export FAKE_GIT_REMOTE="$remote2"
+printf '%s' "$remote2" > "$work/ctl/remote"
 start_fixture tracked
 queue_one h-tracked acme/tracked
 run_once tracked
-unset FAKE_GIT_REMOTE
+rm -f "$work/ctl/remote"
 if [ "$rc" -eq 0 ] && jq -e '.evidence.error | test("tracks .sre-agent-memory")' <<<"$report" >/dev/null; then echo "ok   the report says the repository tracks the name the runner uses"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
 if [ ! -s "$opencode_log" ] && ! grep -q ' push ' "$git_log"; then echo "ok   the agent never runs and nothing is pushed"; else echo "FAIL the run went ahead: $(cat "$opencode_log")"; fail=1; fi
 stop_fixture
@@ -883,6 +900,47 @@ timeout 60 node "$work/snapshot_tamper.js" "$runner" "$work/tamper-ws" "$work/ta
 if [ "$rc" -eq 0 ] && [ "$(cat "$work/tamper-ws/memory/_estate/NOTES.md")" = "the notes that were checked" ]; then echo "ok   the saved NOTES.md is the one that was checked, not the 70000 bytes it became"; else echo "FAIL rc=$rc: $(cat "$work/tamper.out") $(ls -l "$work/tamper-ws/memory/_estate")"; fail=1; fi
 if [ ! -e "$work/tamper-ws/memory/_estate/scripts/late.sh" ]; then echo "ok   a file that appeared after the check is not saved"; else echo "FAIL late.sh was saved"; fail=1; fi
 if [ ! -e "$work/tamper-ws/tamper-scratch/.sre-agent-memory" ]; then echo "ok   the working copy is removed"; else echo "FAIL the copy is still there"; fail=1; fi
+
+echo "--- 38. nothing git trusts can be planted, in the git directory or in the tree ---"
+# commondir, alternates, grafts, a replace ref, config.worktree and an
+# attributes file in the git directory (as if something had written there),
+# a .git directory with a filter in it and a .gitattributes that names the
+# filter in the tree (as the agent can), and a filter and an fsmonitor in the
+# operator's own global config. The runner's staging, commit and push must run
+# none of the commands, pick up none of the objects and keep the base.
+"$real_git" init -q -b main "$work/evil"
+printf 'evil\n' > "$work/evil/README.md"
+"$real_git" -C "$work/evil" add README.md
+"$real_git" -C "$work/evil" -c user.name=evil -c user.email=evil@example.invalid -c commit.gpgsign=false commit -q -m "evil"
+evil_commit="$("$real_git" -C "$work/evil" rev-parse HEAD)"
+real_head="$("$real_git" --git-dir="$remote" rev-parse refs/heads/main)"
+real_readme="$("$real_git" --git-dir="$remote" show refs/heads/main:README.md)"
+gd="$workspace/gitdirs/acme/app"
+mkdir -p "$gd/info" "$gd/refs/replace" "$gd/objects/info" "$work/fakehome" "$work/markers"
+printf '%s\n' "$work/evil/.git" > "$gd/commondir"
+printf '%s\n' "$work/evil/.git/objects" > "$gd/objects/info/alternates"
+printf '%s %s\n' "$real_head" "$evil_commit" > "$gd/info/grafts"
+printf '%s\n' "$evil_commit" > "$gd/refs/replace/$real_head"
+printf '[core]\n\tfsmonitor = touch %s/worktree-config\n' "$work/markers" > "$gd/config.worktree"
+printf '[extensions]\n\tworktreeConfig = true\n' >> "$gd/config"
+printf '* filter=evil\n' > "$gd/info/attributes"
+printf '[filter "evil"]\n\tclean = touch %s/global-filter\n[core]\n\tfsmonitor = touch %s/global-fsmonitor\n' "$work/markers" "$work/markers" > "$work/fakehome/.gitconfig"
+start_fixture planted
+queue_one h-planted acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=plant STUB_PLANT_MARKER="$work/markers/tree-config"
+HOME="$work/fakehome" run_once planted
+unset STUB_OPENCODE_MEMORY STUB_PLANT_MARKER
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request is answered with a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ -z "$(ls -A "$work/markers")" ]; then echo "ok   no filter, fsmonitor or other planted command ran"; else echo "FAIL these ran: $(find "$work/markers" -mindepth 1 -printf '%f ')"; fail=1; fi
+branch_parent="$("$real_git" --git-dir="$remote" rev-parse refs/heads/sre-agent/h-planted^ 2>/dev/null || true)"
+if [ "$branch_parent" = "$real_head" ]; then echo "ok   the pushed commit is built on the real base"; else echo "FAIL parent is '$branch_parent', expected $real_head"; fail=1; fi
+if ! "$real_git" --git-dir="$remote" rev-list refs/heads/sre-agent/h-planted 2>/dev/null | grep -q "$evil_commit"; then echo "ok   the planted commit is not in the pushed history"; else echo "FAIL the planted commit was pushed"; fail=1; fi
+if ! "$real_git" --git-dir="$remote" cat-file -e "$evil_commit" 2>/dev/null; then echo "ok   no object from the planted store reached the remote"; else echo "FAIL the planted commit's objects were pushed"; fail=1; fi
+pushed_readme="$("$real_git" --git-dir="$remote" show refs/heads/sre-agent/h-planted:README.md 2>/dev/null || true)"
+if [ "$pushed_readme" = "$real_readme"$'\n'"a line the fix added" ]; then echo "ok   the pushed README is the real one plus the agent's line"; else echo "FAIL pushed README: $pushed_readme"; fail=1; fi
+if [ ! -e "$gd/commondir" ] && [ ! -e "$gd/objects/info/alternates" ] && [ ! -e "$gd/info/grafts" ] && [ ! -e "$gd/refs/replace/$real_head" ] && [ ! -e "$gd/config.worktree" ] && [ ! -e "$gd/info/attributes" ]; then echo "ok   the runner removed every one of them from the git directory"; else echo "FAIL left: $(find "$gd" -name commondir -o -name alternates -o -name grafts -o -name config.worktree -o -name attributes -o -path '*refs/replace/*' | tr '\n' ' ')"; fail=1; fi
+if [ ! -e "$workspace/repos/acme/app/.git" ]; then echo "ok   no .git is left in the tree"; else echo "FAIL .git is in the tree"; fail=1; fi
+stop_fixture
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
 # The runner cannot deploy, so it cannot verify a fix in a running system. The

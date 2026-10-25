@@ -31,6 +31,7 @@ ARG OPENCODE_VERSION=1.18.29
 ARG KUBECTL_VERSION=v1.37.0
 ARG GH_VERSION=2.100.0
 ARG AWSCLI_VERSION=2.36.40
+ARG MISE_VERSION=2026.10.12
 
 # git and gh are what the runner publishes with, bash is what every script in
 # this package is written in, jq is what those scripts parse with, and less is
@@ -112,6 +113,21 @@ RUN set -eux; \
     rm -rf /tmp/aws /tmp/awscli.zip; \
     aws --version
 
+# mise, so that the agent can install language runtimes as itself, without root,
+# into its own home (MISE_DATA_DIR is set under it). Checked against a digest
+# like the other clients; a bump belongs in the CHANGELOG.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) arch=x64; sha=72404716768b5b044cbd5170136d3d795cbd592658b6e932b66f0f8d67a54875 ;; \
+      arm64) arch=arm64; sha=31bbf697b289fde4b5623b223af288edd9ef86298ce9ecff705ac867f6f27e09 ;; \
+      *) echo "no mise build for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/mise "https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-linux-${arch}"; \
+    echo "${sha}  /tmp/mise" | sha256sum -c -; \
+    install -m 0755 /tmp/mise /usr/local/bin/mise; \
+    rm -f /tmp/mise; \
+    mise --version
+
 RUN set -eux; \
     dir="gh_${GH_VERSION}_linux_${TARGETARCH}"; \
     base="https://github.com/cli/cli/releases/download/v${GH_VERSION}"; \
@@ -125,9 +141,11 @@ RUN set -eux; \
 
 # Two unprivileged accounts. The agent has a shell, so what its account can
 # reach is what the agent can reach; it therefore is not the runner's account.
-# The runner's holds the workspace, the memory directory, the clones and the
-# runner's git and gh state; the agent's holds a home of its own, and is handed
-# one checkout at a time. The ids are fixed rather than allocated, because an
+# The runner's holds the workspace, the memory directory, the git directories
+# and the runner's git and gh state; the agent's holds a home of its own, on the
+# volume (/workspace/agent-home, which the runner creates owned by the agent and
+# closed to everyone else) so that what it installs survives between requests,
+# and is handed one work tree at a time. The ids are fixed rather than allocated, because an
 # operator who mounts a host directory at /workspace has to be able to chown it
 # to something, and that something must not move between releases (10001 is the
 # account earlier releases ran everything as, so an existing volume keeps
@@ -137,8 +155,8 @@ RUN groupadd --gid 10001 runner \
        --home-dir /home/runner --create-home --shell /usr/sbin/nologin runner \
     && groupadd --gid 10002 agent \
     && useradd --uid 10002 --gid agent \
-       --home-dir /home/agent --create-home --shell /usr/sbin/nologin agent \
-    && chmod 0700 /home/runner /home/agent
+       --home-dir /workspace/agent-home --no-create-home --shell /usr/sbin/nologin agent \
+    && chmod 0700 /home/runner
 ENV SRE_RUNNER_USER=runner
 ENV SRE_AGENT_USER=agent
 

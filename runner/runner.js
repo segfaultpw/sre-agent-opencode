@@ -251,7 +251,7 @@ function killGroup(pid, signal) {
 // call or a script is never the agent's or root's by omission; 'agent' is
 // opencode and nothing else; 'root' is the chown that hands a checkout over.
 function launch(command, args, env, as) {
-  const base = env || process.env;
+  const base = env || minimalEnv();
   if (identity.mode === 'root' && as !== 'root') {
     const who = as === 'agent' ? identity.agent : identity.runner;
     return { command, args, env: { ...base, HOME: who.home }, ids: { uid: who.uid, gid: who.gid } };
@@ -359,6 +359,28 @@ function runProcess(command, args, options = {}) {
   });
 }
 
+// What a child that is not the agent is given of the runner's own environment:
+// enough to find its programs, its certificates and its proxy, and nothing else.
+// The poll key, the model setting, the provider key and the AWS variables are
+// the runner's alone, and a git or gh call has no use for any of them; the
+// repository token travels in the URL of the calls that reach GitHub, and gh
+// is given it as its own variable.
+const ENV_PASSTHROUGH = [
+  'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ',
+  'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'GIT_SSL_CAINFO',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+];
+
+function minimalEnv() {
+  const env = {};
+  for (const name of ENV_PASSTHROUGH) {
+    if (process.env[name] !== undefined) env[name] = process.env[name];
+  }
+  if (process.env.HOME !== undefined) env.HOME = process.env.HOME;
+  return env;
+}
+
 // A reused clone persists across requests and across task replacements, and
 // the agent works in it, so what it holds is not the runner's to trust: a hook
 // in .git/hooks, a core.fsmonitor or an alias in .git/config would run with the
@@ -366,19 +388,27 @@ function runProcess(command, args, options = {}) {
 // itself runs git there. Every runner git call carries these two settings, the
 // environment repeats them for any git that gh or a script starts, and
 // .git/config is rewritten from a template before the runner uses the clone.
-const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false'];
+const GIT_HARDENING = ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null'];
 
+// No system or global git configuration (a filter or fsmonitor defined there
+// would be run by anything an attributes file names), no system attributes, no
+// replace objects, no prompt, and the three settings above for any git that gh
+// or a script starts.
 function gitEnv() {
-  // GIT_TERMINAL_PROMPT=0 turns a missing credential into a failure instead of
-  // a service that hangs on a password prompt nobody will ever answer.
   return {
-    ...process.env,
+    ...minimalEnv(),
     GIT_TERMINAL_PROMPT: '0',
-    GIT_CONFIG_COUNT: '2',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_ATTR_NOSYSTEM: '1',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_CONFIG_COUNT: '3',
     GIT_CONFIG_KEY_0: 'core.hooksPath',
     GIT_CONFIG_VALUE_0: '/dev/null',
     GIT_CONFIG_KEY_1: 'core.fsmonitor',
     GIT_CONFIG_VALUE_1: 'false',
+    GIT_CONFIG_KEY_2: 'core.attributesFile',
+    GIT_CONFIG_VALUE_2: '/dev/null',
   };
 }
 
@@ -393,12 +423,21 @@ function gitSubcommand(args) {
   return 'command';
 }
 
-async function git(args) {
-  const result = await runProcess('git', [...GIT_HARDENING, ...args], { env: gitEnv() });
+async function git(args, options = {}) {
+  const result = await runProcess('git', [...GIT_HARDENING, ...args], { env: gitEnv(), cwd: options.cwd });
   if (result.code !== 0) {
     throw new Error(`git ${gitSubcommand(args)} failed: ${redact(result.stderr || result.stdout).trim()}`);
   }
   return result.stdout;
+}
+
+// A git call on a request's work tree. The git directory is the runner's, in
+// gitdirs/, and the tree is only a directory the agent writes in: git is told
+// where both are and never discovers a repository from the tree, so nothing
+// the agent leaves in the tree (a .git of its own, attributes, a nested
+// repository) is ever read as a repository.
+async function gitIn(workspace, args) {
+  return git([`--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...args], { cwd: workspace.dir });
 }
 
 // Step 1. Poll. One request, held open by the platform. A 401 is fatal because
@@ -514,8 +553,8 @@ function plainDirectory(target) {
   ownByRunner(target);
 }
 
-function excludeFromGit(dir, entry) {
-  const excludePath = path.join(dir, '.git', 'info', 'exclude');
+function excludeFromGit(gitDir, entry) {
+  const excludePath = path.join(gitDir, 'info', 'exclude');
   plainDirectory(path.dirname(excludePath));
   let stat = null;
   try {
@@ -535,11 +574,20 @@ function excludeFromGit(dir, entry) {
 // no alias, no filter, no fsmonitor, no sshCommand, no credential helper. It is
 // written before the runner uses a clone and again before it stages one, so
 // neither an earlier request nor the agent leaves a setting behind.
-function resetGitDir(dir, cleanUrl) {
-  const gitDir = path.join(dir, '.git');
+function resetGitDir(gitDir, cleanUrl) {
   const stat = fs.lstatSync(gitDir);
-  if (!stat.isDirectory()) throw new Error('.git in the checkout is not a directory, so the checkout cannot be trusted');
-  fs.rmSync(path.join(gitDir, 'hooks'), { recursive: true, force: true });
+  if (!stat.isDirectory()) throw new Error('the git directory is not a directory, so the clone cannot be trusted');
+  // Everything git reads from a git directory that can run a command, name
+  // another object store, rewrite history or change attributes. The runner owns
+  // this directory and the agent never holds it, so none of these is expected;
+  // they are removed anyway, so that the next run does not depend on that.
+  for (const name of [
+    'hooks', 'commondir', 'config.worktree', 'shallow', 'modules', 'worktrees',
+    path.join('refs', 'replace'), path.join('objects', 'info', 'alternates'),
+    path.join('objects', 'info', 'http-alternates'), path.join('info', 'attributes'), path.join('info', 'grafts'),
+  ]) {
+    fs.rmSync(path.join(gitDir, name), { recursive: true, force: true });
+  }
   const configPath = path.join(gitDir, 'config');
   fs.rmSync(configPath, { recursive: true, force: true });
   fs.writeFileSync(
@@ -583,11 +631,75 @@ async function chownTree(dir, who) {
   if (result.code !== 0) throw new Error(`${dir} could not be given to uid ${target.uid}: ${redact(result.stderr).trim()}`);
 }
 
+// The agent is a reduced user but a capable one: what a CI job does, it can do.
+// Its home is on the volume (the runner creates it, owned by the agent and
+// closed to everyone else), so what it installs there with npm, pip --user,
+// cargo, go, gem, mix or mise is still there for the next request. It has no
+// root and no capability, so system packages are not among the things it can
+// install. Its git configuration is its own: an identity for the commits it
+// makes in clones of its own, no credential helper and nothing to push with.
+const AGENT_GITCONFIG = [
+  '[user]',
+  '\tname = sre-agent-fix-agent',
+  '\temail = sre-agent-fix-agent@users.noreply.github.com',
+  '[init]',
+  '\tdefaultBranch = main',
+  '[advice]',
+  '\tdetachedHead = false',
+  '[credential]',
+  '\thelper =',
+  '',
+].join('\n');
+
+function settleAgentHome() {
+  if (identity.mode === 'none') return;
+  const home = identity.agent.home;
+  fs.mkdirSync(home, { recursive: true });
+  const stat = fs.lstatSync(home);
+  if (!stat.isDirectory()) throw new Error(`${home} is not a directory`);
+  fs.chownSync(home, identity.agent.uid, identity.agent.gid);
+  fs.chmodSync(home, 0o700);
+  const gitconfig = path.join(home, '.gitconfig');
+  // lstat rather than existsSync: access(2) judges by the real uid, which holds
+  // none of the runner's capabilities, so it cannot see into the agent's home.
+  let present = true;
+  try {
+    fs.lstatSync(gitconfig);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    present = false;
+  }
+  if (!present) {
+    fs.writeFileSync(gitconfig, AGENT_GITCONFIG, { flag: 'wx', mode: 0o600 });
+    fs.chownSync(gitconfig, identity.agent.uid, identity.agent.gid);
+  }
+}
+
+// Where user-space installs land, and the places a tool looks for them. mise
+// (in the image, on the system PATH) keeps its runtimes under the same home.
+function agentToolEnv(env, home) {
+  const gem = path.join(home, '.local', 'share', 'gem');
+  const mise = path.join(home, '.local', 'share', 'mise');
+  env.NPM_CONFIG_PREFIX = path.join(home, '.npm-global');
+  env.GEM_HOME = gem;
+  env.MISE_DATA_DIR = mise;
+  env.PATH = [
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.npm-global', 'bin'),
+    path.join(home, '.cargo', 'bin'),
+    path.join(home, 'go', 'bin'),
+    path.join(gem, 'bin'),
+    path.join(mise, 'shims'),
+    env.PATH || '',
+  ].join(':');
+}
+
 // The agent gets the current run's checkout and nothing else. A chown rather
 // than a worktree, because the agent runs git in its checkout and a worktree
 // keeps its index and refs in a directory of the main clone it could not
 // write; a clone is a few seconds of chown, once before and once after.
 async function handOver(dir) {
+  settleAgentHome();
   await chownTree(dir, 'agent');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
 }
@@ -626,6 +738,9 @@ async function reclaim(dir) {
   await killAgentProcesses();
   await chownTree(dir, 'runner');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+  // The tree has no git directory of its own, so one that is there is the
+  // agent's. The runner never reads it; it goes so it cannot be mistaken for one.
+  fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
 }
 
 // Once, before the first poll. Every directory the agent walks through is
@@ -649,6 +764,18 @@ async function settleWorkspace(config) {
       fs.chmodSync(clone, 0o700);
     }
   }
+  settleDir(lay.gitdirs, 0o700);
+  for (const owner of fs.readdirSync(lay.gitdirs)) {
+    const ownerDir = path.join(lay.gitdirs, owner);
+    if (!fs.lstatSync(ownerDir).isDirectory()) continue;
+    settleDir(ownerDir, 0o700);
+    for (const name of fs.readdirSync(ownerDir)) {
+      const gitDir = path.join(ownerDir, name);
+      if (!fs.lstatSync(gitDir).isDirectory()) continue;
+      ownByRunner(gitDir);
+      fs.chmodSync(gitDir, 0o700);
+    }
+  }
   settleDir(lay.memory, 0o700);
   settleDir(lay.scratch, 0o700);
   await chownTree(lay.memory, 'runner');
@@ -666,7 +793,10 @@ async function prepareCheckout(config, job, repo) {
   }
   const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
   const authUrl = `https://x-access-token:${config.githubToken}@github.com/${repo.owner}/${repo.name}.git`;
-  const dir = path.join(memory.layout(config.workspace).repos, repo.owner, repo.name);
+  const lay = memory.layout(config.workspace);
+  const dir = path.join(lay.repos, repo.owner, repo.name);
+  const gitdir = path.join(lay.gitdirs, repo.owner, repo.name);
+  const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, authUrl, cleanUrl };
 
   const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', authUrl, 'HEAD'], { env: gitEnv() });
   if (symref.code !== 0) {
@@ -677,49 +807,64 @@ async function prepareCheckout(config, job, repo) {
     throw new Error(`${repo.fullName} did not name a default branch`);
   }
 
-  // A clone is reused only when .git is a real directory: a file there is a
-  // gitfile that sends git to a directory of somebody else's choosing.
-  let gitStat = null;
-  try {
-    gitStat = fs.lstatSync(path.join(dir, '.git'));
-  } catch {
-    gitStat = null;
-  }
-  if (gitStat && !gitStat.isDirectory()) {
-    log('warn', `${repo.fullName}: .git in the clone is not a directory; cloning it again`);
+  const lstatOrNull = (target) => {
+    try {
+      return fs.lstatSync(target);
+    } catch {
+      return null;
+    }
+  };
+  // The git directory lives in gitdirs/, owned by the runner, and the agent is
+  // handed the tree alone. A tree that has a .git of its own is what an earlier
+  // release left (written by an agent that ran as the runner's own account) or
+  // something planted, and nothing in it is trusted: both are removed and the
+  // clone is made again. So is a git directory that is not one.
+  const gitStat = lstatOrNull(gitdir);
+  const goodGitdir = Boolean(gitStat && gitStat.isDirectory() && lstatOrNull(path.join(gitdir, 'HEAD')));
+  if (lstatOrNull(path.join(dir, '.git'))) {
+    log('warn', `${repo.fullName}: the checkout holds a git directory inside the checkout; cloning it again into the runner's own`);
     fs.rmSync(dir, { recursive: true, force: true });
-    gitStat = null;
-  }
-  if (!gitStat) {
+    fs.rmSync(gitdir, { recursive: true, force: true });
+  } else if (!goodGitdir) {
     fs.rmSync(dir, { recursive: true, force: true });
-    settleDir(memory.layout(config.workspace).repos, 0o711);
-    settleDir(path.dirname(dir), 0o711);
-    await git(['clone', authUrl, dir]);
-    await git(['-C', dir, 'remote', 'set-url', 'origin', cleanUrl]);
+    fs.rmSync(gitdir, { recursive: true, force: true });
+  }
+
+  settleDir(lay.repos, 0o711);
+  settleDir(path.dirname(dir), 0o711);
+  settleDir(lay.gitdirs, 0o700);
+  settleDir(path.dirname(gitdir), 0o700);
+  if (!lstatOrNull(gitdir)) {
+    await git(['clone', `--separate-git-dir=${gitdir}`, authUrl, dir]);
+    fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+    resetGitDir(gitdir, cleanUrl);
   } else {
     // Whatever the last run's end left behind is the runner's again before the
-    // runner's git touches it, and git does not read a repository it does not
-    // own.
+    // runner's git touches it.
+    settleDir(dir, 0o700);
     await chownTree(dir, 'runner');
-    resetGitDir(dir, cleanUrl);
-    await git(['-C', dir, 'fetch', '--prune', authUrl, '+refs/heads/*:refs/remotes/origin/*']);
+    fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+    resetGitDir(gitdir, cleanUrl);
+    await gitIn(workspace, ['fetch', '--prune', authUrl, '+refs/heads/*:refs/remotes/origin/*']);
   }
-  resetGitDir(dir, cleanUrl);
+  resetGitDir(gitdir, cleanUrl);
 
   const branch = `sre-agent/${job.handoff_id}`;
+  workspace.branch = branch;
+  workspace.defaultBranch = defaultBranch;
   // -f discards whatever a previous run left behind, so one abandoned run
   // cannot put its changes into the next request's pull request.
-  await git(['-C', dir, 'checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
+  await gitIn(workspace, ['checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
   // -x as well, twice: ignored files (a build directory, a cache, a planted
   // script) are the other half of what a request leaves for the next one, and
   // the second f takes a nested repository with it.
-  await git(['-C', dir, 'clean', '-ffdx']);
+  await gitIn(workspace, ['clean', '-ffdx']);
 
   // The runner keeps the agent's notes in .sre-agent-memory/ in the checkout
   // for the length of a run and deletes it afterwards, so a repository that
   // tracks the name would have its files deleted and staged as a change on
   // every request. Refused with the reason, the way a tracked agent file is.
-  const tracked = await git(['-C', dir, 'ls-files', '-z', '--', MEMORY_COPY]);
+  const tracked = await gitIn(workspace, ['ls-files', '-z', '--', MEMORY_COPY]);
   if (tracked.trim()) {
     throw new Error(
       `${repo.fullName} tracks ${MEMORY_COPY}/, which is where this runner copies the agent's notes for a run and deletes them afterwards; rename or remove that path in the repository, or the runner would stage its deletion in every pull request`
@@ -734,7 +879,7 @@ async function prepareCheckout(config, job, repo) {
   // package's own agent back into an empty tree. This runs after the clean, or
   // the clean would restore them.
   const stripped = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'strip_repo_config.sh'), dir], {
-    env: gitEnv(),
+    env: { ...gitEnv(), GIT_DIR: gitdir, GIT_WORK_TREE: dir },
   });
   if (stripped.code !== 0) {
     throw new Error(`the checkout could not be stripped of its own opencode configuration: ${redact(stripped.stderr).trim()}`);
@@ -746,10 +891,10 @@ async function prepareCheckout(config, job, repo) {
   // The action stages the whole tree in CI and this runner stages the whole
   // tree too, so the agent file has to be invisible to git or it would land in
   // every pull request.
-  excludeFromGit(dir, '.opencode/');
+  excludeFromGit(gitdir, '.opencode/');
 
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
-  return { dir, repo, branch, defaultBranch, authUrl, cleanUrl };
+  return workspace;
 }
 
 function prepareScratch(config) {
@@ -759,7 +904,7 @@ function prepareScratch(config) {
   const dir = memory.layout(config.workspace).scratch;
   fs.rmSync(dir, { recursive: true, force: true });
   settleDir(dir, 0o700);
-  return { dir, repo: null, branch: null, defaultBranch: null, authUrl: null };
+  return { dir, gitdir: null, repo: null, branch: null, defaultBranch: null, authUrl: null, cleanUrl: null };
 }
 
 function writeAgent(config, dir) {
@@ -860,7 +1005,7 @@ function openMemory(config, workspace, repo) {
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(target, entry.content, { mode: entry.mode & 0o777, flag: 'wx' });
   }
-  if (repo) excludeFromGit(workspace.dir, `${MEMORY_COPY}/`);
+  if (repo) excludeFromGit(workspace.gitdir, `${MEMORY_COPY}/`);
 
   return {
     label,
@@ -1024,6 +1169,14 @@ async function runAgent(config, workspace, prompt) {
   // service variables) and reach anything the role holds. The runner's own
   // process keeps them; only the module's agent_aws_access opts the agent in.
   delete env.SRE_AGENT_AWS_ACCESS;
+  // The accounts' numbers are the runner's business, not the agent's.
+  for (const name of Object.keys(env)) {
+    if (/^SRE_(RUNNER|AGENT)_(UID|GID|HOME|USER)$/.test(name)) delete env[name];
+  }
+  if (identity.mode !== 'none') agentToolEnv(env, identity.agent.home);
+  // The tree has no git directory, and git must not go looking above it for a
+  // repository that is not this request's.
+  env.GIT_CEILING_DIRECTORIES = path.dirname(workspace);
   if (!config.agentAwsAccess) {
     for (const name of Object.keys(env)) {
       if (name.startsWith('AWS_') || name.startsWith('ECS_CONTAINER_METADATA_URI')) delete env[name];
@@ -1077,15 +1230,17 @@ async function runAgent(config, workspace, prompt) {
 // changed is judged here, by the same script the CI door uses, before anything
 // is published.
 async function stageAndGate(workspace, memoryBlobs) {
-  const { dir, cleanUrl } = workspace;
-  // The agent has just had the whole checkout, .git included, so what the
-  // runner stages with is rebuilt first: the config, the hooks and the ignore
-  // entries that keep the runner's own files out of the commit.
-  resetGitDir(dir, cleanUrl);
-  excludeFromGit(dir, '.opencode/');
-  excludeFromGit(dir, `${MEMORY_COPY}/`);
-  await git(['-C', dir, 'add', '-A']);
-  const staged = (await git(['-C', dir, 'diff', '--cached', '--name-only']))
+  const { dir, gitdir, cleanUrl } = workspace;
+  // The agent has had the tree and never the git directory, but what the runner
+  // stages with is rebuilt anyway: the config, the hooks and the ignore entries
+  // that keep the runner's own files out of the commit, and a .git in the tree
+  // is not a repository the runner reads.
+  fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+  resetGitDir(gitdir, cleanUrl);
+  excludeFromGit(gitdir, '.opencode/');
+  excludeFromGit(gitdir, `${MEMORY_COPY}/`);
+  await gitIn(workspace, ['add', '-A']);
+  const staged = (await gitIn(workspace, ['diff', '--cached', '--name-only']))
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
@@ -1108,7 +1263,7 @@ async function stageAndGate(workspace, memoryBlobs) {
   // for byte is refused whatever it is called.
   const memoryCopies = [];
   if (memoryBlobs.size > 0) {
-    const raw = await git(['-C', dir, 'diff', '--cached', '--raw', '--abbrev=40', '--no-renames', '-z']);
+    const raw = await gitIn(workspace, ['diff', '--cached', '--raw', '--abbrev=40', '--no-renames', '-z']);
     const tokens = raw.split('\0');
     for (let index = 0; index + 1 < tokens.length; index += 2) {
       const meta = /^:\d+ \d+ [0-9a-f]+ ([0-9a-f]+) [AMT]$/.exec(tokens[index]);
@@ -1147,16 +1302,14 @@ function pullRequestBody(message, brief, version) {
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
 async function publish(config, workspace, message, brief, result) {
-  const { dir, repo, branch, defaultBranch, authUrl } = workspace;
+  const { dir, gitdir, repo, branch, defaultBranch, authUrl } = workspace;
   const title = pullRequestTitle(message, path.basename(branch));
 
   // The identity is set on the command rather than in the repository, because
   // a service account has no git identity of its own and "empty ident name"
   // after the agent has already done its work is a failure the CI door hit
   // once for exactly this reason.
-  await git([
-    '-C',
-    dir,
+  await gitIn(workspace, [
     '-c',
     'user.name=sre-agent-fix-runner',
     '-c',
@@ -1165,13 +1318,19 @@ async function publish(config, workspace, message, brief, result) {
     '-m',
     title,
   ]);
-  await git(['-C', dir, 'push', authUrl, `HEAD:refs/heads/${branch}`]);
+  await gitIn(workspace, ['push', authUrl, `HEAD:refs/heads/${branch}`]);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
   const bodyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-')), 'body.md');
   fs.writeFileSync(bodyPath, pullRequestBody(message, brief, config.version));
 
-  const ghEnv = { ...gitEnv(), GH_TOKEN: config.githubToken, GH_PROMPT_DISABLED: '1' };
+  const ghEnv = {
+    ...gitEnv(),
+    GIT_DIR: gitdir,
+    GIT_WORK_TREE: dir,
+    GH_TOKEN: config.githubToken,
+    GH_PROMPT_DISABLED: '1',
+  };
   const base = [
     'pr',
     'create',
