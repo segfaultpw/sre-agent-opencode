@@ -72,16 +72,49 @@ const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 //         ambient capabilities, and starts opencode through setpriv, which
 //         switches to the agent's account and clears the capabilities, because
 //         an ambient capability would otherwise survive into the agent.
-//   none  No agent account is configured (a developer's machine, the tests):
-//         the agent runs as the runner's own account, so nothing the scrub of
-//         its environment removes is out of its reach, and the log says so.
+//   none  No agent account is configured (a developer's machine, the tests), or
+//         a start that was asked for the split and cannot make it because it
+//         lacks the capabilities (identity.degraded says which): the agent runs
+//         as the runner's own account, so nothing the scrub of its environment
+//         removes is out of its reach, and the log and every report say so.
 //
-// The agent is handed the current run's checkout only, by chown for the length
-// of the run, and the runner takes it back before it reads or stages a byte.
-// /workspace/memory, the runner's environment (procfs refuses another uid) and
-// every other clone stay the runner's account's alone.
+// The agent is handed the current run's checkout and its own home for that
+// repository only, by chown for the length of the run, and the runner takes
+// both back before it reads or stages a byte. /workspace/memory, the runner's
+// environment (procfs refuses another uid) and every other clone and home stay
+// the runner's account's alone.
 const NO_IDENTITY = { mode: 'none', runner: null, agent: null };
 let identity = NO_IDENTITY;
+// The runner's own HOME for every git, gh and aws call it makes (see launch).
+// Null with no account split, where the process's own HOME stands.
+let runnerHomeDir = null;
+
+// What switching to another account takes, by capability number: CAP_CHOWN 0,
+// CAP_DAC_OVERRIDE 1, CAP_FOWNER 3, CAP_KILL 5, CAP_SETGID 6, CAP_SETUID 7.
+const REQUIRED_CAPABILITIES = [
+  ['CAP_CHOWN', 0],
+  ['CAP_DAC_OVERRIDE', 1],
+  ['CAP_FOWNER', 3],
+  ['CAP_KILL', 5],
+  ['CAP_SETGID', 6],
+  ['CAP_SETUID', 7],
+];
+
+// The effective capability set of this process, or null where it cannot be read
+// (not Linux): then the configured split is trusted rather than second-guessed.
+function readEffectiveCapabilities() {
+  try {
+    const match = /^CapEff:\s*([0-9a-fA-F]+)\s*$/m.exec(fs.readFileSync('/proc/self/status', 'utf8'));
+    return match ? BigInt(`0x${match[1]}`) : null;
+  } catch {
+    return null;
+  }
+}
+
+function missingCapabilities(effective) {
+  if (effective === null) return [];
+  return REQUIRED_CAPABILITIES.filter(([, bit]) => ((effective >> BigInt(bit)) & 1n) === 0n).map(([name]) => name);
+}
 
 function idFrom(env, name) {
   const raw = env[name];
@@ -96,27 +129,44 @@ function accountFrom(env, prefix) {
   return { uid, gid, home, complete: uid !== null && gid !== null && path.isAbsolute(home) };
 }
 
-function loadIdentity(env, own) {
+// A start that asked for the split and cannot make it (a Kubernetes pod that
+// drops every capability, a unit missing one) is not a crash loop: it runs as
+// one account, as every release before 1.5.0 did, and says so wherever a person
+// would look. The sentence is the log's and the report's evidence.
+function degradedIdentity(own, env, missing) {
+  const list = REQUIRED_CAPABILITIES.map(([name]) => name.replace(/^CAP_/, '')).join(', ');
+  return {
+    mode: 'none',
+    runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' },
+    agent: null,
+    degraded: `the agent account split is off: this start lacks ${missing.join(', ')} (switching to the agent's account takes ${list}), so the agent runs as the runner's own account (one account), as in releases before v1.5.0, and taking credentials out of its environment is not a boundary`,
+  };
+}
+
+function loadIdentity(env, own, effective = readEffectiveCapabilities()) {
   const agent = accountFrom(env, 'SRE_AGENT');
+  const missing = missingCapabilities(effective);
   if (own.uid === 0) {
     const runner = accountFrom(env, 'SRE_RUNNER');
-    const missing = [];
+    const absent = [];
     for (const [prefix, account] of [['SRE_RUNNER', runner], ['SRE_AGENT', agent]]) {
-      if (!account.complete) missing.push(`${prefix}_UID, ${prefix}_GID and ${prefix}_HOME`);
+      if (!account.complete) absent.push(`${prefix}_UID, ${prefix}_GID and ${prefix}_HOME`);
     }
-    if (missing.length > 0) {
+    if (absent.length > 0) {
       throw fatal(
-        `the runner is root, which it only is to start the agent as another account, and needs ${missing.join(' and ')} (the container entrypoint sets them from SRE_RUNNER_USER and SRE_AGENT_USER)`
+        `the runner is root, which it only is to start the agent as another account, and needs ${absent.join(' and ')} (the container entrypoint sets them from SRE_RUNNER_USER and SRE_AGENT_USER)`
       );
     }
     if (runner.uid === 0 || agent.uid === 0 || runner.uid === agent.uid) {
       throw fatal('SRE_RUNNER_UID and SRE_AGENT_UID must be different accounts, and neither may be root');
     }
+    if (missing.length > 0) return degradedIdentity(own, env, missing);
     return { mode: 'root', runner, agent };
   }
   if (env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '') {
     if (!agent.complete) throw fatal('SRE_AGENT_UID needs SRE_AGENT_GID and an absolute SRE_AGENT_HOME with it');
     if (agent.uid === own.uid) throw fatal('SRE_AGENT_UID is the runner\'s own account, which would split nothing');
+    if (missing.length > 0) return degradedIdentity(own, env, missing);
     return { mode: 'caps', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent };
   }
   return { mode: 'none', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent: null };
@@ -305,11 +355,18 @@ function killGroup(pid, signal) {
 // Which account a child runs as. 'runner' is the default, so a git call, a gh
 // call or a script is never the agent's or root's by omission; 'agent' is
 // opencode and nothing else; 'root' is the chown that hands a checkout over.
-function launch(command, args, env, as) {
+//
+// HOME is never an account's old home. The agent's is the one for the
+// repository of this run (`home`), and everything else the runner starts has the
+// runner-only directory settleRunnerHome made: what an earlier release's agent
+// could write in the account's own home (an ~/.aws/config with a
+// credential_process, a gh configuration) is not read by the runner's aws and gh.
+function launch(command, args, env, as, home) {
   const base = env || minimalEnv();
   if (identity.mode === 'root' && as !== 'root') {
     const who = as === 'agent' ? identity.agent : identity.runner;
-    return { command, args, env: { ...base, HOME: who.home }, ids: { uid: who.uid, gid: who.gid } };
+    const childHome = as === 'agent' ? home || who.home : runnerHomeDir || who.home;
+    return { command, args, env: { ...base, HOME: childHome }, ids: { uid: who.uid, gid: who.gid } };
   }
   if (identity.mode === 'caps' && as === 'agent') {
     return {
@@ -324,7 +381,7 @@ function launch(command, args, env, as) {
         command,
         ...args,
       ],
-      env: { ...base, HOME: identity.agent.home },
+      env: { ...base, HOME: home || identity.agent.home },
       ids: {},
     };
   }
@@ -332,8 +389,8 @@ function launch(command, args, env, as) {
 }
 
 function runProcess(command, args, options = {}) {
-  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner' } = options;
-  const launched = launch(command, args, requestedEnv, as);
+  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null } = options;
+  const launched = launch(command, args, requestedEnv, as, home);
   const env = launched.env;
   return new Promise((resolve) => {
     // Its own process group: opencode starts a local server of its own, and a
@@ -418,8 +475,10 @@ function runProcess(command, args, options = {}) {
 // enough to find its programs, its certificates and its proxy, and nothing else.
 // The poll key, the model setting, the provider key and the AWS variables are
 // the runner's alone, and a git or gh call has no use for any of them; the
-// repository token travels in the URL of the calls that reach GitHub, and gh
-// is given it as its own variable.
+// repository token reaches the git calls that talk to GitHub through their
+// environment (gitAuthEnv), and gh is given it as its own variable. It is on no
+// command line: another account reads /proc/<pid>/cmdline, and a process the
+// agent left running would see every URL the runner passed to git.
 const ENV_PASSTHROUGH = [
   'PATH', 'TMPDIR', 'LANG', 'LC_ALL', 'TZ',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CURL_CA_BUNDLE', 'GIT_SSL_CAINFO',
@@ -472,7 +531,8 @@ function minimalEnv() {
   for (const name of ENV_PASSTHROUGH) {
     if (process.env[name] !== undefined) env[name] = process.env[name];
   }
-  if (process.env.HOME !== undefined) env.HOME = process.env.HOME;
+  if (runnerHomeDir) env.HOME = runnerHomeDir;
+  else if (process.env.HOME !== undefined) env.HOME = process.env.HOME;
   return env;
 }
 
@@ -507,6 +567,25 @@ function gitEnv() {
   };
 }
 
+// What a git call that talks to GitHub is given on top of gitEnv(): a credential
+// helper for https://github.com alone (no other host is answered, and the empty
+// helper before it clears any other), which reads the token from this process's
+// environment. The helper is a shell function git runs itself, so the token is in
+// the environment of the git process and its helper and in no argument of either.
+const GIT_CREDENTIAL_HELPER = '!f() { test "$1" = get && echo username=x-access-token && echo "password=$RUNNER_GIT_PASSWORD"; }; f';
+
+function gitAuthEnv(token) {
+  return {
+    ...gitEnv(),
+    GIT_CONFIG_COUNT: '5',
+    GIT_CONFIG_KEY_3: 'credential.helper',
+    GIT_CONFIG_VALUE_3: '',
+    GIT_CONFIG_KEY_4: 'credential.https://github.com.helper',
+    GIT_CONFIG_VALUE_4: GIT_CREDENTIAL_HELPER,
+    RUNNER_GIT_PASSWORD: token,
+  };
+}
+
 function gitSubcommand(args) {
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === '-C' || args[index] === '-c') {
@@ -519,7 +598,8 @@ function gitSubcommand(args) {
 }
 
 async function git(args, options = {}) {
-  const result = await runProcess('git', [...GIT_HARDENING, ...args], { env: gitEnv(), cwd: options.cwd });
+  const env = options.token ? gitAuthEnv(options.token) : gitEnv();
+  const result = await runProcess('git', [...GIT_HARDENING, ...args], { env, cwd: options.cwd });
   if (result.code !== 0) {
     throw new Error(`git ${gitSubcommand(args)} failed: ${redact(result.stderr || result.stdout).trim()}`);
   }
@@ -530,9 +610,10 @@ async function git(args, options = {}) {
 // gitdirs/, and the tree is only a directory the agent writes in: git is told
 // where both are and never discovers a repository from the tree, so nothing
 // the agent leaves in the tree (a .git of its own, attributes, a nested
-// repository) is ever read as a repository.
-async function gitIn(workspace, args) {
-  return git([`--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...args], { cwd: workspace.dir });
+// repository) is ever read as a repository. `token` is given to the calls that
+// reach GitHub (fetch, push) and to no other.
+async function gitIn(workspace, args, token = null) {
+  return git([`--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...args], { cwd: workspace.dir, token });
 }
 
 // Step 1. Poll. One request, held open by the platform. A 401 is fatal because
@@ -726,17 +807,30 @@ async function chownTree(dir, who) {
   if (result.code !== 0) throw new Error(`${dir} could not be given to uid ${target.uid}: ${redact(result.stderr).trim()}`);
 }
 
-// The agent is a reduced user but a capable one: what a CI job does, it can do.
-// Its home is on the volume (the runner creates it, owned by the agent and
-// closed to everyone else), so what it installs there with npm, pip --user,
-// cargo, go, gem, mix or mise is still there for the next request. It has no
-// root and no capability, so system packages are not among the things it can
-// install. Its git configuration is its own: an identity for the commits it
-// makes in clones of its own, and a credential helper for github.com that
-// answers with GH_TOKEN from its environment, so it can clone private
-// repositories without the token ever being written into its home. The token
-// can push as well as clone; what stops a push is the package's fence on git
-// push, and it is the runner that pushes.
+// The agent is a reduced but capable user, much as a CI job would be. It has a
+// home for each repository, on the volume (agent-home/<owner>/<repo>, and
+// agent-home/_estate for requests that name none), so what it installs there
+// with npm, pip --user, cargo, go, gem, mix or mise is still there for the next
+// request about that repository, like a CI cache. It has no root and no
+// capability, so system packages are not among the things it can install.
+//
+// Nothing a run leaves in its home reaches another repository's runs. The
+// directories above the homes are the runner's (0711: walked through, never
+// listed), a home belongs to the agent only for the length of its own run and to
+// the runner (0700) before and after, so the agent's account cannot enter a home
+// no run is using whatever its files are owned by. And the runner removes from
+// the home it hands over everything opencode loads by itself (configuration,
+// plugins, agent definitions and instructions under .config/opencode and
+// .opencode, Claude Code's files, external skills), because a plugin runs before
+// any gate is consulted: that is opencode's loader, the same one
+// scripts/strip_repo_config.sh closes for a repository's own files.
+//
+// Its git configuration is its own: an identity for the commits it makes in
+// clones of its own, and a credential helper for github.com that answers with
+// GH_TOKEN from its environment, so it can clone private repositories without
+// the token ever being written into its home. The token can push as well as
+// clone; what stops a push is the package's fence on git push, and it is the
+// runner that pushes.
 const AGENT_GITCONFIG = [
   '[user]',
   '\tname = sre-agent-fix-agent',
@@ -752,32 +846,221 @@ const AGENT_GITCONFIG = [
   '',
 ].join('\n');
 
-function settleAgentHome() {
-  if (identity.mode === 'none') return;
-  const home = identity.agent.home;
-  fs.mkdirSync(home, { recursive: true });
-  const stat = fs.lstatSync(home);
-  if (!stat.isDirectory()) throw new Error(`${home} is not a directory`);
-  fs.chownSync(home, identity.agent.uid, identity.agent.gid);
-  fs.chmodSync(home, 0o700);
-  const gitconfig = path.join(home, '.gitconfig');
-  // lstat rather than existsSync: access(2) judges by the real uid, which holds
-  // none of the runner's capabilities, so it cannot see into the agent's home.
-  let present = true;
+// What opencode loads from a home without being told to. Removed whole, before
+// every run; the tool directories (.local, .npm-global, .cargo, go, mise's data)
+// run only when the agent invokes them, so they stay.
+const AGENT_HOME_SCRUB = ['.config/opencode', '.opencode', '.claude', '.claude.json', '.agents'];
+
+// The switches the pinned opencode reads that stop it loading plugins, Claude
+// Code's files and external skills on its own. They are belt and braces: the
+// removal above is what keeps a planted agent definition or configuration out,
+// and tests/dry_run_test.sh runs the real binary to show both.
+const AUTOLOAD_SWITCHES = {
+  OPENCODE_DISABLE_CLAUDE_CODE: '1',
+  OPENCODE_DISABLE_CLAUDE_CODE_PROMPT: '1',
+  OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: '1',
+  OPENCODE_DISABLE_EXTERNAL_SKILLS: '1',
+  OPENCODE_PURE: '1',
+};
+
+// The size bound for the one file the runner reads as root in the agent's home
+// (.gitconfig). The template is under 1 KiB.
+const AGENT_FILE_MAX_BYTES = 65_536;
+
+// The environment that points opencode at one home and away from everything
+// else: the switches above, and its configuration, data, cache and state
+// directories under that home whatever the runner's own environment said, so the
+// directories the runner scrubbed are the ones it reads. With no home (no account
+// split, a developer's machine) only the switches are set and nothing is moved.
+function applyAgentHomeEnv(env, home) {
+  Object.assign(env, AUTOLOAD_SWITCHES);
+  if (!home) return;
+  env.XDG_CONFIG_HOME = path.join(home, '.config');
+  env.XDG_DATA_HOME = path.join(home, '.local', 'share');
+  env.XDG_CACHE_HOME = path.join(home, '.cache');
+  env.XDG_STATE_HOME = path.join(home, '.local', 'state');
+}
+
+function agentHomeFor(repo) {
+  const base = identity.agent.home;
+  return repo ? path.join(base, repo.owner, repo.name) : path.join(base, memory.ESTATE);
+}
+
+// A directory that is really one, owned by `who`, with `mode`. What is in its
+// place and is not a directory (a link above all) is removed, never followed:
+// the runner chowns and chmods these as root, and a link would send that
+// anywhere.
+function ensureDirectory(target, who, mode) {
+  let stat = null;
   try {
-    fs.lstatSync(gitconfig);
+    stat = fs.lstatSync(target);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
-    present = false;
   }
-  // The runner's file: rewritten whenever it differs from the template, so a
-  // change to it reaches homes made by an earlier release. What the agent wants
-  // of its own goes in ~/.config/git/config, which git also reads.
-  if (!present || fs.readFileSync(gitconfig, 'utf8') !== AGENT_GITCONFIG) {
-    fs.rmSync(gitconfig, { force: true });
-    fs.writeFileSync(gitconfig, AGENT_GITCONFIG, { flag: 'wx', mode: 0o600 });
-    fs.chownSync(gitconfig, identity.agent.uid, identity.agent.gid);
+  if (stat && !stat.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
+  fs.mkdirSync(target, { recursive: true });
+  fs.lchownSync(target, who.uid, who.gid);
+  fs.chmodSync(target, mode);
+}
+
+// Removes `relative` below `root` without ever following a link: a link or a
+// file where a directory on the way belongs is removed itself and the walk
+// stops, so a .config that points at /usr/local/bin cannot make the removal of
+// .config/opencode delete /usr/local/bin/opencode.
+function removeBelow(root, relative) {
+  const parts = relative.split('/');
+  let current = root;
+  for (const part of parts.slice(0, -1)) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return;
+      throw error;
+    }
+    if (!stat.isDirectory()) {
+      fs.rmSync(current, { recursive: true, force: true });
+      return;
+    }
   }
+  fs.rmSync(path.join(current, parts[parts.length - 1]), { recursive: true, force: true });
+}
+
+// A regular file of at most `max` bytes, read through a descriptor that was
+// opened without following a link and without blocking: the agent writes this
+// directory, so the name can be a FIFO (a read would wait for ever), a link to
+// /dev/zero (a read would never end) or a directory.
+// { state: 'absent' | 'bad' | 'ok', content }.
+function readSmallRegularFile(file, max) {
+  const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
+  let fd;
+  try {
+    fd = fs.openSync(file, flags);
+  } catch (error) {
+    return { state: error.code === 'ENOENT' ? 'absent' : 'bad' };
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > max) return { state: 'bad' };
+    const content = Buffer.alloc(stat.size);
+    let read = 0;
+    while (read < stat.size) {
+      const count = fs.readSync(fd, content, read, stat.size - read, read);
+      if (count === 0) break;
+      read += count;
+    }
+    return { state: 'ok', content: content.subarray(0, read) };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// The runner's file in the home, rewritten whenever it differs from the template,
+// so a change to it reaches homes made by an earlier release. What the agent
+// wants of its own goes in .config/git/config, which git also reads. It is
+// created exclusively and handed over through its descriptor, so a link planted
+// between the removal and the write is never followed.
+function writeAgentGitconfig(home) {
+  const gitconfig = path.join(home, '.gitconfig');
+  const found = readSmallRegularFile(gitconfig, AGENT_FILE_MAX_BYTES);
+  if (found.state === 'ok' && found.content.toString('utf8') === AGENT_GITCONFIG) return;
+  fs.rmSync(gitconfig, { recursive: true, force: true });
+  const fd = fs.openSync(gitconfig, 'wx', 0o600);
+  try {
+    fs.writeSync(fd, AGENT_GITCONFIG);
+    fs.fchownSync(fd, identity.agent.uid, identity.agent.gid);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function checkAgentHomeBase(base) {
+  if (!path.isAbsolute(base) || path.resolve(base) === path.parse(base).root) {
+    throw new Error(`the agent home ${base} is the root of the file system or not an absolute path, which the runner will not manage`);
+  }
+  if (identity.runner && identity.runner.home && path.resolve(identity.runner.home) === path.resolve(base)) {
+    throw new Error(`the agent home ${base} is the runner's own home, which the runner will not hand to the agent`);
+  }
+}
+
+// Before a run: the directories above the home are the runner's, the home is the
+// agent's, nothing opencode loads on its own is left in it, and the git
+// configuration is the template.
+function settleAgentHome(home) {
+  if (identity.mode === 'none') return;
+  const base = identity.agent.home;
+  checkAgentHomeBase(base);
+  ensureDirectory(base, identity.runner, 0o711);
+  const relative = path.relative(base, home);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(`${home} is not a home under the agent home ${base}`);
+  }
+  let current = base;
+  for (const part of relative.split(path.sep).slice(0, -1)) {
+    current = path.join(current, part);
+    ensureDirectory(current, identity.runner, 0o711);
+  }
+  ensureDirectory(home, identity.agent, 0o700);
+  for (const name of AGENT_HOME_SCRUB) removeBelow(home, name);
+  writeAgentGitconfig(home);
+}
+
+// After a run, and for every home at start: back to the runner, 0700, so the
+// agent's account cannot enter a home that no run is using. Only the directory
+// itself changes hands (what is inside stays the agent's, and unreachable).
+function closeAgentHome(home) {
+  if (identity.mode === 'none' || !home) return;
+  let stat;
+  try {
+    stat = fs.lstatSync(home);
+  } catch {
+    return;
+  }
+  if (!stat.isDirectory()) return;
+  fs.lchownSync(home, identity.runner.uid, identity.runner.gid);
+  fs.chmodSync(home, 0o700);
+}
+
+function closeAllAgentHomes() {
+  if (identity.mode === 'none') return;
+  const base = identity.agent.home;
+  checkAgentHomeBase(base);
+  ensureDirectory(base, identity.runner, 0o711);
+  for (const entry of fs.readdirSync(base)) {
+    const entryPath = path.join(base, entry);
+    let stat = fs.lstatSync(entryPath);
+    if (!stat.isDirectory()) continue;
+    if (entry === memory.ESTATE) {
+      closeAgentHome(entryPath);
+      continue;
+    }
+    ensureDirectory(entryPath, identity.runner, 0o711);
+    for (const name of fs.readdirSync(entryPath)) {
+      stat = fs.lstatSync(path.join(entryPath, name));
+      if (stat.isDirectory()) closeAgentHome(path.join(entryPath, name));
+    }
+  }
+}
+
+// The runner's HOME for its own git, gh and aws calls: a directory of its own,
+// 0700, beside the account's old home and not in it. On a host the account's home
+// is the state directory that an earlier release's agent, which was the same
+// account, could write: an AWS CLI configuration with a credential_process or a
+// gh configuration there would run with the runner's credentials. Nothing in this
+// directory is written by anyone but the runner's own tools.
+function settleRunnerHome() {
+  if (identity.mode === 'none') {
+    runnerHomeDir = null;
+    return;
+  }
+  const parent = identity.runner.home;
+  if (!path.isAbsolute(parent) || path.resolve(parent) === path.parse(parent).root) {
+    throw fatal('the runner needs an absolute HOME of its own (the account\'s home directory) to keep the home of its own git, gh and aws calls in');
+  }
+  const dir = path.join(parent, 'runner-home');
+  ensureDirectory(dir, identity.runner, 0o700);
+  runnerHomeDir = dir;
 }
 
 // Where user-space installs land, and the places a tool looks for them. mise
@@ -803,12 +1086,13 @@ function agentToolEnv(env, home) {
   ].join(':');
 }
 
-// The agent gets the current run's checkout and nothing else. A chown rather
-// than a worktree, because the agent runs git in its checkout and a worktree
-// keeps its index and refs in a directory of the main clone it could not
-// write; a clone is a few seconds of chown, once before and once after.
-async function handOver(dir) {
-  settleAgentHome();
+// The agent gets the current run's checkout and its home for this repository,
+// and nothing else. A chown rather than a worktree, because the agent runs git in
+// its checkout and a worktree keeps its index and refs in a directory of the main
+// clone it could not write; a clone is a few seconds of chown, once before and
+// once after.
+async function handOver(dir, home) {
+  settleAgentHome(home);
   await chownTree(dir, 'agent');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
 }
@@ -844,7 +1128,7 @@ async function makeBaseBundle(workspace) {
   }
 }
 
-async function initAgentRepository(workspace, bundle) {
+async function initAgentRepository(workspace, bundle, home) {
   const made = await runProcess(
     'bash',
     [
@@ -855,50 +1139,71 @@ async function initAgentRepository(workspace, bundle) {
       workspace.baseSha,
       workspace.cleanUrl,
     ],
-    { cwd: workspace.dir, env: gitEnv(), as: 'agent', timeoutMs: 300_000 }
+    { cwd: workspace.dir, env: gitEnv(), as: 'agent', home, timeoutMs: 300_000 }
   );
   if (made.code !== 0) {
     throw new Error(`the agent's repository could not be made from the base commit: ${redact(made.stderr || made.stdout).trim()}`);
   }
 }
 
-// A process the agent left behind (a daemon it started, something that put
-// itself in another session) is the agent's uid's, and the uid is what lets the
-// runner find it. Zombies have nothing left to kill.
-async function killAgentProcesses() {
-  if (identity.mode === 'none') return;
-  for (let round = 0; round < 5; round += 1) {
-    let found = 0;
-    for (const entry of fs.readdirSync('/proc')) {
-      if (!/^[0-9]+$/.test(entry)) continue;
-      let status;
-      try {
-        status = fs.readFileSync(`/proc/${entry}/status`, 'utf8');
-      } catch {
-        continue;
-      }
-      const uids = /^Uid:\s+(\d+)\s+(\d+)/m.exec(status);
-      if (!uids || (Number(uids[1]) !== identity.agent.uid && Number(uids[2]) !== identity.agent.uid)) continue;
-      if (/^State:\s+Z/m.test(status)) continue;
-      try {
-        process.kill(Number(entry), 'SIGKILL');
-        found += 1;
-      } catch {
-        // Gone already, which is what the kill was after.
-      }
+// The pids of every process running as the agent's account (real or effective
+// uid). Zombies have nothing left to kill.
+function agentProcesses() {
+  const found = [];
+  for (const entry of fs.readdirSync('/proc')) {
+    if (!/^[0-9]+$/.test(entry)) continue;
+    let status;
+    try {
+      status = fs.readFileSync(`/proc/${entry}/status`, 'utf8');
+    } catch {
+      continue;
     }
-    if (found === 0) return;
-    await sleep(50);
+    const uids = /^Uid:\s+(\d+)\s+(\d+)/m.exec(status);
+    if (!uids || (Number(uids[1]) !== identity.agent.uid && Number(uids[2]) !== identity.agent.uid)) continue;
+    if (/^State:\s+Z/m.test(status)) continue;
+    found.push(Number(entry));
   }
+  return found;
 }
 
-async function reclaim(dir) {
-  await killAgentProcesses();
+// A process the agent left behind (a daemon it started, something that put
+// itself in another session, a fork loop) is the agent's uid's, and the uid is
+// what lets the runner find it. The kill is kill(-1) made as the agent's own
+// account: the kernel signals every process that account may signal in one pass,
+// and a fork cannot slip between a scan and a kill the way it does between
+// readdir and kill(pid). The scan afterwards is the check. Returns whether every
+// process of the account is gone; when one is not, the caller says so and
+// publishes nothing.
+async function killAgentProcesses() {
+  if (identity.mode === 'none') return true;
+  for (let round = 0; round < 20; round += 1) {
+    if (agentProcesses().length === 0) return true;
+    await runProcess(process.execPath, ['-e', "try { process.kill(-1, 'SIGKILL'); } catch {}"], {
+      env: { PATH: process.env.PATH || '' },
+      as: 'agent',
+      timeoutMs: 10_000,
+    });
+    await sleep(50);
+  }
+  const left = agentProcesses();
+  if (left.length === 0) return true;
+  log('error', `${left.length} process${left.length === 1 ? '' : 'es'} of the agent's account (pid ${left.slice(0, 5).join(', ')}) could not be ended after 20 attempts`);
+  return false;
+}
+
+// Takes the agent's processes, its home and the checkout back, in that order, and
+// answers whether the account is quiet. The home goes back first, so that even a
+// checkout that cannot be taken back leaves the agent unable to enter a home no
+// run is using.
+async function reclaim(dir, home) {
+  const quiet = await killAgentProcesses();
+  closeAgentHome(home);
   await chownTree(dir, 'runner');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
   // The repository in the tree is the agent's. The runner never reads it; it
   // goes so it cannot be mistaken for the runner's.
   fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+  return quiet;
 }
 
 // Once, before the first poll. Every directory the agent walks through is
@@ -906,7 +1211,9 @@ async function reclaim(dir) {
 // clones with a directory per owner above them, and an older runner created
 // everything for its one account.
 async function settleWorkspace(config) {
+  settleRunnerHome();
   if (identity.mode === 'none') return;
+  closeAllAgentHomes();
   const base = path.resolve(config.workspace);
   const lay = memory.layout(base);
   settleDir(base, 0o711);
@@ -941,22 +1248,23 @@ async function settleWorkspace(config) {
   if (closed.code !== 0) throw new Error(`the memory directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
 }
 
-// Step 3. Prepare the workspace. The credential is passed on the command line
-// for the calls that need it and origin keeps the clean URL, so a token is
-// never written into .git/config where a later run, or the operator, would
-// find it.
+// Step 3. Prepare the workspace. The credential reaches the calls that need it
+// through their environment (gitAuthEnv) and every URL is the clean one, so a
+// token is on no command line and never written into .git/config where a later
+// run, or the operator, would find it.
 async function prepareCheckout(config, job, repo) {
   if (!config.githubToken) {
     throw new Error('this request names a repository and the runner has no SRE_GITHUB_TOKEN to reach it with');
   }
   const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
-  const authUrl = `https://x-access-token:${config.githubToken}@github.com/${repo.owner}/${repo.name}.git`;
   const lay = memory.layout(config.workspace);
   const dir = path.join(lay.repos, repo.owner, repo.name);
   const gitdir = path.join(lay.gitdirs, repo.owner, repo.name);
-  const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, authUrl, cleanUrl, baseSha: null };
+  const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, cleanUrl, baseSha: null };
 
-  const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', authUrl, 'HEAD'], { env: gitEnv() });
+  const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', cleanUrl, 'HEAD'], {
+    env: gitAuthEnv(config.githubToken),
+  });
   if (symref.code !== 0) {
     throw new Error(`${repo.fullName} could not be reached: ${redact(symref.stderr).trim()}`);
   }
@@ -993,7 +1301,7 @@ async function prepareCheckout(config, job, repo) {
   settleDir(lay.gitdirs, 0o700);
   settleDir(path.dirname(gitdir), 0o700);
   if (!lstatOrNull(gitdir)) {
-    await git(['clone', `--separate-git-dir=${gitdir}`, authUrl, dir]);
+    await git(['clone', `--separate-git-dir=${gitdir}`, cleanUrl, dir], { token: config.githubToken });
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
   } else {
@@ -1003,7 +1311,7 @@ async function prepareCheckout(config, job, repo) {
     await chownTree(dir, 'runner');
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
-    await gitIn(workspace, ['fetch', '--prune', authUrl, '+refs/heads/*:refs/remotes/origin/*']);
+    await gitIn(workspace, ['fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], config.githubToken);
   }
   resetGitDir(gitdir, cleanUrl);
 
@@ -1063,7 +1371,7 @@ function prepareScratch(config) {
   const dir = memory.layout(config.workspace).scratch;
   fs.rmSync(dir, { recursive: true, force: true });
   settleDir(dir, 0o700);
-  return { dir, gitdir: null, repo: null, branch: null, defaultBranch: null, authUrl: null, cleanUrl: null };
+  return { dir, gitdir: null, repo: null, branch: null, defaultBranch: null, cleanUrl: null };
 }
 
 function writeAgent(config, dir) {
@@ -1354,7 +1662,14 @@ async function runAgent(config, workspace, prompt, options = {}) {
   for (const name of Object.keys(env)) {
     if (/^SRE_(RUNNER|AGENT)_(UID|GID|HOME|USER)$/.test(name)) delete env[name];
   }
-  if (identity.mode !== 'none') agentToolEnv(env, identity.agent.home);
+  if (identity.mode !== 'none') {
+    // The home of this run's repository, and opencode pointed at it and away from
+    // anything it would load on its own.
+    agentToolEnv(env, options.home);
+    applyAgentHomeEnv(env, options.home);
+  } else {
+    applyAgentHomeEnv(env, null);
+  }
   // The tree holds the agent's own repository, and git must not go looking
   // above it for one that is not this request's.
   env.GIT_CEILING_DIRECTORIES = path.dirname(workspace);
@@ -1372,6 +1687,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
     env,
     input: prompt,
     as: 'agent',
+    home: options.home,
     timeoutMs: options.timeoutMs || config.runTimeoutMs,
   });
 
@@ -1499,7 +1815,7 @@ function pullRequestBody(message, brief, version) {
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
 async function publish(config, workspace, message, brief, result) {
-  const { dir, gitdir, repo, branch, defaultBranch, authUrl } = workspace;
+  const { dir, gitdir, repo, branch, defaultBranch, cleanUrl } = workspace;
   const title = pullRequestTitle(message, path.basename(branch));
 
   // The identity is set on the command rather than in the repository, because
@@ -1515,7 +1831,7 @@ async function publish(config, workspace, message, brief, result) {
     '-m',
     title,
   ]);
-  await gitIn(workspace, ['push', authUrl, `HEAD:refs/heads/${branch}`]);
+  await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], config.githubToken);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
   const bodyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-')), 'body.md');
@@ -1677,7 +1993,13 @@ function newResult(config) {
     outcome: 'not_validated',
     summary: '',
     actions: [],
-    evidence: { runner_version: `v${config.version}`, model: config.model },
+    evidence: {
+      runner_version: `v${config.version}`,
+      model: config.model,
+      // A start that was asked for the account split and could not make it says
+      // so in every report, not only in the log: the card is where it is read.
+      ...(config.identity && config.identity.degraded ? { agent_isolation: config.identity.degraded } : {}),
+    },
     // For the report of what the run did to its memory. memoryChanges is the
     // report's list (at most fifty); memoryMirror is every change, which is what
     // the bucket is told.
@@ -1831,14 +2153,17 @@ async function runTestJob(config, job) {
       writeAgent(config, scratch.dir);
       const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
       let agent;
+      let quiet = true;
+      const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
       try {
-        await handOver(scratch.dir);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs });
+        await handOver(scratch.dir, home);
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home });
       } finally {
-        await reclaim(scratch.dir);
+        quiet = await reclaim(scratch.dir, home);
       }
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
+      if (!quiet) return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
       return modelVerdict(agent, timeoutMs);
     });
 
@@ -1893,6 +2218,7 @@ async function runTestJob(config, job) {
 
 async function handleJob(config, job) {
   identity = config.identity || NO_IDENTITY;
+  settleRunnerHome();
   if (!job || !job.handoff_id || !job.report_url || !job.token) {
     log('error', 'the queue answered with a job carrying no handoff id, report URL or credential; skipping it');
     return;
@@ -1934,14 +2260,18 @@ async function handleJob(config, job) {
     }
     let agent;
     let reclaimed = false;
+    let agentProcessesEnded = true;
+    // The agent's home for this repository, or for the estate; none without an
+    // account split, where the process's own home stands.
+    const home = identity.mode !== 'none' ? agentHomeFor(repo) : null;
     // Made while the tree is still the runner's: the bundle needs the runner's
     // git directory, and nothing of the agent's.
     const bundle = repo ? await makeBaseBundle(workspace) : null;
     try {
-      await handOver(workspace.dir);
-      if (repo) await initAgentRepository(workspace, bundle);
+      await handOver(workspace.dir, home);
+      if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief);
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -1949,7 +2279,7 @@ async function handleJob(config, job) {
       // copy is dropped unread.
       try {
         if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-        await reclaim(workspace.dir);
+        agentProcessesEnded = await reclaim(workspace.dir, home);
         reclaimed = true;
       } finally {
         if (mem && reclaimed) closeMemory(mem, result);
@@ -1959,6 +2289,17 @@ async function handleJob(config, job) {
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
     if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors;
+
+    if (!agentProcessesEnded) {
+      // A process of the agent's account outlived every attempt to end it. It
+      // can still change what the gate is about to judge, so nothing is staged
+      // or pushed; the operator is the one who can go and look.
+      result.summary = 'A process of the agent\'s account could not be ended after the run, so nothing was published. It may still be running on this machine.';
+      result.evidence.agent_processes_survived = true;
+      result.actions.push('a process of the agent\'s account could not be ended, so nothing was published');
+      log('error', `handoff ${job.handoff_id}: a process of the agent's account outlived every attempt to end it; nothing was published`);
+      return result;
+    }
 
     if (agent.timedOut) {
       result.summary = `The agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds) and nothing was published.`;
@@ -1980,9 +2321,9 @@ async function handleJob(config, job) {
     // runner writes itself, or a credential the agent happened to print would
     // be the one place the redaction did not reach.
     agent.finalMessage = redact(agent.finalMessage);
-    const memoryReport = splitMemorySummary(agent.finalMessage, mem !== null);
-    agent.finalMessage = memoryReport.message;
-    result.memorySummary = memoryReport.summary;
+    const memorySection = splitMemorySummary(agent.finalMessage, mem !== null);
+    agent.finalMessage = memorySection.message;
+    result.memorySummary = memorySection.summary;
     result.summary = agent.finalMessage || 'The agent produced no final message.';
 
     if (agent.code !== 0) {
@@ -2145,10 +2486,17 @@ async function main() {
   if (identity.mode !== 'none') process.umask(0o077);
   log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}, running ${describeIdentity()}`);
   if (identity.mode === 'none') {
-    log(
-      'warn',
-      'no agent account is configured (SRE_AGENT_UID), so the agent runs as the runner\'s own account: taking credentials out of its environment is not a boundary, because it can read this process\'s environment and write the memory directory. The container image and the systemd install configure the split.'
-    );
+    if (identity.degraded) {
+      log(
+        'warn',
+        `${identity.degraded}. Start the container as root (the image's default) with those capabilities, which Docker's default set holds; a Kubernetes securityContext that drops ALL has to add them back (the README has the manifest)`
+      );
+    } else {
+      log(
+        'warn',
+        'no agent account is configured (SRE_AGENT_UID), so the agent runs as the runner\'s own account: taking credentials out of its environment is not a boundary, because it can read this process\'s environment and write the memory directory. The container image and the systemd install configure the split.'
+      );
+    }
   }
 
   await startMemory(config);
@@ -2179,7 +2527,29 @@ async function main() {
   }
 }
 
-module.exports = { loadConfig, handleJob, startMemory, serveJob, PROVIDER_KEY_VARIABLES, internals: { openMemory, closeMemory, replaceMemory, makeBaseBundle } };
+module.exports = {
+  loadConfig,
+  handleJob,
+  startMemory,
+  serveJob,
+  PROVIDER_KEY_VARIABLES,
+  internals: {
+    openMemory,
+    closeMemory,
+    replaceMemory,
+    makeBaseBundle,
+    settleAgentHome,
+    closeAgentHome,
+    closeAllAgentHomes,
+    agentHomeFor,
+    applyAgentHomeEnv,
+    autoLoadSwitches: AUTOLOAD_SWITCHES,
+    loadIdentity,
+    setIdentity: (value) => {
+      identity = value;
+    },
+  },
+};
 
 if (require.main === module) {
   process.on('uncaughtException', (error) => {

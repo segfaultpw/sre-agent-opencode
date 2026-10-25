@@ -163,7 +163,10 @@ if [ -d "${root}${state_dir}/workspace" ]; then echo "ok   the workspace is crea
 # 0711: the agent account walks through the state directory to its own home and
 # its checkout, and cannot list it.
 if [ "$(stat -c '%a' "${root}${state_dir}")" = "711" ]; then echo "ok   the state directory can be walked through but not listed"; else echo "FAIL state directory mode $(stat -c '%a' "${root}${state_dir}")"; fail=1; fi
-if [ "$(stat -c '%a' "${root}${state_dir}/agent-home")" = "700" ]; then echo "ok   the agent has a home of its own that nobody else can enter"; else echo "FAIL agent home mode $(stat -c '%a' "${root}${state_dir}/agent-home" 2>&1)"; fail=1; fi
+# The runner owns the directory above the per-repository homes and closes every
+# home the agent is not using, so the agent can walk through this one to the home
+# it is handed and cannot list it.
+if [ "$(stat -c '%a' "${root}${state_dir}/agent-home")" = "711" ]; then echo "ok   the directory above the agent's per-repository homes can be walked through but not listed"; else echo "FAIL agent home mode $(stat -c '%a' "${root}${state_dir}/agent-home" 2>&1)"; fail=1; fi
 
 echo "--- the installer writes no credential ---"
 if [ "$(stat -c '%a' "${root}${env_file}")" = "600" ]; then echo "ok   the environment file is 0600"; else echo "FAIL environment file mode $(stat -c '%a' "${root}${env_file}")"; fail=1; fi
@@ -188,7 +191,7 @@ agent_useradd="$(grep "^useradd .* ${agent_account}\$" "$STUB_LOG" || true)"
 for needle in "--system" "--gid ${agent_account}" "--home-dir ${state_dir}/agent-home" "nologin"; do
   if [[ "$agent_useradd" == *"$needle"* ]]; then echo "ok   the agent account is created with ${needle}"; else echo "FAIL agent useradd was '${agent_useradd}'"; fail=1; fi
 done
-if grep -q "chown ${agent_account}:${agent_account} ${root}${state_dir}/agent-home" "$STUB_LOG"; then echo "ok   the agent home belongs to the agent account"; else echo "FAIL the agent home was not given to the agent: $(cat "$STUB_LOG")"; fail=1; fi
+if grep -q "chown ${service}:${service} .*${root}${state_dir}/agent-home" "$STUB_LOG" && ! grep -q "chown ${agent_account}:${agent_account} ${root}${state_dir}/agent-home" "$STUB_LOG"; then echo "ok   the directory above the per-repository homes belongs to the runner's account, which hands each home to the agent only for a run"; else echo "FAIL the agent-home directory was given to the wrong account: $(cat "$STUB_LOG")"; fail=1; fi
 # The agent runs as that account, so the package it loads its fences from must
 # not belong to it.
 if grep -q "chown -R root:root ${root}/opt/sre-agent-opencode" "$STUB_LOG"; then echo "ok   the package belongs to root, not to the account the agent runs as"; else echo "FAIL the package was not given to root: $(cat "$STUB_LOG")"; fail=1; fi

@@ -147,8 +147,8 @@ fi
 # The agent's own account. The agent has a shell, so what its account can reach
 # is what the agent can reach, and it is not the runner's: it holds no
 # capability, cannot read the runner's environment or the memory directory, and
-# is handed one checkout at a time. Its home is inside the one path the unit
-# makes writable.
+# is handed one checkout and one repository's home at a time. Its homes are
+# inside the one path the unit makes writable.
 if ! getent group "$AGENT_ACCOUNT" >/dev/null 2>&1; then
   groupadd --system "$AGENT_ACCOUNT"
   echo "created the ${AGENT_ACCOUNT} group"
@@ -166,16 +166,20 @@ env_path="$(at "$ENV_FILE")"
 unit_path="$(at "$UNIT_FILE")"
 
 install -d -m 0755 "$package_path"
-# 0711 on both: the agent's account walks through them to its home and to the
-# checkout it is handed, and cannot list them. What the runner keeps for itself
-# (the memory directory, the clones of other repositories) is 0700 inside.
+# 0711 on all three: the agent's account walks through them to the home it is
+# handed for a run and to the checkout it is handed, and cannot list them. What
+# the runner keeps for itself (the memory directory, the clones of other
+# repositories) is 0700 inside. The agent-home directory is the runner's too: it
+# holds one home per repository, each the agent's only for the length of that
+# repository's run (the runner hands it over and takes it back), so no run can
+# enter the home of a repository that is not under way. The runner re-asserts
+# every one of these modes at start.
 agent_home_path="$(at "$AGENT_HOME")"
 install -d -m 0711 "$state_path"
 install -d -m 0711 "$workspace_path"
-install -d -m 0700 "$agent_home_path"
+install -d -m 0711 "$agent_home_path"
 install -d -m 0750 "$(at "$ENV_DIR")"
-chown "${SERVICE}:${SERVICE}" "$state_path" "$workspace_path"
-chown "${AGENT_ACCOUNT}:${AGENT_ACCOUNT}" "$agent_home_path"
+chown "${SERVICE}:${SERVICE}" "$state_path" "$workspace_path" "$agent_home_path"
 
 # The package is root-owned and not writable by the account the agent runs
 # under, so a run cannot edit the fences the next run will load.

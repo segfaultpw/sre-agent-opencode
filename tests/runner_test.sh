@@ -89,9 +89,9 @@ cat > "$work/bin/git" <<EOF
 # the GitHub URL pointed at the fixture remote on disk. The log is how a case
 # proves the runner reached for github.com, and how the untargeted case proves
 # it never reached for git at all. A file named fail_push in the control
-# directory makes a push fail with the unmasked URL on stderr, which is how a
-# real git reports one, so the case that follows can prove the runner redacts
-# what it logs and reports. The runner starts git and gh with a minimal
+# directory makes a push fail with the credential in its message on stderr (a
+# transport error that quotes what the helper offered, which a real git can do),
+# so the case that follows can prove the runner redacts what it logs and reports. The runner starts git and gh with a minimal
 # environment, so the paths and switches here are baked in or read from files,
 # never taken from variables.
 set -euo pipefail
@@ -103,6 +103,9 @@ set -euo pipefail
 # (a git that a script or gh starts); the flags are on the runner's own.
 if [ "\${GIT_CONFIG_KEY_0:-}" = "core.hooksPath" ] && [ "\${GIT_CONFIG_KEY_1:-}" = "core.fsmonitor" ] && [ "\${GIT_CONFIG_KEY_2:-}" = "core.attributesFile" ] && [ "\${GIT_CONFIG_NOSYSTEM:-}" = "1" ] && [ "\${GIT_NO_REPLACE_OBJECTS:-}" = "1" ] && [ "\${GIT_ATTR_NOSYSTEM:-}" = "1" ]; then marker=hardened-env; else marker=plain-env; fi
 printf '%s %s\n' "\$marker" "\$*" >> "$work/git_raw.log"
+# The raw argument vector, one argument per line and never masked: the proof
+# that no credential is on any command line, where another account can read it.
+printf '%s\n' "\$@" >> "$work/git_argv.log"
 # What a git call can see of the runner's own environment, which must be none
 # of its credentials: only the variables the call needs are passed to it.
 env | cut -d= -f1 | grep -E '^(SRE_|AWS_|ECS_|GH_|GITHUB_|OPENROUTER|ANTHROPIC)' >> "$work/git_leaks.log" || true
@@ -112,8 +115,29 @@ if [ "\${1:-}" = "-c" ] && [ "\${2:-}" = "core.hooksPath=/dev/null" ] && [ "\${3
   shift 6
 fi
 printf '%s\n' "\$*" | sed -e 's#://[^@ ]*@#://[redacted]@#g' >> "$git_log"
+# The subcommand, and whether this call reaches a URL and carries the credential
+# in its environment. Only the calls that name a URL are classified, because the
+# agent's own git (its repository is made by a script that fetches a bundle by
+# path) runs through this stub too.
+sub=""
+skip=0
+net=0
+for a in "\$@"; do
+  case "\$a" in https://*) net=1 ;; esac
+  if [ -z "\$sub" ]; then
+    if [ "\$skip" = 1 ]; then skip=0; continue; fi
+    case "\$a" in
+      -c) skip=1 ;;
+      -*) ;;
+      *) sub="\$a" ;;
+    esac
+  fi
+done
+if [ "\$net" = 1 ]; then
+  if [ -n "\${RUNNER_GIT_PASSWORD+x}" ]; then printf '%s\n' "\$sub" >> "$work/git_authed.log"; else printf '%s\n' "\$sub" >> "$work/git_plain.log"; fi
+fi
 if [ -e "$work/ctl/fail_push" ] && [ "\${3:-}" = "push" ]; then
-  printf 'fatal: could not read from remote repository: git %s\n' "\$*" >&2
+  printf 'fatal: could not read from remote repository: git %s (credential offered: %s)\n' "\$*" "\${RUNNER_GIT_PASSWORD:-none}" >&2
   exit 128
 fi
 args=()
@@ -122,6 +146,18 @@ for a in "\$@"; do
   # and rewriting it would make git reject the config rather than the remote.
   case "\$a" in
     https://x-access-token:*@github.com/*) tok="\${a#https://x-access-token:}"; printf '%s\n' "\${tok%%@*}" >> "$work/git_urltokens.log"; args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
+    https://github.com/*)
+      case "\$sub" in
+        ls-remote|clone|fetch|push)
+          # What git would send to github.com for this call, asked of real git
+          # with the very environment the runner gave it: the credential helper
+          # the runner configured answers or it does not. A second host is asked
+          # as well, because the helper must answer github.com and nobody else.
+          printf '%s\n' "\$(printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "$real_git" credential fill 2>/dev/null | sed -n 's/^password=//p')" >> "$work/git_urltokens.log"
+          printf 'protocol=https\nhost=evil.example\n\n' | GIT_TERMINAL_PROMPT=0 "$real_git" credential fill 2>/dev/null | sed -n 's/^password=//p' >> "$work/git_otherhost_tokens.log" || true
+          args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
+        *) args+=("\$a") ;;
+      esac ;;
     *) args+=("\$a") ;;
   esac
 done
@@ -135,6 +171,8 @@ cat > "$work/bin/gh" <<EOF
 # answers with the URL a real gh prints on stdout.
 set -euo pipefail
 printf '%s\n' "\$*" >> "$gh_log"
+printf '%s\n' "\$@" >> "$work/gh_argv.log"
+printf '%s\n' "\${GH_TOKEN:-}" >> "$work/gh_env_token.log"
 env | cut -d= -f1 | grep -E '^(SRE_API|SRE_MODEL|AWS_|ECS_|OPENROUTER|ANTHROPIC)' >> "$work/gh_leaks.log" || true
 body=""
 while [ \$# -gt 0 ]; do
@@ -258,7 +296,14 @@ queue_one h-targeted acme/app
 export STUB_OPENCODE_MODE=fix
 run_once targeted
 if [ "$rc" -eq 0 ]; then echo "ok   a targeted job exits 0"; else echo "FAIL a targeted job exited $rc: $(cat "$out")"; fail=1; fi
-if grep -q '^clone --separate-git-dir=[^ ]*/gitdirs/acme/app https://\[redacted\]@github.com/acme/app.git ' "$git_log"; then echo "ok   the named repository is cloned from github.com"; else echo "FAIL clone call: $(cat "$git_log")"; fail=1; fi
+if grep -q '^clone --separate-git-dir=[^ ]*/gitdirs/acme/app https://github.com/acme/app.git ' "$git_log"; then echo "ok   the named repository is cloned from its github.com URL, which carries no credential"; else echo "FAIL clone call: $(cat "$git_log")"; fail=1; fi
+if ! grep -qF -e "$github_token" "$work/git_argv.log" "$gh_log"; then echo "ok   no git or gh argument holds the repository token ($(grep -c '' "$work/git_argv.log") git arguments, $(grep -c '' "$gh_log") gh calls)"; else echo "FAIL a command line holds the token: $(grep -F "$github_token" "$work/git_argv.log" "$gh_log" | sed -e "s#$github_token#[token]#g" | head -n 3)"; fail=1; fi
+if [ "$(sort -u "$work/git_authed.log" | tr '\n' ' ')" = "clone ls-remote push " ]; then echo "ok   the calls that reach GitHub (ls-remote, clone, push) are given the credential, in their environment"; else echo "FAIL calls given the credential: $(sort -u "$work/git_authed.log" | tr '\n' ' ')"; fail=1; fi
+if ! grep -qE '^(clone|ls-remote|fetch|push)$' "$work/git_plain.log"; then echo "ok   no call that reaches GitHub went without the credential helper"; else echo "FAIL plain calls: $(sort -u "$work/git_plain.log" | tr '\n' ' ')"; fail=1; fi
+if [ -s "$work/git_urltokens.log" ] && ! grep -qvx "$github_token" "$work/git_urltokens.log"; then echo "ok   the helper the runner configured hands github.com the repository token ($(grep -c '' "$work/git_urltokens.log") calls)"; else echo "FAIL what the credential helper answered: $(sort -u "$work/git_urltokens.log" | cut -c1-24 | tr '\n' ' ')"; fail=1; fi
+if [ ! -s "$work/git_otherhost_tokens.log" ]; then echo "ok   the helper answers github.com and no other host"; else echo "FAIL a credential was offered to another host"; fail=1; fi
+if [ -s "$work/gh_env_token.log" ] && ! grep -qvx "$github_token" "$work/gh_env_token.log"; then echo "ok   gh is given the token in GH_TOKEN, not on its command line"; else echo "FAIL gh's GH_TOKEN: $(sort -u "$work/gh_env_token.log" | cut -c1-24 | tr '\n' ' ')"; fail=1; fi
+if grep -qx "opencode_switches: OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1 OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 OPENCODE_DISABLE_EXTERNAL_SKILLS=1 OPENCODE_PURE=1 " "$opencode_log"; then echo "ok   opencode is told not to load plugins, Claude Code files or external skills on its own"; else echo "FAIL switches: $(grep opencode_switches "$opencode_log")"; fail=1; fi
 if grep -q -- '--agent sre-fix' "$opencode_log"; then echo "ok   the agent is started as sre-fix"; else echo "FAIL opencode argv: $(cat "$opencode_log")"; fail=1; fi
 if grep -q -- "--model $model" "$opencode_log"; then echo "ok   the configured model is passed to the agent"; else echo "FAIL opencode argv: $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "default_agent: sre-fix" "$opencode_log"; then echo "ok   the config travels through OPENCODE_CONFIG_CONTENT with sre-fix as the default agent"; else echo "FAIL config: $(cat "$opencode_log")"; fail=1; fi
@@ -813,6 +858,7 @@ if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c co
 unnamed="$(grep -E ' (add|commit|push|checkout|clean|diff|fetch|ls-files) ' "$work/git_raw.log" | grep -v -E '^hardened-env (rev-parse|update-index|ls-files|init|fetch|remote|symbolic-ref|reset|update-ref) ' | grep -v -- '--git-dir=' || true)"
 if [ -z "$unnamed" ]; then echo "ok   every call that works on the tree names the runner's git directory and the tree explicitly"; else echo "FAIL calls: $(head -n 3 <<<"$unnamed")"; fail=1; fi
 if [ ! -s "$work/git_leaks.log" ] && [ ! -s "$work/gh_leaks.log" ]; then echo "ok   no git or gh call saw the poll key, the model setting or a provider or AWS variable"; else echo "FAIL leaks: $(sort -u "$work/git_leaks.log" "$work/gh_leaks.log" | tr '\n' ' ')"; fail=1; fi
+if grep -qx fetch "$work/git_authed.log" && ! grep -qx fetch "$work/git_plain.log"; then echo "ok   a reused clone is refreshed with the credential in the fetch's environment, and the fetch has none on its command line"; else echo "FAIL fetch calls: authed $(sort -u "$work/git_authed.log" | tr '\n' ' ') plain $(sort -u "$work/git_plain.log" | tr '\n' ' ')"; fail=1; fi
 stop_fixture
 
 echo "--- 31b. an old clone with its git directory inside the tree is replaced, not adopted ---"
@@ -962,6 +1008,9 @@ printf '[core]\n\tfsmonitor = touch %s/worktree-config\n' "$work/markers" > "$gd
 printf '[extensions]\n\tworktreeConfig = true\n' >> "$gd/config"
 printf '* filter=evil\n' > "$gd/info/attributes"
 printf '[filter "evil"]\n\tclean = touch %s/global-filter\n[core]\n\tfsmonitor = touch %s/global-fsmonitor\n' "$work/markers" "$work/markers" > "$work/fakehome/.gitconfig"
+mkdir -p "$work/fakehome/.config/opencode" "$work/fakehome/.claude"
+printf '{}\n' > "$work/fakehome/.config/opencode/opencode.json"
+printf 'my own instructions\n' > "$work/fakehome/.claude/CLAUDE.md"
 start_fixture planted
 queue_one h-planted acme/app
 export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=plant STUB_PLANT_MARKER="$work/markers/tree-config"
@@ -979,6 +1028,7 @@ pushed_readme="$("$real_git" --git-dir="$remote" show refs/heads/sre-agent/h-pla
 if [ "$pushed_readme" = "$real_readme"$'\n'"a line the fix added" ]; then echo "ok   the pushed README is the real one plus the agent's line"; else echo "FAIL pushed README: $pushed_readme"; fail=1; fi
 if [ ! -e "$gd/commondir" ] && [ ! -e "$gd/objects/info/alternates" ] && [ ! -e "$gd/info/grafts" ] && [ ! -e "$gd/refs/replace/$real_head" ] && [ ! -e "$gd/config.worktree" ] && [ ! -e "$gd/info/attributes" ]; then echo "ok   the runner removed every one of them from the git directory"; else echo "FAIL left: $(find "$gd" -name commondir -o -name alternates -o -name grafts -o -name config.worktree -o -name attributes -o -path '*refs/replace/*' | tr '\n' ' ')"; fail=1; fi
 if [ ! -e "$workspace/repos/acme/app/.git" ]; then echo "ok   no .git is left in the tree"; else echo "FAIL .git is in the tree"; fail=1; fi
+if [ -f "$work/fakehome/.config/opencode/opencode.json" ] && [ -f "$work/fakehome/.claude/CLAUDE.md" ]; then echo "ok   with no account split the home is the developer's own, and the runner removes nothing from it"; else echo "FAIL the runner removed files from a home that is not the agent's"; fail=1; fi
 stop_fixture
 
 echo "--- 39. the agent works in a real repository, and the pull request is the tree against the real base ---"
@@ -1018,6 +1068,7 @@ if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then ec
 if grep -qx "gh_token: matches" "$opencode_log" && grep -qx "runner_token_visible: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_TOKEN: no" "$opencode_log"; then echo "ok   the agent holds the agent token as GH_TOKEN and the runner token is nowhere in its environment"; else echo "FAIL $(grep -E 'gh_token|runner_token|sees_' "$opencode_log")"; fail=1; fi
 if grep -qx 'sees_SRE_AGENT_GITHUB_TOKEN: no' "$opencode_log"; then echo "ok   the variable that names the agent token is not itself in the agent's environment"; else echo "FAIL $(grep AGENT_GITHUB "$opencode_log")"; fail=1; fi
 if [ -s "$work/git_urltokens.log" ] && ! grep -qvx "$github_token" "$work/git_urltokens.log"; then echo "ok   every clone, fetch, ls-remote and push the runner made used the runner token ($(wc -l < "$work/git_urltokens.log") calls)"; else echo "FAIL tokens in URLs: $(sort -u "$work/git_urltokens.log" | cut -c1-24 | tr '\n' ' ')"; fail=1; fi
+if ! grep -qF -e "$agent_token" "$work/git_argv.log" "$gh_log" && ! grep -qF -e "$agent_token" "$work/git_urltokens.log"; then echo "ok   the agent's token is on no command line and was never offered to the runner's git"; else echo "FAIL the agent token reached a command line or the runner's git"; fail=1; fi
 stop_fixture
 
 echo "--- 41b. a token the agent prints is redacted whichever token it is ---"
@@ -1250,6 +1301,35 @@ for _ in 1 2 3; do
 done
 if [ "$(grep -cx 'runner_token_visible: yes' "$work/probe.log")" -eq 3 ]; then echo "ok   a token the environment holds is seen as visible, three times out of three"; else echo "FAIL probe log: $(grep runner_token_visible "$work/probe.log")"; fail=1; fi
 if ! grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh" >/dev/null; then echo "ok   no pipeline in the stub ends with grep -q"; else echo "FAIL $(grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh")"; fail=1; fi
+
+echo "--- 48. a start that asked for an account split but cannot switch accounts falls back to one account, loudly, and the job still lands ---"
+# The runner is started as this shell's own account with SRE_AGENT_UID set, the
+# way a Kubernetes pod that drops every capability starts the image (the image
+# names the agent account in its environment). A shell that holds capabilities
+# cannot provoke it from here; tests/uid_split_test.sh does that with real
+# accounts, as root and as a caps start missing one capability.
+cap_eff="$(sed -n 's/^CapEff:[[:space:]]*//p' /proc/self/status)"
+if [ "$cap_eff" = "0000000000000000" ]; then
+  start_fixture nocaps
+  queue_one h-nocaps acme/app
+  export STUB_OPENCODE_MODE=fix
+  SRE_AGENT_USER=agent SRE_AGENT_UID="$(( $(id -u) + 1 ))" SRE_AGENT_GID="$(( $(id -g) + 1 ))" SRE_AGENT_HOME="$work/agent-home-nocaps" run_once nocaps
+  if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request ends in a pull request, as in a release before the split"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+  if grep -q 'the agent account split is off' "$out" && grep -q 'CAP_SETUID' "$out" && grep -q 'CAP_CHOWN' "$out"; then echo "ok   the start says, in the log, that the split is off and which capabilities it lacks"; else echo "FAIL log: $(head -n 5 "$out")"; fail=1; fi
+  if jq -e '.evidence.agent_isolation | test("CAP_SETUID") and test("one account")' <<<"$report" >/dev/null; then echo "ok   the report's evidence says the same, so the card shows it"; else echo "FAIL evidence: $report"; fail=1; fi
+  if ! grep -q 'EPERM\|operation not permitted' "$out"; then echo "ok   it is not a crash loop: no EPERM from a chown or a chmod"; else echo "FAIL $(grep -m 3 'EPERM\|not permitted' "$out")"; fail=1; fi
+  if [ ! -e "$work/agent-home-nocaps" ]; then echo "ok   no agent home was made, because no account was switched to"; else echo "FAIL the fallback made an agent home"; fail=1; fi
+  stop_fixture
+else
+  echo "ok   skipped: this shell holds capabilities (CapEff ${cap_eff}), so the fallback cannot be provoked from here; tests/uid_split_test.sh covers it with real accounts"
+fi
+
+echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
+for token_name in github_token agent_token; do
+  token="${!token_name}"
+  if ! grep -qF -e "$token" "$work/git_argv.log" "$work/gh_argv.log"; then echo "ok   ${token_name}: not in the argument vector of any of $(grep -c '' "$work/git_argv.log") git arguments or $(grep -c '' "$work/gh_argv.log") gh arguments"; else echo "FAIL ${token_name} is on a command line"; fail=1; fi
+done
+if [ "$(sort -u "$work/git_authed.log" | tr '\n' ' ')" = "clone fetch ls-remote push " ]; then echo "ok   over the whole run the credential went to clone, fetch, ls-remote and push and to no other call"; else echo "FAIL: $(sort -u "$work/git_authed.log" | tr '\n' ' ')"; fail=1; fi
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
 # The runner cannot deploy, so it cannot verify a fix in a running system. The

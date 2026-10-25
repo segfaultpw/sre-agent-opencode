@@ -882,6 +882,10 @@ args=()
 for a in "\$@"; do
   case "\$a" in
     https://x-access-token:*@github.com/*) args+=("$remote") ;;
+    # The runner's calls that reach GitHub carry the token in their environment
+    # and name the clean URL; the agent's own git names it too, as origin, and
+    # must keep it.
+    https://github.com/*) if [ -n "\${RUNNER_GIT_PASSWORD+x}" ]; then args+=("$remote"); else args+=("\$a"); fi ;;
     *) args+=("\$a") ;;
   esac
 done

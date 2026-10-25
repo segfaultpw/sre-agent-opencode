@@ -39,6 +39,7 @@ line=""
 for arg in "$@"; do line+="${arg}${us}"; done
 printf '%s\n' "$line" >> "$ctl/aws_calls.log"
 id -u >> "$ctl/aws_uid.log"
+printf '%s\n' "${HOME:-}" >> "$ctl/aws_home.log"
 
 if [ -s "$ctl/fixture_log_path" ]; then
   grep -c '' "$(cat "$ctl/fixture_log_path")" >> "$ctl/aws_seen.log" || true
