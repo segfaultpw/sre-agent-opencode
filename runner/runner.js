@@ -1698,6 +1698,14 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // The tree holds the agent's own repository, and git must not go looking
   // above it for one that is not this request's.
   env.GIT_CEILING_DIRECTORIES = path.dirname(workspace);
+  // The agent commits in its own repository, and a machine with no global git
+  // identity (a CI host, an account with no ~/.gitconfig, the one-account
+  // fallback) refuses a commit with none. The runner commits the pull request
+  // itself, so these name only the agent's local history.
+  env.GIT_AUTHOR_NAME = 'sre-agent-fix-agent';
+  env.GIT_AUTHOR_EMAIL = 'sre-agent-fix-agent@users.noreply.github.com';
+  env.GIT_COMMITTER_NAME = 'sre-agent-fix-agent';
+  env.GIT_COMMITTER_EMAIL = 'sre-agent-fix-agent@users.noreply.github.com';
   if (!config.agentAwsAccess) {
     for (const name of Object.keys(env)) {
       if (name.startsWith('AWS_') || name.startsWith('ECS_CONTAINER_METADATA_URI')) delete env[name];

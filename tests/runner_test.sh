@@ -18,6 +18,11 @@ if [ -f "$runner" ]; then echo "ok   the runner exists"; else echo "FAIL $runner
 if command -v node >/dev/null 2>&1; then echo "ok   node is on PATH"; else echo "FAIL node is not on PATH"; exit 1; fi
 
 work="$(mktemp -d)"
+# A home of its own, empty: a developer's ~/.gitconfig (an identity above all)
+# hid that the agent's local commits fail on a machine without one, which is
+# what CI and many hosts are.
+export HOME="$work/home"
+mkdir -p "$HOME"
 fixture_pid=""
 # Every fixture server this test starts, so the last check can prove none was
 # left running. A server is only ever stopped by the PID this shell started,

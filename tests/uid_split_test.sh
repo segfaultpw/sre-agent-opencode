@@ -25,14 +25,31 @@ if [ "${1:-}" != "--inner" ]; then
   }
   if ! command -v setpriv >/dev/null 2>&1; then unavailable "setpriv is not installed, so no uid can be switched"; fi
   if [ ! -r "$(command -v node)" ] || [ ! -x "$(command -v node)" ]; then unavailable "node is not usable"; fi
+  # The package is copied here, as the account running the test, into a
+  # directory every account can read: a root mapped into a user namespace is not
+  # this account, and cannot read a checkout under a 0750 home (a CI runner's
+  # work directory is one). The inner run reads only the copy.
+  stage="$(mktemp -d)"
+  chmod 755 "$stage"
+  for item in VERSION config agents scripts runner tests/fixture tests/uid_split_test.sh; do
+    mkdir -p "$stage/$(dirname "$item")"
+    cp -R "$here/../$item" "$stage/$item"
+  done
+  chmod -R a+rX "$stage"
+  inner=(bash "$stage/tests/uid_split_test.sh" --inner)
+  rc=0
   if [ "$(id -u)" -eq 0 ]; then
-    exec bash "$0" --inner
+    "${inner[@]}" || rc=$?
   elif unshare --user --map-users=auto --map-groups=auto --setuid 0 --setgid 0 setpriv --reuid=10001 --regid=10001 --clear-groups true 2>/dev/null; then
-    exec unshare --user --map-users=auto --map-groups=auto --setuid 0 --setgid 0 bash "$0" --inner
+    unshare --user --map-users=auto --map-groups=auto --setuid 0 --setgid 0 "${inner[@]}" || rc=$?
   elif sudo -n true 2>/dev/null; then
-    exec sudo -n env "PATH=$PATH" bash "$0" --inner
+    sudo -n env "PATH=$PATH" "${inner[@]}" || rc=$?
+  else
+    rm -rf "$stage"
+    unavailable "no way to become root here (not root, no user namespace with a subuid range, no passwordless sudo)"
   fi
-  unavailable "no way to become root here (not root, no user namespace with a subuid range, no passwordless sudo)"
+  rm -rf "$stage"
+  exit "$rc"
 fi
 
 pkg="$here/.."
@@ -43,6 +60,12 @@ caps_uid=10003
 real_git="$(command -v git)"
 work="$(mktemp -d)"
 chmod 755 "$work"
+# Every account below makes its temporary files in here, so the cleanup that
+# removes $work removes them too; in /tmp, files the agent's account made are
+# not this test's to delete once it has left the namespace.
+mkdir -p "$work/tmp"
+chmod 1777 "$work/tmp"
+export TMPDIR="$work/tmp"
 # The accounts below cannot necessarily walk through the directory this
 # checkout is in (a home directory is often 0750), so they run from a copy.
 for item in VERSION config agents scripts runner tests/fixture; do
