@@ -17,6 +17,8 @@
 //   FIXTURE_QUEUE_STATUSES a comma separated list of statuses to answer the
 //                          queue with in order; the last one repeats
 //   FIXTURE_BRIEF_FILE     the brief the brief endpoint serves
+//   FIXTURE_BRIEF_STATUS   a status other than 200 to answer the brief with, as a
+//                          platform that failed to serve it would
 
 const fs = require('node:fs');
 const http = require('node:http');
@@ -27,6 +29,7 @@ const apiKey = process.env.FIXTURE_API_KEY || '';
 const handoffToken = process.env.FIXTURE_HANDOFF_TOKEN || '';
 const statuses = (process.env.FIXTURE_QUEUE_STATUSES || '200').split(',').map((value) => Number.parseInt(value, 10));
 const briefFile = process.env.FIXTURE_BRIEF_FILE || '';
+const briefStatus = Number.parseInt(process.env.FIXTURE_BRIEF_STATUS || '200', 10);
 
 let queueCalls = 0;
 let queueServed = false;
@@ -94,6 +97,10 @@ const server = http.createServer((request, response) => {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/brief')) {
+      if (briefStatus !== 200) {
+        send(response, briefStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
+        return;
+      }
       send(response, 200, 'text/markdown', briefFile ? fs.readFileSync(briefFile, 'utf8') : 'no brief');
       return;
     }

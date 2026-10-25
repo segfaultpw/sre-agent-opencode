@@ -322,6 +322,45 @@ for dir in /tmp /var/tmp /dev/shm; do
   if [ "$rc" -ne 0 ] && grep -qF "is under ${dir}" <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link in the image that points under ${dir} is refused too"; else echo "FAIL link to ${dir}: rc=$rc out=$out"; fail=1; fi
   rm -rf "$planted"
 done
+# The same two reasons for every directory any account can write, not only the
+# three above: /run/lock is one on Debian, and so is whatever an operator mounts
+# with the wrong mode. The rule is read off the path as given and the path it
+# resolves to, every directory above it, and the file itself.
+for dir in /run/lock /var/lock; do
+  if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then echo "ok   skipped: $dir is not a writable directory here"; continue; fi
+  planted="$(mktemp -d "$dir/sre-image-test.XXXXXX")"
+  printf '#!/usr/bin/env bash\nprintf "setup ran\\n" >> "%s"\n' "$STUB_LOG" > "$planted/setup.sh"
+  chmod +x "$planted/setup.sh"
+  run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$planted/setup.sh"
+  if [ "$rc" -ne 0 ] && grep -qE "is under ${dir}|writable by every account" <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a setup script under ${dir} is refused"; else echo "FAIL ${dir}: rc=$rc out=$out"; fail=1; fi
+  rm -rf "$planted"
+done
+check "$entrypoint" '/run/lock /var/lock' 'the refusal names /run/lock and /var/lock whether or not this machine lets the test write there'
+
+open_dir="$setup_dir/open"
+mkdir -p "$open_dir/inner"
+chmod 0777 "$open_dir"
+cp "$setup_dir/ok.sh" "$open_dir/setup.sh"
+cp "$setup_dir/ok.sh" "$open_dir/inner/setup.sh"
+chmod 0755 "$open_dir/inner" "$open_dir/setup.sh" "$open_dir/inner/setup.sh"
+ln -sf "$setup_dir/ok.sh" "$open_dir/link.sh"
+cp "$setup_dir/ok.sh" "$setup_dir/world-writable.sh"
+chmod 0757 "$setup_dir/world-writable.sh"
+ln -sf "$open_dir" "$setup_dir/open-link"
+for case_name in directly nested link inlink file; do
+  case "$case_name" in
+    directly) target="$open_dir/setup.sh"; what="a script in a directory every account can write" ;;
+    nested) target="$open_dir/inner/setup.sh"; what="a script whose directory is private but whose parent is writable by every account" ;;
+    link) target="$open_dir/link.sh"; what="a link that sits in a directory every account can write, though it points at a safe file" ;;
+    inlink) target="$setup_dir/open-link/setup.sh"; what="a script reached through a link to a directory every account can write" ;;
+    file) target="$setup_dir/world-writable.sh"; what="a script that every account can write" ;;
+  esac
+  run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$target"
+  if [ "$rc" -ne 0 ] && grep -qF 'writable by every account' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG" && ! grep -q 'runner/runner.js' "$STUB_LOG"; then echo "ok   ${what} is refused, and neither it nor the runner starts"; else echo "FAIL ${case_name}: rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+done
+ln -sf "$setup_dir/ok.sh" "$setup_dir/safe-link.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/safe-link.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link in a private directory to a private script still runs"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 for spelling in / // /./ /../; do
   : > "$STUB_LOG"
   rc=0

@@ -1,7 +1,9 @@
 'use strict';
 // Unit tests for runner/memory.js: the persistent workspace layout, the bounds
 // the runner enforces on the agent's memory directory, and the change list the
-// report carries. Run with `node tests/memory_test.js`; every input is small
+// report carries; and for the test job's two small pieces that touch it, the
+// removal of a marker a killed runner left (memory.clearTestMarkers) and the
+// bucket probe (bucket.probe). Run with `node tests/memory_test.js`; every input is small
 // and explicit, and the largest file written is a little over 1 MiB.
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -10,6 +12,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const memory = require('../runner/memory.js');
+const bucket = require('../runner/bucket.js');
 
 let failed = 0;
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-test-'));
@@ -40,6 +43,20 @@ function listing(base) {
   };
   walk(base, '');
   return out;
+}
+
+const asyncTests = [];
+function testAsync(name, fn) {
+  asyncTests.push(
+    fn().then(
+      () => console.log(`ok   ${name}`),
+      (error) => {
+        failed += 1;
+        console.log(`FAIL ${name}`);
+        console.log(String(error && error.stack ? error.stack : error).replace(/^/gm, '     '));
+      }
+    )
+  );
 }
 
 function test(name, fn) {
@@ -657,10 +674,105 @@ test('admit judges names and sizes only, and never lists more than the bounds al
   assert.deepEqual(memory.admit([{ rel: 'other.txt', bytes: 1 }, { rel: 'scripts/sub/x', bytes: 1 }, { rel: 'scripts/..', bytes: 1 }]), []);
 });
 
-fs.rmSync(root, { recursive: true, force: true });
+test('clearTestMarkers removes the marker of every memory directory and nothing else', () => {
+  const workspace = fresh();
+  const mem = path.join(workspace, 'memory');
+  put(mem, '_estate/NOTES.md', 'estate');
+  put(mem, '_estate/.runner-test', 'x');
+  put(mem, 'acme/app/NOTES.md', 'app');
+  put(mem, 'acme/app/.runner-test', 'x');
+  put(mem, 'acme/app/scripts/.runner-test-not', 'a script that merely starts the same way');
+  put(mem, 'acme/api/scripts/keep.sh', '#!/bin/sh');
+  assert.deepEqual(memory.clearTestMarkers(workspace).sort(), ['_estate/.runner-test', 'acme/app/.runner-test']);
+  assert.deepEqual(listing(mem), ['_estate/NOTES.md', 'acme/api/scripts/keep.sh', 'acme/app/NOTES.md', 'acme/app/scripts/.runner-test-not']);
+  assert.deepEqual(memory.clearTestMarkers(workspace), [], 'a second call finds nothing');
+  assert.deepEqual(memory.clearTestMarkers(path.join(workspace, 'absent')), [], 'a workspace with no memory directory is not an error');
+});
 
-if (failed > 0) {
-  console.log(`${failed} test(s) failed`);
-  process.exit(1);
+test('the marker is not a memory file the bounds would keep', () => {
+  const dir = fresh();
+  put(dir, 'NOTES.md', 'n');
+  put(dir, memory.TEST_MARKER, 'x');
+  assert.deepEqual(memory.admit([{ rel: memory.TEST_MARKER, bytes: 1 }, { rel: `scripts/${memory.TEST_MARKER}`, bytes: 1 }]), [`scripts/${memory.TEST_MARKER}`], 'by shape alone a script of that name is a script: the marker is placed outside scripts/ for that reason');
+  const { kept, removed } = memory.enforce(dir, new Map());
+  assert.deepEqual(kept, ['NOTES.md']);
+  assert.deepEqual(removed, [memory.TEST_MARKER]);
+});
+
+function fakeBucket(overrides = {}) {
+  const calls = [];
+  const config = {
+    bucket: 'acme-sre-memory',
+    prefix: 'fleet/',
+    workspace: fresh(),
+    run: async (command, args, options) => {
+      calls.push({ command, args, options });
+      return { code: 0, stdout: '', stderr: '', timedOut: false };
+    },
+    ...overrides,
+  };
+  return { config, calls };
 }
-console.log('all memory tests passed');
+
+testAsync('probe puts the marker outside scripts/ and removes it, two calls, each with the probe timeout', async () => {
+  const { config, calls } = fakeBucket({ probeTimeoutMs: 1234 });
+  const answer = await bucket.probe(config, 'acme/app', '/somewhere/.runner-test');
+  assert.deepEqual(answer, { ok: true, calls: 2 });
+  assert.deepEqual(calls.map((call) => call.args), [
+    ['s3', 'cp', '/somewhere/.runner-test', 's3://acme-sre-memory/fleet/acme/app/.runner-test', '--only-show-errors'],
+    ['s3', 'rm', 's3://acme-sre-memory/fleet/acme/app/.runner-test', '--only-show-errors'],
+  ]);
+  assert.ok(calls.every((call) => call.command === 'aws' && call.options.timeoutMs === 1234));
+});
+
+testAsync('probe ignores the mirror deadline and a journal of any size', async () => {
+  const { config, calls } = fakeBucket({ deadlineMs: 1 });
+  fs.mkdirSync(config.workspace, { recursive: true });
+  const paths = {};
+  for (let index = 0; index < 500; index += 1) paths[`acme/r${index}/NOTES.md`] = 'added';
+  paths['acme/gone/NOTES.md'] = 'added';
+  fs.writeFileSync(path.join(config.workspace, '.memory-mirror-pending'), JSON.stringify({ version: 1, paths }));
+  const answer = await bucket.probe(config, '_estate', '/v/.runner-test');
+  assert.equal(answer.ok, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.timeoutMs, 60_000);
+});
+
+testAsync('probe says which call failed, and that a marker it could not remove is left for the next test job', async () => {
+  const failing = (needle) => async (command, args) => (args.includes(needle) ? { code: 1, stdout: '', stderr: 'An error occurred (AccessDenied)', timedOut: false } : { code: 0, stdout: '', stderr: '', timedOut: false });
+  const put = await bucket.probe(fakeBucket({ run: failing('cp') }).config, '_estate', '/v/.runner-test');
+  assert.equal(put.ok, false);
+  assert.equal(put.calls, 1);
+  assert.match(put.error, /did not take the marker \(aws s3 cp: An error occurred \(AccessDenied\)\)/);
+  const removal = await bucket.probe(fakeBucket({ run: failing('rm') }).config, '_estate', '/v/.runner-test');
+  assert.equal(removal.ok, false);
+  assert.equal(removal.calls, 2);
+  assert.match(removal.error, /could not be removed \(aws s3 rm: An error occurred \(AccessDenied\)\); the next test job removes it/);
+  const thrown = await bucket.probe(fakeBucket({ run: async () => { throw new Error('spawn aws ENOENT'); } }).config, '_estate', '/v/.runner-test');
+  assert.equal(thrown.ok, false);
+  assert.match(thrown.error, /spawn aws ENOENT/);
+});
+
+testAsync('probe refuses a place that is not a memory directory, and puts nothing while a restore is pending', async () => {
+  const { config, calls } = fakeBucket();
+  for (const label of ['', '..', 'a/../b', 'acme/app bad', undefined]) {
+    const answer = await bucket.probe(config, label, '/v/.runner-test');
+    assert.equal(answer.ok, false, String(label));
+  }
+  fs.mkdirSync(config.workspace, { recursive: true });
+  fs.writeFileSync(path.join(config.workspace, '.memory-restore-pending'), '{}');
+  const pending = await bucket.probe(config, 'acme/app', '/v/.runner-test');
+  assert.equal(pending.ok, false);
+  assert.match(pending.error, /restore/);
+  assert.equal(calls.length, 0);
+  assert.deepEqual(await bucket.probe({ ...config, bucket: '' }, 'acme/app', '/v/.runner-test'), { ok: true, calls: 0, skipped: 'no bucket is configured' });
+});
+
+Promise.all(asyncTests).then(() => {
+  fs.rmSync(root, { recursive: true, force: true });
+  if (failed > 0) {
+    console.log(`${failed} test(s) failed`);
+    process.exit(1);
+  }
+  console.log('all memory tests passed');
+});

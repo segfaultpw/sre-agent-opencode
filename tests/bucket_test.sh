@@ -1096,22 +1096,24 @@ export STUB_OPENCODE_MODE=oneline
 BUCKET_V="acme-sre-memory"
 PREFIX_V="fleet"
 run_driver test_bucket
-estate_marker="$workspace/memory/_estate/scripts/.runner-test"
+# The marker sits at the top of the memory directory, where nothing can be
+# memory: a leftover is never a note or a script the agent would be shown.
+estate_marker="$workspace/memory/_estate/.runner-test"
+marker_key=s3://acme-sre-memory/fleet/_estate/.runner-test
 check "the job exits 0 and is reported as not_validated" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
 check_jq "every step passed, the bucket step among them" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
 check_jq "the bucket step names the bucket and the prefix" '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/")' "$report"
-check "the marker was put under the prefix, in the estate's scripts" test "$(grep -cxF "$(argline s3 cp "$estate_marker" s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
-check "and removed from the bucket" test "$(grep -cxF "$(argline s3 rm s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "the marker was put under the prefix, in the estate's directory and outside scripts/" test "$(grep -cxF "$(argline s3 cp "$estate_marker" "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "and removed from the bucket" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
 check "the put came before the removal" test "$(grep -nF 's3'"$us"'cp'"$us$estate_marker" "$ctl/aws_calls.log" | head -n 1 | cut -d: -f1)" -lt "$(grep -nF 's3'"$us"'rm'"$us" "$ctl/aws_calls.log" | head -n 1 | cut -d: -f1)"
 check "nothing is left in the bucket" test -z "$(find "$ctl/uploaded" -type f -print -quit 2>/dev/null)"
 check "nothing is left on the volume: no marker, no directory the test made" test ! -e "$estate_marker" -a ! -e "$workspace/memory/_estate"
 check "the mirror's calls were made after the brief was fetched and before the report was posted" test "$(tail -n 2 "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "1 "
-check_jqf "the result carries the mirror's answer" '.mirror.ok == true and .mirror.pending == 0' "$work/test_bucket.result.json"
-check "no journal and no pending path are left" test ! -e "$workspace/.memory-mirror-pending"
+check "the marker never entered the journal" test ! -e "$workspace/.memory-mirror-pending"
 check "no shell ran anything in the workspace name" test -z "$(pwned)"
 stop_fixture
 
-echo "--- 23b. a bucket that refuses the marker fails the bucket step with the aws error, and the removal is retried by the next job ---"
+echo "--- 23b. a bucket that refuses the marker fails the bucket step with the aws error, and nothing is left behind ---"
 reset_aws
 fresh_workspace
 printf '.runner-test' > "$ctl/aws_fail_on"
@@ -1123,16 +1125,89 @@ check_jq "the steps before the bucket pass, the bucket fails with the aws error,
 check_jq "the summary is one sentence naming the step" '(.summary | contains("the bucket step")) and (.summary | test("\n") | not)' "$report"
 check "nothing was uploaded" test ! -e "$ctl/uploaded"
 check "no marker file is left on the volume" test -z "$(find "$workspace/memory" -name '.runner-test' -print -quit 2>/dev/null)"
-check_jqf "the removal of the marker waits in the journal, as a removal" '.paths["_estate/scripts/.runner-test"] == "removed"' "$workspace/.memory-mirror-pending"
+check "the marker is not journaled: the bucket step's verdict is its own two calls" test ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 23b2. a bucket that takes the marker and refuses to remove it fails the step, and the next test job removes it ---"
+reset_aws
+fresh_workspace
+printf 's3%srm' ' ' > "$ctl/aws_fail_on"
+start_fixture test_bucket_norm
+queue_test_job h-test-bucket-norm ""
+run_driver test_bucket_norm
+check_jq "the bucket step fails and says the marker could not be removed, with the aws error" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("removed")) and (.test.steps[4].detail | contains("AccessDenied"))' "$report"
+check "the marker object is in the bucket, as the step said" test -f "$ctl/uploaded/acme-sre-memory/fleet/_estate/.runner-test"
+check "no marker file is left on the volume" test -z "$(find "$workspace/memory" -name '.runner-test' -print -quit 2>/dev/null)"
 stop_fixture
 rm -f "$ctl/aws_fail_on"
-: > "$ctl/aws_calls.log"
-start_fixture test_bucket_retry
-queue_one h-test-bucket-retry
+start_fixture test_bucket_norm_again
+queue_test_job h-test-bucket-norm-again ""
+run_driver test_bucket_norm_again
+check_jq "the next test job passes" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check "and the marker object is gone" test ! -e "$ctl/uploaded/acme-sre-memory/fleet/_estate/.runner-test"
+stop_fixture
+
+echo "--- 23d. a journal the bucket has not caught up with never decides the bucket step ---"
+# The journal holds what earlier requests (or a first sync) left to upload. The
+# step judges the marker's own put and removal; the backlog is carried to the
+# bucket after the report, on the mirror's own deadline.
+reset_aws
+fresh_workspace
+for repo in acme/app acme/api acme/web; do
+  mkdir -p "$workspace/memory/$repo"
+  printf 'notes of %s\n' "$repo" > "$workspace/memory/$repo/NOTES.md"
+done
+write_sync_marker acme-sre-memory fleet/
+printf '{"version":1,"paths":{"acme/api/NOTES.md":"added","acme/app/NOTES.md":"added","acme/gone/NOTES.md":"added","acme/web/NOTES.md":"added"}}\n' > "$workspace/.memory-mirror-pending"
+start_fixture test_bucket_backlog
+queue_test_job h-test-bucket-backlog ""
+run_driver test_bucket_backlog
+check_jq "a journaled path whose file is gone does not fail the bucket step" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check "the marker was put and removed" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "the backlog's files that exist were carried to the bucket" test -f "$ctl/uploaded/acme-sre-memory/fleet/acme/app/NOTES.md" -a -f "$ctl/uploaded/acme-sre-memory/fleet/acme/web/NOTES.md" -a -f "$ctl/uploaded/acme-sre-memory/fleet/acme/api/NOTES.md"
+check "the marker's two calls came before the report and the backlog's three after it" test "$(sed -n 1,2p "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "1 " -a "$(sed -n 3,5p "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "2 "
+stop_fixture
+
+echo "--- 23e. a backlog cut by the mirror's deadline does not fail the bucket step either ---"
+reset_aws
+fresh_workspace
+for number in 1 2 3 4 5 6; do
+  mkdir -p "$workspace/memory/acme/r$number"
+  printf 'notes %s\n' "$number" > "$workspace/memory/acme/r$number/NOTES.md"
+done
+write_sync_marker acme-sre-memory fleet/
+printf '{"version":1,"paths":{"acme/r1/NOTES.md":"added","acme/r2/NOTES.md":"added","acme/r3/NOTES.md":"added","acme/r4/NOTES.md":"added","acme/r5/NOTES.md":"added","acme/r6/NOTES.md":"added"}}\n' > "$workspace/.memory-mirror-pending"
+printf '1' > "$ctl/aws_sleep"
+driver_deadline_ms=1500
+start_fixture test_bucket_cut
+queue_test_job h-test-bucket-cut ""
+run_driver test_bucket_cut
+driver_deadline_ms=""
+check_jq "the bucket step passes although the mirror's deadline is shorter than the backlog" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check "the marker was put and removed" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
+check "what the deadline cut still waits in the journal" test -s "$workspace/.memory-mirror-pending"
+stop_fixture
+rm -f "$ctl/aws_sleep"
+
+echo "--- 23f. a marker a killed runner left behind is not memory: it is removed at start, never shown to the agent and never uploaded ---"
+reset_aws
+fresh_workspace
+mkdir -p "$workspace/memory/_estate/scripts" "$workspace/memory/acme/app/scripts"
+printf 'estate\n' > "$workspace/memory/_estate/NOTES.md"
+printf 'app\n' > "$workspace/memory/acme/app/NOTES.md"
+printf 'left by a test job\n' > "$workspace/memory/_estate/.runner-test"
+printf 'left by a test job\n' > "$workspace/memory/acme/app/.runner-test"
+write_sync_marker acme-sre-memory fleet/
+start_fixture test_leftover
+queue_one h-leftover
 export STUB_OPENCODE_MODE=diagnose
-run_driver test_bucket_retry
-check "the next ordinary job removes the marker from the bucket, once" test "$(grep -cxF "$(argline s3 rm s3://acme-sre-memory/fleet/_estate/scripts/.runner-test --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
-check "and the journal is empty again" test ! -e "$workspace/.memory-mirror-pending"
+run_driver test_leftover
+check "the estate's marker is gone" test ! -e "$workspace/memory/_estate/.runner-test"
+check "and so is the repository's" test ! -e "$workspace/memory/acme/app/.runner-test"
+check "the agent was shown the estate's notes and no marker" test "$(grep -c '^memory_files:.*NOTES.md' "$opencode_log")" -eq 1 -a "$(grep -c 'runner-test' "$opencode_log")" -eq 0
+check_jq "the removal is not reported as a change the run made to its memory" 'has("memory") | not' "$report"
+check "nothing about a marker was sent to the bucket" test "$(grep -c 'runner-test' "$ctl/aws_calls.log")" -eq 0
+check "the notes are untouched" test "$(cat "$workspace/memory/_estate/NOTES.md")" = "estate" -a "$(cat "$workspace/memory/acme/app/NOTES.md")" = "app"
 stop_fixture
 
 echo "--- 23c. a restore that has not succeeded fails the bucket step, naming the restore ---"

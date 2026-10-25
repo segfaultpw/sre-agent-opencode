@@ -1705,7 +1705,7 @@ function newResult(config) {
 // step after it as not run; `reported` is always ok, because the report
 // arriving is its proof.
 const TEST_DETAIL_MAX = 300;
-const TEST_MARKER = '.runner-test';
+const TEST_MARKER = memory.TEST_MARKER;
 const TEST_NOT_RUN = 'not run';
 const TEST_MODEL_TIMEOUT_MS = 120_000;
 // Fixed, and sent with none of a brief or of the memory: this is the whole input
@@ -1835,7 +1835,8 @@ async function runTestJob(config, job) {
       } finally {
         await reclaim(scratch.dir);
       }
-      result.actions.push(`asked model ${config.model} for one line through opencode run`);
+      const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
       return modelVerdict(agent, timeoutMs);
     });
 
@@ -1856,33 +1857,26 @@ async function runTestJob(config, job) {
       return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${label} and removed it again` };
     });
 
+    // Judged on the marker's own put and removal, never on the journal: what
+    // earlier requests left to upload is carried after the report, on the
+    // mirror's own deadline, and cannot make a working bucket look broken.
     await step('bucket', async () => {
       const settings = bucketSettings(config);
       if (!settings) return { ok: true, detail: 'no bucket configured' };
       const dir = memoryDirectory();
       const label = path.relative(memoryRoot, dir);
-      const scripts = path.join(dir, memory.SCRIPTS);
-      const marker = path.join(scripts, TEST_MARKER);
-      const key = `${label}/${memory.SCRIPTS}/${TEST_MARKER}`;
-      const created = makeTrackedDirectories(memoryRoot, scripts);
-      let put;
-      let size;
+      const marker = path.join(dir, TEST_MARKER);
+      const created = makeTrackedDirectories(memoryRoot, dir);
+      let answer;
       try {
         writeTestMarker(marker);
-        size = fs.statSync(marker).size;
-        put = await bucket.mirror(settings, [{ path: key, change: 'added', bytes: size }]);
+        answer = await bucket.probe(settings, label, marker);
       } finally {
         fs.rmSync(marker, { force: true });
         removeTrackedDirectories(created);
       }
-      // The same mirror a fix goes through: the marker is put, then removed, and
-      // a removal that fails stays in the journal for the next request.
-      const removal = await bucket.mirror(settings, [{ path: key, change: 'removed', bytes: size }]);
-      const error = put.ok ? removal.error : put.error;
-      result.mirror = { ok: Boolean(put.ok && removal.ok), calls: (put.calls || 0) + (removal.calls || 0), pending: removal.pending || 0 };
-      if (error) result.mirror.error = error;
-      if (!result.mirror.ok) return { ok: false, detail: `the bucket did not take the marker: ${error || 'no answer'}` };
-      return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/${memory.SCRIPTS}/ and removed it again` };
+      if (!answer.ok) return { ok: false, detail: answer.error };
+      return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/ and removed it again` };
     });
   } finally {
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
@@ -1890,6 +1884,7 @@ async function runTestJob(config, job) {
     result.summary = testSummary(config, result.test, failed);
     await report(job, result);
     jobSecret = null;
+    await mirrorMemory(config, result);
   }
   return result;
 }
@@ -2085,6 +2080,11 @@ async function startMemory(config) {
     for (const note of memory.recover(config.workspace)) log('info', `memory: ${note}`);
   } catch (error) {
     log('warn', `memory directories left by a stopped run could not be put in order (${redact(error.message)})`);
+  }
+  try {
+    for (const gone of memory.clearTestMarkers(config.workspace)) log('info', `memory: removed ${gone}, left by a test job that stopped before it could`);
+  } catch (error) {
+    log('warn', `a marker left by a stopped test job could not be removed (${redact(error.message)})`);
   }
   await settleWorkspace(config);
 

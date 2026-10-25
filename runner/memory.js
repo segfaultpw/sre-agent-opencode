@@ -20,6 +20,11 @@ const path = require('node:path');
 const NOTES = 'NOTES.md';
 const SCRIPTS = 'scripts';
 const ESTATE = '_estate';
+// The file a test job writes at the top of a memory directory, and takes away
+// again. It is not memory (only NOTES.md and scripts/ are), so a copy a killed
+// runner leaves is removed at start, before anything is restored, journaled or
+// shown to the agent.
+const TEST_MARKER = '.runner-test';
 const MAX_NOTES_BYTES = 65536;
 const MAX_SCRIPTS = 50;
 const MAX_DIR_BYTES = 1048576;
@@ -445,10 +450,38 @@ function recover(workspace) {
   return notes;
 }
 
+// Removes every test marker under the memory root and returns their paths
+// relative to it. Only the runner can write there, so there is no link to meet;
+// rmSync never follows one in any case.
+function clearTestMarkers(workspace) {
+  const { memory: root } = layout(workspace);
+  const removed = [];
+  const clear = (dir) => {
+    const target = path.join(dir, TEST_MARKER);
+    if (!lstatOrNull(target)) return;
+    fs.rmSync(target, { recursive: true, force: true });
+    removed.push(path.relative(root, target));
+  };
+  for (const name of readDirOrEmpty(root)) {
+    const top = path.join(root, name);
+    if (!isRealDirectory(top)) continue;
+    if (name === ESTATE) {
+      clear(top);
+      continue;
+    }
+    for (const repo of readDirOrEmpty(top)) {
+      const leaf = path.join(top, repo);
+      if (isRealDirectory(leaf)) clear(leaf);
+    }
+  }
+  return removed;
+}
+
 module.exports = {
   NOTES,
   SCRIPTS,
   ESTATE,
+  TEST_MARKER,
   MAX_NOTES_BYTES,
   MAX_SCRIPTS,
   MAX_DIR_BYTES,
@@ -466,4 +499,5 @@ module.exports = {
   check,
   blobSha,
   recover,
+  clearTestMarkers,
 };

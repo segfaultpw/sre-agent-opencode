@@ -1058,11 +1058,23 @@ if [ "$(cat "$brief_seen")" = "$test_prompt" ]; then echo "ok   what the model i
 if grep -qx 'sees_SRE_API_KEY: no' "$opencode_log" && grep -qx 'sees_SRE_GITHUB_TOKEN: no' "$opencode_log" && grep -qx 'aws_env: ' "$opencode_log"; then echo "ok   the model call has the same scrubbed environment as a fix"; else echo "FAIL $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "cwd: $workspace/scratch" "$opencode_log"; then echo "ok   it runs in the scratch directory"; else echo "FAIL cwd: $(grep cwd "$opencode_log")"; fail=1; fi
 if jq -e '.test.steps[2].detail | test("Ready, and working")' <<<"$report" >/dev/null; then echo "ok   the model step carries the model's one line"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
+if jq -e '.actions | any(test("within 60 seconds"))' <<<"$report" >/dev/null; then echo "ok   the model call is bounded by SRE_RUN_TIMEOUT_SECONDS when that is shorter than two minutes, and the report says so"; else echo "FAIL actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
 if jq -e '.test.steps[3].detail | test("runner-test")' <<<"$report" >/dev/null && [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   the memory step wrote .runner-test and removed it again"; else echo "FAIL steps: $(jq -c '.test' <<<"$report"); left: $(find "$workspace/memory" -name '.runner-test')"; fail=1; fi
 if [ "$(find "$mem" -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)" = "$before_memory" ]; then echo "ok   the repository's memory is as it was"; else echo "FAIL the memory changed"; fail=1; fi
 if jq -e '.test.steps[4] == {name: "bucket", ok: true, detail: "no bucket configured"}' <<<"$report" >/dev/null; then echo "ok   with no bucket configured the bucket step is ok, saying so"; else echo "FAIL steps: $(jq -c '.test.steps[4]' <<<"$report")"; fail=1; fi
 if [ "$(jq -r '.test.steps[5].ok' <<<"$report")" = "true" ]; then echo "ok   the reported step is ok: the report is being sent"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
 if [ "$(auth_for /brief)" = "Bearer $handoff_token" ] && [ "$(auth_for /report)" = "Bearer $handoff_token" ] && [ "$(count_path /brief)" -eq 1 ] && [ "$(count_path /report)" -eq 1 ]; then echo "ok   the brief is fetched once and the report posted once, with the handoff token"; else echo "FAIL fixture calls"; fail=1; fi
+stop_fixture
+
+echo "--- 43b. the model step never waits longer than two minutes, whatever SRE_RUN_TIMEOUT_SECONDS allows ---"
+start_fixture test_cap
+queue_test_job h-test-cap ""
+export STUB_OPENCODE_MODE=oneline
+run_timeout=1800
+run_once test_cap
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+if jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.actions | any(test("within 120 seconds"))' <<<"$report" >/dev/null && ! jq -e '.actions | any(test("within 1800 seconds"))' <<<"$report" >/dev/null; then echo "ok   with a run timeout of 1800 seconds the model is given 120"; else echo "FAIL actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
 stop_fixture
 
 echo "--- 44. a test job with no test repository uses scratch and says so ---"
@@ -1105,6 +1117,29 @@ runner_github_token=""
 run_once test_no_token
 unset runner_github_token
 fail_step_check "a runner with no repository token" cloned 'SRE_GITHUB_TOKEN' '[true, false, false, false, false, true]'
+stop_fixture
+
+start_fixture_brief_status() {
+  export FIXTURE_BRIEF_STATUS="$2"
+  start_fixture "$1"
+  unset FIXTURE_BRIEF_STATUS
+}
+start_fixture_brief_status test_collected_fail 500
+queue_test_job h-test-collected-fail acme/app
+export STUB_OPENCODE_MODE=oneline
+run_once test_collected_fail
+export STUB_OPENCODE_MODE=fix
+fail_step_check "a brief the platform cannot serve" collected 'could not be fetched \(HTTP 500\)' '[false, false, false, false, false, true]'
+if [ ! -s "$opencode_log" ] && [ ! -s "$git_log" ]; then echo "ok   neither the model nor git is reached after a failed collection"; else echo "FAIL opencode: $(cat "$opencode_log") git: $(cat "$git_log")"; fail=1; fi
+stop_fixture
+
+start_fixture test_model_long
+queue_test_job h-test-model-long ""
+export STUB_OPENCODE_MODE=provider_error_long
+run_once test_model_long
+export STUB_OPENCODE_MODE=fix
+fail_step_check "a model whose error is a page long" model 'a long provider error' '[true, true, false, false, false, true]'
+if jq -e '(.test.steps[2].detail | length) == 300' <<<"$report" >/dev/null; then echo "ok   the sentence is cut at exactly 300 characters"; else echo "FAIL detail length: $(jq -r '.test.steps[2].detail | length' <<<"$report")"; fail=1; fi
 stop_fixture
 
 start_fixture test_model_error
@@ -1153,6 +1188,29 @@ run_once test_long_detail
 if jq -e '.test.steps | all(.[]; (.detail | length) <= 300)' <<<"$report" >/dev/null && jq -e '.test.steps | map(.ok) == [true, true, true, false, false, true]' <<<"$report" >/dev/null; then echo "ok   a repository whose memory directory cannot be named fails the memory step, every detail within 300 characters"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 stop_fixture
 
+echo "--- 45b. the bucket step against a test repository puts and removes the marker under the repository's key ---"
+install -m 755 "$here/fixture/stub_aws.sh" "$work/bin/aws"
+: > "$work/ctl/aws_calls.log"
+: > "$work/ctl/aws_seen.log"
+: > "$work/ctl/aws_env.log"
+rm -rf "$work/ctl/uploaded"
+export SRE_MEMORY_BUCKET=acme-sre-memory SRE_MEMORY_PREFIX=fleet
+start_fixture test_bucket_repo
+queue_test_job h-test-bucket-repo acme/app
+export STUB_OPENCODE_MODE=oneline
+run_once test_bucket_repo
+export STUB_OPENCODE_MODE=fix
+us=$'\037'
+want_put="s3${us}cp${us}${mem}/.runner-test${us}s3://acme-sre-memory/fleet/acme/app/.runner-test${us}--only-show-errors${us}"
+want_rm="s3${us}rm${us}s3://acme-sre-memory/fleet/acme/app/.runner-test${us}--only-show-errors${us}"
+if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/acme/app/")' <<<"$report" >/dev/null; then echo "ok   every step passes and the bucket step names the repository's place in the bucket"; else echo "FAIL rc=$rc steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if [ "$(grep -cxF "$want_put" "$work/ctl/aws_calls.log")" -eq 1 ] && [ "$(grep -cxF "$want_rm" "$work/ctl/aws_calls.log")" -eq 1 ]; then echo "ok   the marker is put under <owner>/<repo>/ and removed again, once each"; else echo "FAIL aws calls: $(tr '\037' ' ' < "$work/ctl/aws_calls.log")"; fail=1; fi
+if [ -z "$(find "$work/ctl/uploaded" -name '.runner-test' -print -quit 2>/dev/null)" ] && [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   neither the bucket nor the volume keeps the marker"; else echo "FAIL left: $(find "$work/ctl/uploaded" "$workspace/memory" -name '.runner-test')"; fail=1; fi
+if ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed"; else echo "FAIL git: $(cat "$git_log")"; fail=1; fi
+unset SRE_MEMORY_BUCKET SRE_MEMORY_PREFIX
+rm -f "$work/bin/aws"
+stop_fixture
+
 echo "--- 46. a test report is the ordinary body plus the test key ---"
 # Older platforms read named keys only, so the two optional keys are additions
 # and never replacements: a platform that ignores test still gets a valid report.
@@ -1163,6 +1221,27 @@ run_once testbase
 export STUB_OPENCODE_MODE=fix
 if jq -e '(keys | sort) == ["actions", "evidence", "outcome", "summary", "test"] and (.actions | type == "array") and (.evidence.runner_version | startswith("v"))' <<<"$report" >/dev/null; then echo "ok   the keys are the ordinary ones and test"; else echo "FAIL report keys: $(jq -c 'keys' <<<"$report")"; fail=1; fi
 stop_fixture
+
+echo "--- 47. the stub's token probes read the whole environment before they answer ---"
+# `grep -q` leaves at the first match, and the command upstream can then die of
+# SIGPIPE; under pipefail that turned a token that was there into "no", which
+# failed a run at random under load. An `env` that lists the token first and
+# then three megabytes makes the producer outlive the match every time.
+probe_token="$(printf 'sre-agent-probe-%048d' 5)"
+mkdir -p "$work/env_shim"
+cat > "$work/env_shim/env" <<EOF
+#!/bin/sh
+printf 'RUNNER_TOKEN=%s\n' "$probe_token"
+head -c 3000000 /dev/zero | tr '\0' 'a' | fold -w 100
+EOF
+chmod +x "$work/env_shim/env"
+: > "$work/probe.log"
+for _ in 1 2 3; do
+  PATH="$work/env_shim:$PATH" STUB_OPENCODE_LOG="$work/probe.log" STUB_RUNNER_TOKEN="$probe_token" STUB_OPENCODE_MODE=silent \
+    bash "$work/bin/opencode" < /dev/null > /dev/null 2>&1 || true
+done
+if [ "$(grep -cx 'runner_token_visible: yes' "$work/probe.log")" -eq 3 ]; then echo "ok   a token the environment holds is seen as visible, three times out of three"; else echo "FAIL probe log: $(grep runner_token_visible "$work/probe.log")"; fail=1; fi
+if ! grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh" >/dev/null; then echo "ok   no pipeline in the stub ends with grep -q"; else echo "FAIL $(grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh")"; fail=1; fi
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
 # The runner cannot deploy, so it cannot verify a fix in a running system. The

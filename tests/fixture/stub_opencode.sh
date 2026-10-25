@@ -23,7 +23,9 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     if [ -n "${SRE_API_KEY+set}" ]; then printf 'sees_SRE_API_KEY: yes\n'; else printf 'sees_SRE_API_KEY: no\n'; fi
     if [ -n "${SRE_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_GITHUB_TOKEN: no\n'; fi
     if [ -n "${SRE_AGENT_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_AGENT_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_AGENT_GITHUB_TOKEN: no\n'; fi
-    printf 'runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -qF -- "$STUB_RUNNER_TOKEN"; then echo yes; else echo no; fi)"
+    # grep -c reads the whole environment: with -q it leaves at the first match,
+    # the producer upstream can die of SIGPIPE, and pipefail reads that as "no".
+    printf 'runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"
     if [ -n "${STUB_PROBE_GIT:-}" ] && [ -e .git ]; then
       printf 'git_status_clean: %s\n' "$(if [ -z "$("$STUB_PROBE_GIT" status --porcelain 2>/dev/null)" ]; then echo yes; else echo no; fi)"
       printf 'git_log_commits: %s\n' "$("$STUB_PROBE_GIT" rev-list --count HEAD 2>/dev/null || echo 0)"
@@ -78,10 +80,10 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'mise_data_dir: %s\n' "${MISE_DATA_DIR:-}"
     printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|SRE_AGENT_GITHUB_TOKEN|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
     printf 'gh_token: %s\n' "$(if [ -z "${GH_TOKEN+set}" ]; then echo absent; elif [ "$GH_TOKEN" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then echo matches; else echo differs; fi)"
-    printf 'probe_runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -qF -- "$STUB_RUNNER_TOKEN"; then echo yes; else echo no; fi)"
-    printf 'helper_hands_out_runner_token: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -qF -- "$STUB_RUNNER_TOKEN"; then echo yes; else echo no; fi)"
+    printf 'probe_runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"
+    printf 'helper_hands_out_runner_token: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"
     printf 'pip_break: %s\n' "${PIP_BREAK_SYSTEM_PACKAGES:-}"
-    printf 'credential_helper: %s\n' "$(if printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -qx "password=${GH_TOKEN:-unset}"; then echo ok; else echo failed; fi)"
+    printf 'credential_helper: %s\n' "$(if printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -cx "password=${GH_TOKEN:-unset}" >/dev/null; then echo ok; else echo failed; fi)"
     printf 'git_user: %s\n' "$("${STUB_PROBE_GIT:?}" config --global user.name 2>/dev/null || echo none)"
     if [ -n "${STUB_CLONE_SOURCE:-}" ]; then
       clone_dir="$(mktemp -d)/clone"
@@ -262,6 +264,13 @@ case "$mode" in
     # which is exactly what tests/dry_run_test.sh sees from the real binary.
     jq -cn '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderAuthError", data: {message: "User not found."}}}'
     echo "opencode: the provider refused the key" >&2
+    exit 1
+    ;;
+  provider_error_long)
+    # The same ending with an error message far longer than a test step's
+    # sentence may be: the runner must cut it, not forward a page of it.
+    long="$(printf 'a long provider error %.0s' $(seq 1 60))"
+    jq -cn --arg m "$long" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderError", data: {message: $m}}}'
     exit 1
     ;;
   hang)

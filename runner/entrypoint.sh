@@ -142,9 +142,6 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
     echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not executable" >&2
     exit 1
   fi
-  # The workspace is the volume the agent writes (its home and checkouts live there), so a
-  # script on it is one the agent could replace before the next start, when it runs as root.
-  # /tmp, /var/tmp and /dev/shm are refused below for the same reason.
   case "$setup" in
     /*) ;;
     *)
@@ -152,23 +149,50 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
       exit 1
       ;;
   esac
+  # The script runs as root at every start, so it must be somewhere the agent
+  # cannot write, whichever way the path is spelled. Three questions are asked
+  # of the path as given and of the file it resolves to (a link can sit in a
+  # place the agent writes while pointing at a safe file, and the other way
+  # round): is it on the workspace, which is the volume the agent writes (its
+  # home and checkouts live there); is it under one of the directories every
+  # account can write, named here because they are where an agent looks first;
+  # and is any directory above it, or the file itself, writable by every
+  # account, which covers the ones nobody named (a mount with the wrong mode).
+  setup_given="$(realpath -m -s -- "$setup")"
   setup_real="$(realpath -e -- "$setup")"
-  case "$setup_real/" in
-    "$workspace_real"/*)
-      echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is on the workspace ${workspace}; the agent can write there and the script runs as root, so put it in the image" >&2
-      exit 1
-      ;;
-  esac
-  # Every account in the container can write these, the agent's included, and
-  # they are not the image's: the same reason as the workspace.
-  for open_dir in /tmp /var/tmp /dev/shm; do
-    open_real="$(realpath -m -- "$open_dir")"
-    case "$setup_real/" in
-      "$open_dir"/* | "$open_real"/*)
-        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is under ${open_dir}; the agent can write there and the script runs as root, so put it in the image" >&2
+  open_dirs=(/tmp /var/tmp /dev/shm /run/lock /var/lock)
+  for candidate in "$setup_given" "$setup_real"; do
+    case "$candidate/" in
+      "$workspace_real"/*)
+        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is on the workspace ${workspace}; the agent can write there and the script runs as root, so put it in the image" >&2
         exit 1
         ;;
     esac
+    for open_dir in "${open_dirs[@]}"; do
+      open_real="$(realpath -m -- "$open_dir")"
+      case "$candidate/" in
+        "$open_dir"/* | "$open_real"/*)
+          echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is under ${open_dir}; the agent can write there and the script runs as root, so put it in the image" >&2
+          exit 1
+          ;;
+      esac
+    done
+  done
+  # The directories above each spelling, and the resolved file itself. A link is
+  # never the file asked about (its own mode says nothing), so the given spelling
+  # starts at its directory and the resolved one at the file.
+  for start in "${setup_given%/*}" "$setup_real"; do
+    current="${start:-/}"
+    while :; do
+      mode="$(stat -L -c '%a' -- "$current" 2>/dev/null || echo 0)"
+      if (( (8#${mode}) & 8#002 )); then
+        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, and ${current} on the way to it is writable by every account; the agent can replace what is there and the script runs as root, so put it in a place only root writes, in the image" >&2
+        exit 1
+      fi
+      if [ "$current" = "/" ]; then break; fi
+      current="${current%/*}"
+      current="${current:-/}"
+    done
   done
   echo "sre-agent-fix-runner: running the setup script ${setup}"
   set +e

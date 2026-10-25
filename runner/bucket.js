@@ -61,6 +61,9 @@ const RETRY_TIMEOUT_MS = 300_000;
 // back for as long as there are paths. A call is given the time that is left,
 // so one that gets no answer uses all of it and ends the mirror.
 const MIRROR_DEADLINE_MS = 120_000;
+// What a test job gives each of its two calls (the marker's put and its
+// removal): the step is bounded by these and by nothing else.
+const PROBE_TIMEOUT_MS = 60_000;
 const RETRY_BACKOFF_BASE_MS = 30_000;
 const RETRY_BACKOFF_MAX_MS = 600_000;
 const ERROR_MAX = 300;
@@ -443,6 +446,41 @@ async function mirror(config, changes) {
   return { ok: false, calls, pending, error };
 }
 
+// What a test job asks of the bucket: one marker object put under the memory
+// prefix, at <label>/.runner-test (outside NOTES.md and scripts/, so nothing
+// that ever reaches the journal or a restore can be taken for it), and taken
+// away again. The answer is about those two calls and nothing else: the journal
+// of paths earlier requests left, and the mirror's deadline over them, play no
+// part, so a bucket that works is never reported as one that does not because of
+// a backlog. While a restore has not succeeded nothing is put, as for the mirror.
+// Never throws.
+async function probe(config, label, local) {
+  if (!config || !config.bucket) return { ok: true, calls: 0, skipped: 'no bucket is configured' };
+  const segments = typeof label === 'string' ? label.split('/') : [];
+  if (segments.length === 0 || !segments.every(memory.validName)) {
+    return { ok: false, calls: 0, error: `the marker's place ${show(label)} is not a memory directory` };
+  }
+  if (restorePending(config)) {
+    return { ok: false, calls: 0, error: 'the restore from the bucket has not succeeded, so no marker was put; it is tried again before each request' };
+  }
+  const uri = `s3://${config.bucket}/${config.prefix}${segments.join('/')}/${memory.TEST_MARKER}`;
+  const timeoutMs = Number.isFinite(config.probeTimeoutMs) && config.probeTimeoutMs > 0 ? config.probeTimeoutMs : PROBE_TIMEOUT_MS;
+  const call = async (args) => {
+    try {
+      return await config.run('aws', args, { timeoutMs });
+    } catch (error) {
+      return { code: null, stdout: '', stderr: error.message, timedOut: false };
+    }
+  };
+  const put = await call(['s3', 'cp', local, uri, '--only-show-errors']);
+  if (put.code !== 0) return { ok: false, calls: 1, error: `the bucket did not take the marker (aws s3 cp: ${failureText(put)})` };
+  const removal = await call(['s3', 'rm', uri, '--only-show-errors']);
+  if (removal.code !== 0) {
+    return { ok: false, calls: 2, error: `the bucket took the marker but it could not be removed (aws s3 rm: ${failureText(removal)}); the next test job removes it` };
+  }
+  return { ok: true, calls: 2 };
+}
+
 // A leaf directory (_estate, or <owner>/<repo>) as restored from the bucket.
 // Returns the number of files kept. enforce is the whole judgement: after it
 // the directory holds NOTES.md and scripts/<name> within the bounds.
@@ -730,4 +768,4 @@ async function retryRestore(config) {
   return result;
 }
 
-module.exports = { fromEnv, restore, retryRestore, restorePending, firstSync, mirror, isLeftover, DEFAULT_PREFIX };
+module.exports = { fromEnv, restore, retryRestore, restorePending, firstSync, mirror, probe, isLeftover, DEFAULT_PREFIX };
