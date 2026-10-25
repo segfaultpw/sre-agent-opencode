@@ -45,6 +45,14 @@ if [ "${#missing_tools[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# The memory mirror runs the AWS CLI, and only when a bucket is configured, so
+# a plain machine that mirrors nothing needs no AWS CLI. Without it every job's
+# mirror would fail after the job, which is a worse place to find out.
+if [ -n "${SRE_MEMORY_BUCKET:-}" ] && ! command -v aws >/dev/null 2>&1; then
+  echo "sre-agent-fix-runner: aws is not on PATH, and SRE_MEMORY_BUCKET names the bucket the runner mirrors its memory to with the AWS CLI; the container image carries it, and a plain machine needs it installed (or SRE_MEMORY_BUCKET unset)" >&2
+  exit 1
+fi
+
 # Kept in step with runner.js's own default, which is what a run with no
 # SRE_WORKSPACE would use.
 workspace="${SRE_WORKSPACE:-/workspace}"

@@ -414,6 +414,7 @@ module.exports = {
   MAX_SCRIPTS,
   MAX_DIR_BYTES,
   MAX_CHANGES,
+  RESERVED,
   validName,
   layout,
   memoryDir,

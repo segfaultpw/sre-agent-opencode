@@ -33,6 +33,7 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     if [ -z "${GH_TOKEN+set}" ]; then printf 'gh_token: absent\n'; elif [ "${GH_TOKEN}" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then printf 'gh_token: matches\n'; else printf 'gh_token: differs\n'; fi
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
+    printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
       printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
     else

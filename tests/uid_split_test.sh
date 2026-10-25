@@ -273,6 +273,65 @@ prove root "$runner_uid" setpriv --groups=20001,20002 --
 prove caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
 
+# The memory bucket (runner/bucket.js): the AWS CLI is the runner's own call, so
+# what it restores belongs to the runner's account and what it mirrors is read
+# by the runner's account, whatever the mode; the agent sees none of it.
+prove_bucket() {
+  local label="$1" owner="$2"
+  shift 2
+  local prefix=("$@")
+  local ws="$work/$label-bucket-ws" runner_home="$work/home/$label-bucket-runner" agent_home="$work/home/$label-bucket-agent"
+  local awsroot="$work/$label-awsroot" agent_log="$work/$label-bucket.opencode.log" out="$work/$label-bucket.out"
+  echo "--- $label: the memory bucket is restored and mirrored as the runner's account ---"
+  mkdir -p "$ws" "$runner_home" "$agent_home" "$awsroot/bin" "$awsroot/ctl/bucket_tree/_estate/scripts" "$awsroot/ctl/bucket_tree/acme/app"
+  install -m 755 "$fixture_dir/stub_aws.sh" "$awsroot/bin/aws"
+  printf '# Estate\n\nrestored note\n' > "$awsroot/ctl/bucket_tree/_estate/NOTES.md"
+  printf '#!/bin/sh\n# an estate helper\n' > "$awsroot/ctl/bucket_tree/_estate/scripts/old.sh"
+  printf '# acme/app\n\nrestored note\n' > "$awsroot/ctl/bucket_tree/acme/app/NOTES.md"
+  chmod -R a+rX "$awsroot"
+  chmod 777 "$awsroot/ctl"
+  chown -R "$owner:$owner" "$ws" "$runner_home"
+  chmod 700 "$ws"
+  : > "$agent_log"
+  chmod 666 "$agent_log"
+  local rc=0
+  bucket_run() {
+    local id="$1" edit="$2"
+    start_fixture
+    queue_job "$id" ""
+    rc=0
+    timeout 120 "${prefix[@]}" env PATH="$awsroot/bin:$PATH" SRE_ONCE=1 \
+      SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+      SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+      SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+      SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+      HOME="$runner_home" SRE_MEMORY_BUCKET=acme-sre-memory SRE_MEMORY_PREFIX=fleet \
+      AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
+      STUB_OPENCODE_MODE=diagnose STUB_OPENCODE_LOG="$agent_log" STUB_OPENCODE_MEMORY="$edit" \
+      node "$runner" > "$out" 2>&1 || rc=$?
+    stop_fixture
+  }
+
+  bucket_run "h-$label-restore" ""
+  if [ "$rc" -eq 0 ] && [ -f "$ws/memory/acme/app/NOTES.md" ]; then echo "ok   $label: an empty memory directory is restored from the bucket"; else echo "FAIL $label: rc=$rc out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if [ "$(grep -c '' "$awsroot/ctl/aws_calls.log")" = "1" ] && [ "$(sort -u "$awsroot/ctl/aws_uid.log")" = "$owner" ]; then echo "ok   $label: the one download ran as the runner's account"; else echo "FAIL $label: calls $(cat "$awsroot/ctl/aws_calls.log") uids $(sort -u "$awsroot/ctl/aws_uid.log" | tr '\n' ' ')"; fail=1; fi
+  if [ -z "$(find "$ws/memory" -mindepth 1 ! -user "$owner" -print -quit)" ]; then echo "ok   $label: everything restored belongs to the runner's account"; else echo "FAIL $label: $(find "$ws/memory" -mindepth 1 ! -user "$owner" -printf '%u %p\n')"; fail=1; fi
+  if [ "$(stat -c '%a' "$ws/memory/acme/app")" = "700" ] && [ "$(stat -c '%a' "$ws/memory/acme/app/NOTES.md")" = "600" ] && [ "$(stat -c '%a' "$ws/memory/_estate/scripts/old.sh")" = "700" ]; then echo "ok   $label: restored directories are 0700, notes 0600 and a script 0700"; else echo "FAIL $label: $(find "$ws/memory" -printf '%m %p\n')"; fail=1; fi
+  if grep -q 'restored 3 memory files' "$out"; then echo "ok   $label: the log counts the files restored"; else echo "FAIL $label: $(cat "$out")"; fail=1; fi
+
+  : > "$awsroot/ctl/aws_calls.log"
+  : > "$awsroot/ctl/aws_uid.log"
+  bucket_run "h-$label-mirror" edit
+  if [ "$rc" -eq 0 ] && [ "$(grep -c '' "$awsroot/ctl/aws_calls.log")" = "3" ] && [ "$(sort -u "$awsroot/ctl/aws_uid.log")" = "$owner" ]; then echo "ok   $label: the three mirror calls ran as the runner's account"; else echo "FAIL $label: rc=$rc calls $(cat "$awsroot/ctl/aws_calls.log") uids $(sort -u "$awsroot/ctl/aws_uid.log" | tr '\n' ' ')"; fail=1; fi
+  if [ -s "$awsroot/ctl/uploaded/acme-sre-memory/fleet/_estate/NOTES.md" ]; then echo "ok   $label: the runner's account could read what it uploaded"; else echo "FAIL $label: nothing was uploaded: $(find "$awsroot/ctl" -type f)"; fail=1; fi
+  if grep -qx 'memory_env: ' "$agent_log"; then echo "ok   $label: no SRE_MEMORY_ variable reaches the agent"; else echo "FAIL $label: $(grep memory_env "$agent_log")"; fail=1; fi
+  if grep -qx 'aws_env: ' "$agent_log"; then echo "ok   $label: and no AWS variable either"; else echo "FAIL $label: $(grep aws_env "$agent_log")"; fail=1; fi
+}
+
+prove_bucket root "$runner_uid" setpriv --groups=20001,20002 --
+prove_bucket caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
+  --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
+
 echo "--- a root runner without the account ids refuses to start ---"
 start_fixture
 rc=0

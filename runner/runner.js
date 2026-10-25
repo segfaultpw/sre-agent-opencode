@@ -21,6 +21,7 @@ const https = require('node:https');
 const { spawn } = require('node:child_process');
 const { conventionalTitle } = require('./conventional_title.js');
 const memory = require('./memory.js');
+const bucket = require('./bucket.js');
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 
@@ -186,11 +187,22 @@ function loadConfig() {
     throw fatal('SRE_RUN_TIMEOUT_SECONDS must be a positive whole number of seconds');
   }
 
+  // Validated here, before the first poll, so a bucket the mirror could never
+  // write to is a refusal to start with a sentence, not a warning on every job.
+  let memoryBucket;
+  try {
+    memoryBucket = bucket.fromEnv(process.env);
+  } catch (error) {
+    throw fatal(error.message);
+  }
+
   return {
     serverUrl: process.env.SRE_SERVER_URL.replace(/\/+$/, ''),
     apiKey: process.env.SRE_API_KEY,
     model: process.env.SRE_MODEL,
     workspace: process.env.SRE_WORKSPACE || '/workspace',
+    // {bucket, prefix}; bucket is '' when the operator configured none.
+    memoryBucket,
     githubToken: process.env.SRE_GITHUB_TOKEN || '',
     // Optional: a token for the agent alone, so that it can be read-only while the
     // runner's own token pushes. Unset, the agent is given the runner's.
@@ -374,6 +386,39 @@ const ENV_PASSTHROUGH = [
   'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
   'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
 ];
+
+// What the AWS CLI is given when the runner mirrors its memory: the runner's
+// own AWS_* and container credential variables on top of the minimal
+// environment, and nothing else of the runner's (not the poll key, not the
+// GitHub tokens, not SRE_MEMORY_*). The agent is never given this: runAgent
+// starts from the whole environment and removes the credentials, and its own
+// account cannot read this process's.
+function awsEnv() {
+  const env = minimalEnv();
+  for (const [name, value] of Object.entries(process.env)) {
+    if (name.startsWith('AWS_') || name.startsWith('ECS_CONTAINER_METADATA_URI')) env[name] = value;
+  }
+  return env;
+}
+
+// The settings bucket.js works with, or null when no bucket is configured. The
+// aws calls are argument arrays handed to runProcess, as the runner's own
+// account, so no shell sees a path.
+function bucketSettings(config) {
+  const chosen = config.memoryBucket;
+  if (!chosen || !chosen.bucket) return null;
+  const workspace = path.resolve(config.workspace);
+  return {
+    bucket: chosen.bucket,
+    prefix: chosen.prefix,
+    workspace,
+    log,
+    run: async (command, args, options = {}) => {
+      const result = await runProcess(command, args, { cwd: workspace, env: awsEnv(), as: 'runner', timeoutMs: options.timeoutMs });
+      return { ...result, stdout: redact(result.stdout), stderr: redact(result.stderr) };
+    },
+  };
+}
 
 function minimalEnv() {
   const env = {};
@@ -1176,6 +1221,10 @@ function closeMemory(mem, result) {
   } catch (error) {
     log('warn', `memory for ${mem.label} could not be saved: ${redact(error.message)}`);
     result.memoryNotes.push(`the memory could not be saved: ${redact(error.message)}`);
+    // The earlier directory stands, so there is no change to report or to
+    // mirror: a list computed before the save failed would send a file that
+    // is not on the volume to the bucket.
+    result.memoryChanges = [];
   } finally {
     fs.rmSync(mem.copy, { recursive: true, force: true });
   }
@@ -1245,6 +1294,11 @@ async function runAgent(config, workspace, prompt) {
   // service variables) and reach anything the role holds. The runner's own
   // process keeps them; only the module's agent_aws_access opts the agent in.
   delete env.SRE_AGENT_AWS_ACCESS;
+  // Where the memory is mirrored to is the runner's business: the agent edits a
+  // copy in its checkout and has no use for the bucket.
+  for (const name of Object.keys(env)) {
+    if (name.startsWith('SRE_MEMORY_')) delete env[name];
+  }
   // The accounts' numbers are the runner's business, not the agent's.
   for (const name of Object.keys(env)) {
     if (/^SRE_(RUNNER|AGENT)_(UID|GID|HOME|USER)$/.test(name)) delete env[name];
@@ -1554,6 +1608,9 @@ async function handleJob(config, job) {
     memoryChanges: [],
     memorySummary: '',
     memoryNotes: [],
+    // The mirror's answer ({ok: true} or {ok: false, error}) when memory
+    // changed and a bucket is configured; null otherwise.
+    bucket: null,
   };
 
   try {
@@ -1688,10 +1745,25 @@ async function handleJob(config, job) {
     result.evidence.error = redact(error.message);
     log('error', `handoff ${job.handoff_id} failed: ${redact(error.message)}`);
   } finally {
+    await mirrorMemory(config, result);
     await report(job, result);
     jobSecret = null;
   }
   return result;
+}
+
+// Whatever the outcome, the changes the run made to its memory follow it to the
+// bucket before the request is reported. A failure is logged and returned in
+// result.bucket; it never fails the request.
+async function mirrorMemory(config, result) {
+  const settings = bucketSettings(config);
+  if (!settings || result.memoryChanges.length === 0) return;
+  try {
+    result.bucket = await bucket.mirror(settings, result.memoryChanges);
+  } catch (error) {
+    result.bucket = { ok: false, error: `the mirror stopped: ${redact(error.message)}` };
+    log('warn', `memory bucket: ${result.bucket.error}`);
+  }
 }
 
 async function main() {
@@ -1727,6 +1799,16 @@ async function main() {
     log('warn', `memory directories left by a stopped run could not be put in order (${redact(error.message)})`);
   }
   await settleWorkspace(config);
+
+  const settings = bucketSettings(config);
+  if (settings) {
+    log('info', `the memory is mirrored to s3://${settings.bucket}/${settings.prefix}, and restored from it onto an empty memory directory`);
+    try {
+      await bucket.restoreIfEmpty(settings);
+    } catch (error) {
+      log('warn', `memory bucket: the memory could not be restored (${redact(error.message)}); the runner starts without it`);
+    }
+  }
 
   for (;;) {
     let jobs = [];
