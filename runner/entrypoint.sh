@@ -132,6 +132,23 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
     echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not executable" >&2
     exit 1
   fi
+  # The workspace is the volume the agent writes (its home and checkouts live there), so a
+  # script on it is one the agent could replace before the next start, when it runs as root.
+  case "$setup" in
+    /*) ;;
+    *)
+      echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not an absolute path; name a file in the image" >&2
+      exit 1
+      ;;
+  esac
+  setup_real="$(realpath -e -- "$setup")"
+  workspace_real="$(realpath -m -- "$workspace")"
+  case "$setup_real/" in
+    "$workspace_real"/*)
+      echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is on the workspace ${workspace}; the agent can write there and the script runs as root, so put it in the image" >&2
+      exit 1
+      ;;
+  esac
   echo "sre-agent-fix-runner: running the setup script ${setup}"
   set +e
   setup_env=(PATH="$PATH" HOME=/root)

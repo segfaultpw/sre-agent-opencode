@@ -288,6 +288,16 @@ run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP=
 if [ "$rc" -ne 0 ] && grep -qF "$work/setup/missing.sh" <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a setup script that does not exist stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/not-executable.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'not executable' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   one that is not executable stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+mkdir -p "$work/workspace/agent-home"
+cp "$work/setup/ok.sh" "$work/workspace/agent-home/setup.sh"
+ln -sf "$work/workspace/agent-home/setup.sh" "$work/setup/link-into-workspace.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/workspace/agent-home/setup.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a setup script on the workspace (which the agent writes) is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/link-into-workspace.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link outside the workspace that points into it is refused too"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+relative_setup="$(realpath --relative-to="$PWD" "$work/setup/ok.sh")"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$relative_setup"
+if [ "$rc" -ne 0 ] && grep -qF 'not an absolute path' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a relative setup path is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="https://example.invalid/setup.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'URL' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a URL is refused: the runner never fetches a script"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=1000 SRE_RUNNER_SETUP="$work/setup/ok.sh"
