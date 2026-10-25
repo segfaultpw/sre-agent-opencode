@@ -1142,6 +1142,24 @@ function readHeldLock(file) {
   }
 }
 
+// Leftovers of a crash between the write and the link: a temporary lock is
+// never read, never linked, and worth nothing once its writer is gone, so the
+// sweep keeps the directory tidy without ever touching the lock itself.
+function sweepLockTemps(dir, staleMs) {
+  for (const name of fs.readdirSync(dir)) {
+    if (!/^\.lock-\d+-[0-9a-f]+\.tmp$/.test(name)) continue;
+    const temp = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.lstatSync(temp);
+    } catch {
+      continue;
+    }
+    if (Date.now() - stat.mtimeMs <= staleMs) continue;
+    fs.rmSync(temp, { force: true });
+  }
+}
+
 // Takes `file` for this instance, or returns what it found still holding it
 // after the bound. A stale file is replaced; a live one is polled once a
 // second until the bound runs out. The directory above the lock is the
@@ -1155,21 +1173,33 @@ async function acquireLock(file, options = {}) {
   const staleMs = options.staleMs === undefined ? LOCK_STALE_MS : options.staleMs;
   let warnedUnreadable = false;
   settleDir(path.dirname(file), 0o700);
+  // Both levels: a repository lock sits in <locks>/<owner>/ and its temporary,
+  // like every other lock's, lands in the locks root beside _state.lock.
+  sweepLockTemps(path.dirname(file), staleMs);
+  sweepLockTemps(path.dirname(path.dirname(file)), staleMs);
   for (;;) {
+    // The lock appears whole or not at all: written to a private temporary and
+    // linked into place, so no reader ever observes this runner mid-write and
+    // a lock whose content does not parse is always a crash or a poison file,
+    // never a writer to be stolen from. The link fails with EEXIST when the
+    // lock is already held, which is the answer the open used to give.
+    const temp = path.join(path.dirname(file), `.lock-${process.pid}-${crypto.randomBytes(8).toString('hex')}.tmp`);
     try {
-      const fd = fs.openSync(file, 'wx', 0o600);
+      const fd = fs.openSync(temp, 'wx', 0o600);
       try {
         fs.writeSync(fd, `${instance} ${process.pid} ${new Date().toISOString()}\n`);
-        // Flushed, so a crash between the two lines below leaves a lock that
-        // names a pid that is gone rather than an empty file a pool would have
-        // to wait out.
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
-      return { ok: true, file, instance };
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
+      try {
+        fs.linkSync(temp, file);
+        return { ok: true, file, instance };
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+    } finally {
+      fs.rmSync(temp, { force: true });
     }
     const held = readHeldLock(file);
     if (held.state === 'absent') continue;
@@ -1486,20 +1516,50 @@ async function reclaim(dir, home) {
 // 0711 and the runner's state is 0700, whoever created it: the migration moves
 // clones with a directory per owner above them, and an older runner created
 // everything for its one account.
+// Like settleDir, but the directory is REFUSED rather than adopted when another
+// account owns it: the locks and the directory they sit in decide who may work
+// on a repository, so they must be this runner's own in every identity mode.
+function ensureOwnedDirectory(dir, mode) {
+  const existed = fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) throw new Error(`${dir} is not a directory`);
+  // The runner ACCOUNT, not the process: a root start makes and chowns the
+  // workspace to the runner's uid on purpose, so that is the owner the locks
+  // must have. Only a directory that was already there can be somebody
+  // else's; one this process just made is adopted and chowned to the runner.
+  const owner = identity.runner && Number.isInteger(identity.runner.uid) ? identity.runner : { uid: process.getuid(), gid: process.getgid() };
+  if (existed && (stat.uid !== owner.uid || stat.gid !== owner.gid)) {
+    throw new Error(
+      `${dir} is owned by uid ${stat.uid}, not by the runner account (uid ${owner.uid}), so its locks would not be this runner's to trust; point SRE_MEMORY_ROOT at a directory this account owns`,
+    );
+  }
+  ownByRunner(dir);
+  fs.chmodSync(dir, mode);
+}
+
 async function settleWorkspace(config) {
   settleRunnerHome();
+  const lay = config.layout;
+  if (lay.perInstance) {
+    // The locks guard the shared memory tree, so they live beside it and every
+    // directory on the way to them is this account's own, whatever
+    // SRE_MEMORY_ROOT points at: a locks directory another account created is
+    // one whose locks it can forge or remove, and the runner refuses to work
+    // rather than trust it. Checked in every identity mode, because the pool
+    // leases even when the account split is off.
+    ensureOwnedDirectory(path.dirname(lay.locks), 0o711);
+    ensureOwnedDirectory(lay.locks, 0o700);
+  }
   if (identity.mode === 'none') return;
   closeAllAgentHomes();
-  const lay = config.layout;
   settleDir(lay.workspace, 0o711);
   if (lay.perInstance) {
     // The instance's own directories sit under instances/<id>, which the agent
     // walks through to reach its checkout: the two directories above it are
     // 0711 like the ones above a checkout in the flat layout, never listed.
-    // The locks belong to the runners alone, in every mode.
     settleDir(path.dirname(lay.instanceDir), 0o711);
     settleDir(lay.instanceDir, 0o711);
-    settleDir(lay.locks, 0o700);
   }
   settleDir(lay.repos, 0o711);
   for (const owner of fs.readdirSync(lay.repos)) {
@@ -2481,21 +2541,21 @@ async function runTestJob(config, job) {
     await step('memory', async () => {
       const lease = await testRepoLease(config, repo);
       if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
-      const dir = memoryDirectory();
-      const label = path.relative(memoryRoot, dir);
-      const created = makeTrackedDirectories(memoryRoot, dir);
-      const marker = path.join(dir, TEST_MARKER);
+      let dir;
+      let created;
       try {
+        dir = memoryDirectory();
+        created = makeTrackedDirectories(memoryRoot, dir);
+        const marker = path.join(dir, TEST_MARKER);
         writeTestMarker(marker);
         fs.rmSync(marker);
       } catch (error) {
-        return { ok: false, detail: `could not write and remove ${TEST_MARKER} in memory/${label}: ${error.code || error.message}` };
+        return { ok: false, detail: `could not write and remove ${TEST_MARKER} in memory/${path.relative(memoryRoot, dir || memoryRoot)}: ${error.code || error.message}` };
       } finally {
-        fs.rmSync(marker, { force: true });
-        removeTrackedDirectories(created);
+        if (created) removeTrackedDirectories(created);
         releaseLock(lease);
       }
-      return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${label} and removed it again` };
+      return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${path.relative(memoryRoot, dir)} and removed it again` };
     });
 
     // Judged on the marker's own put and removal, never on the journal: what
@@ -2506,17 +2566,20 @@ async function runTestJob(config, job) {
       if (!settings) return { ok: true, detail: 'no bucket configured' };
       const lease = await testRepoLease(config, repo);
       if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
-      const dir = memoryDirectory();
-      const label = path.relative(memoryRoot, dir);
-      const marker = path.join(dir, TEST_MARKER);
-      const created = makeTrackedDirectories(memoryRoot, dir);
+      let dir;
+      let created;
       let answer;
+      let label;
       try {
+        dir = memoryDirectory();
+        label = path.relative(memoryRoot, dir);
+        created = makeTrackedDirectories(memoryRoot, dir);
+        const marker = path.join(dir, TEST_MARKER);
         writeTestMarker(marker);
         answer = await bucket.probe(settings, label, marker);
-      } finally {
         fs.rmSync(marker, { force: true });
-        removeTrackedDirectories(created);
+      } finally {
+        if (created) removeTrackedDirectories(created);
         releaseLock(lease);
       }
       if (!answer.ok) return { ok: false, detail: answer.error };

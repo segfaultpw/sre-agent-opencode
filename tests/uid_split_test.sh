@@ -614,6 +614,26 @@ prove_split() {
 
 prove_split
 
+echo "--- a locks directory another account owns is refused, not adopted ---"
+# The locks decide who may work on a repository, so the runner will not trust a
+# directory it did not make: chown the pool's locks to the agent's account and
+# the start refuses, before any poll, naming the directory and the owner.
+if [ "$(id -u)" -eq 0 ]; then
+  owned_ws="$work/owned-ws"
+  mkdir -p "$owned_ws/memory" "$owned_ws/locks"
+  # The parent is the runner account's, as the image makes it; the locks
+  # directory itself is the agent's, which is the forgery the runner refuses.
+  chown "$runner_uid:$runner_uid" "$owned_ws"
+  chown "$agent_uid:$agent_uid" "$owned_ws/locks"
+  owned_rc=0
+  SRE_ONCE=1 SRE_SERVER_URL=http://127.0.0.1:9 SRE_API_KEY=not-a-real-key SRE_MODEL=openrouter/deepseek/deepseek-v4-pro SRE_WORKSPACE="$owned_ws" SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=pool-a SRE_RUNNER_USER=runner SRE_RUNNER_UID="$runner_uid" SRE_RUNNER_GID="$runner_uid" SRE_RUNNER_HOME="$work/home/owned-runner-home" SRE_AGENT_USER=agent SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$work/home/owned-agent-home" HOME="$work/home/owned-runner" node "$runner" > "$work/owned.out" 2>&1 || owned_rc=$?
+  if [ "$owned_rc" -ne 0 ] && grep -qF 'is owned by uid' "$work/owned.out" && grep -qF 'locks' "$work/owned.out"; then
+    echo "ok   a foreign-owned locks directory refuses the start, before any poll"
+  else
+    echo "FAIL owned locks: rc=$owned_rc out=$(tail -n 5 "$work/owned.out")"; fail=1
+  fi
+fi
+
 echo "--- a root runner without the account ids refuses to start ---"
 start_fixture
 rc=0

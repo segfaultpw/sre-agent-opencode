@@ -87,7 +87,7 @@ function instanceId(env = process.env, hostname = os.hostname()) {
 //     bucket mirror's three state files and restore staging sit in its parent,
 //     beside the memory as they always have, on its file system for the rename
 //     that moves a restore in
-//     <workspace>/locks holds the leases on the shared tree
+//     <memory root>/../locks holds the leases on the shared tree, beside it
 //
 // `stateBase` is where the mirror keeps its state files and `agentHome` is
 // where the per-repository homes live (null in the flat layout, where the

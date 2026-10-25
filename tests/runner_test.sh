@@ -1521,6 +1521,20 @@ queue_one h-blindlock acme/app
 SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once blindlock
 if jq -e '.evidence.busy_repository == "acme/app"' <<<"$report" >/dev/null && [ -e "$workspace/locks/acme/app.lock" ] && grep -q 'could not be read' "$out" && ! grep -q 'is not a lock file' "$out"; then echo "ok   a lock this account cannot read is waited for and reported busy, never replaced"; else echo "FAIL report: $report out: $(tail -n 5 "$out")"; fail=1; fi
 chmod 600 "$workspace/locks/acme/app.lock"; rm -f "$workspace/locks/acme/app.lock"
+# The lock file appears whole or not at all: a crash between the write and the
+# link leaves a temporary, never a half-written lock, and the sweep takes the
+# temporary once its writer is long gone while a fresh one is left alone.
+mkdir -p "$workspace/locks"
+: > "$workspace/locks/.lock-999999-deadbeef01.tmp"
+touch -d '2 hours ago' "$workspace/locks/.lock-999999-deadbeef01.tmp"
+fresh_tmp="$workspace/locks/.lock-999999-$(printf '%s' live | sha256sum | cut -c1-16).tmp"
+: > "$fresh_tmp"
+mkdir -p "$workspace/locks/acme"
+start_fixture tempsweep
+queue_one h-tempsweep acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once tempsweep
+if [ ! -e "$workspace/locks/.lock-999999-deadbeef01.tmp" ] && [ -e "$fresh_tmp" ]; then echo "ok   a dead writer's lock temporary is swept and a fresh one is left alone"; else echo "FAIL temps: $(ls -A "$workspace/locks" | tr '\n' ' ')"; fail=1; fi
+rm -f "$fresh_tmp"
 stop_fixture
 
 echo "--- 52d. a run that releases cleanly leaves no takeover warning behind ---"
