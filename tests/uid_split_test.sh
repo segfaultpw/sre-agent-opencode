@@ -65,6 +65,7 @@ trap cleanup EXIT
 api_key="$(printf 'sre-agent-poll-%048d' 1)"
 handoff_token="$(printf 'sre-agent-handoff-%048d' 2)"
 github_token="$(printf 'sre-agent-github-%048d' 3)"
+agent_token="$(printf 'sre-agent-agent-tok-%048d' 7)"
 model="openrouter/deepseek/deepseek-v4-pro"
 remote="$work/remote/app.git"
 mkdir -p "$work/bin" "$work/remote" "$work/home" "$work/ctl"
@@ -150,6 +151,7 @@ prove() {
   local label="$1" owner="$2"
   shift 2
   local prefix=("$@")
+  local extra_runner_env=()
   local ws="$work/$label-ws" probe="$work/$label.probe" survivor="$work/$label.survivor"
   local uidlog="$work/$label.git-uids" ghuidlog="$work/$label.gh-uids" out="$work/$label.out"
   local runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent"
@@ -188,7 +190,8 @@ prove() {
       HOME="$runner_home" \
       AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
       STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe_file" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor_file" \
-      STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" \
+      STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" STUB_RUNNER_TOKEN="$github_token" \
+      "${extra_runner_env[@]}" \
       STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" \
       node "$runner" > "$out" 2>&1 || rc=$?
     stop_fixture
@@ -246,6 +249,23 @@ prove() {
   if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report2")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: a second request ends in a pull request too"; else echo "FAIL $label: second run rc=$rc report=$report2 out=$(tail -n 5 "$out")"; fail=1; return; fi
   if grep -qx 'tool: found fixture-tool-ok' "$probe2"; then echo "ok   $label: the tool installed by the first run is on its PATH in the second, and runs"; else echo "FAIL $label: $(grep tool: "$probe2")"; fail=1; fi
   if grep -qx 'clone_local: ok' "$probe2"; then echo "ok   $label: it clones again in the second run"; else echo "FAIL $label: $(grep clone "$probe2")"; fail=1; fi
+  if grep -qx 'probe_runner_token_visible: yes' "$probe2" && grep -qx 'helper_hands_out_runner_token: yes' "$probe2"; then echo "ok   $label: without SRE_AGENT_GITHUB_TOKEN the agent holds the runner token, in GH_TOKEN and through its credential helper"; else echo "FAIL $label: $(grep -E 'runner_token' "$probe2")"; fail=1; fi
+
+  echo "--- $label: with SRE_AGENT_GITHUB_TOKEN the agent holds a token of its own ---"
+  local probe3="$work/$label.probe3" survivor3="$work/$label.survivor3"
+  : > "$probe3"; : > "$survivor3"; chmod 666 "$probe3" "$survivor3"
+  rm -rf "$work/markers"; mkdir -p "$work/markers"; chmod 777 "$work/markers"
+  extra_runner_env=(SRE_AGENT_GITHUB_TOKEN="$agent_token" STUB_EXPECT_GH_TOKEN="$agent_token")
+  invoke_runner "h-$label-3" "$probe3" "$survivor3"
+  survivors+=("$(cat "$survivor3" 2>/dev/null || true)")
+  local report3
+  report3="$(jq -c 'select(.path | endswith("/h-'"$label"'-3/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
+  if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report3")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: the pull request still lands, pushed by the runner with its own token"; else echo "FAIL $label: third run rc=$rc report=$report3 out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if grep -qx 'gh_token: matches' "$probe3" && grep -qx 'credential_helper: ok' "$probe3"; then echo "ok   $label: GH_TOKEN and the credential helper both carry the agent token"; else echo "FAIL $label: $(grep -E 'gh_token|credential_helper' "$probe3")"; fail=1; fi
+  if grep -qx 'probe_runner_token_visible: no' "$probe3" && grep -qx 'helper_hands_out_runner_token: no' "$probe3"; then echo "ok   $label: the runner token is nowhere in its environment and the helper never hands it out"; else echo "FAIL $label: $(grep -E 'runner_token' "$probe3")"; fail=1; fi
+  if grep -qx 'token_env: ' "$probe3"; then echo "ok   $label: the variable that names the agent token is not in its environment"; else echo "FAIL $label: $(grep token_env "$probe3")"; fail=1; fi
+  if ! grep -qF -e "$github_token" -e "$agent_token" "$work/$label.out" "$work/requests.jsonl"; then echo "ok   $label: neither token is in a log line or a report"; else echo "FAIL $label: a token was logged or reported"; fail=1; fi
+  extra_runner_env=()
 }
 
 # The root runner carries extra groups, so a child that kept them is caught.

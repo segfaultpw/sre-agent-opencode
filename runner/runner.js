@@ -192,6 +192,9 @@ function loadConfig() {
     model: process.env.SRE_MODEL,
     workspace: process.env.SRE_WORKSPACE || '/workspace',
     githubToken: process.env.SRE_GITHUB_TOKEN || '',
+    // Optional: a token for the agent alone, so that it can be read-only while the
+    // runner's own token pushes. Unset, the agent is given the runner's.
+    agentGithubToken: process.env.SRE_AGENT_GITHUB_TOKEN || '',
     runTimeoutMs: timeoutSeconds * 1000,
     runTimeoutSeconds: timeoutSeconds,
     version: readPackageFile('VERSION').trim(),
@@ -1224,11 +1227,15 @@ async function runAgent(config, workspace, prompt) {
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
-  // The agent does get the repository token, as GH_TOKEN: it clones private
-  // repositories as a CI job does, and its git credential helper reads the
-  // variable. It does not get the poll key, the AWS variables or anything of the
-  // runner's environment, and the fences deny git push.
-  if (config.githubToken) env.GH_TOKEN = config.githubToken;
+  // The agent does get a token, as GH_TOKEN: it clones private repositories as a
+  // CI job does, and its git credential helper reads the variable. It is
+  // SRE_AGENT_GITHUB_TOKEN when the operator set one (a token that can only
+  // read, so the agent cannot push) and the runner's own otherwise. It does not
+  // get the poll key, the AWS variables or anything of the runner's environment,
+  // and the fences deny git push.
+  delete env.SRE_AGENT_GITHUB_TOKEN;
+  const agentToken = config.agentGithubToken || config.githubToken;
+  if (agentToken) env.GH_TOKEN = agentToken;
   // The agent's shell would otherwise read the task role's credentials from
   // the container credentials endpoint (or the instance's from its metadata
   // service variables) and reach anything the role holds. The runner's own
@@ -1687,6 +1694,7 @@ async function main() {
   const config = loadConfig();
   constantSecrets.push(config.apiKey);
   if (config.githubToken) constantSecrets.push(config.githubToken);
+  if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
   logLevel = LEVELS[(process.env.SRE_LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
 
   identity = config.identity;

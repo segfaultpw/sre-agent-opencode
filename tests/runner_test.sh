@@ -40,6 +40,7 @@ api_key="$(printf 'sre-agent-poll-%048d' 1)"
 wrong_key="$(printf 'sre-agent-poll-%048d' 9)"
 handoff_token="$(printf 'sre-agent-handoff-%048d' 2)"
 github_token="$(printf 'sre-agent-github-%048d' 3)"
+agent_token="$(printf 'sre-agent-agent-tok-%048d' 7)"
 model="openrouter/deepseek/deepseek-v4-pro"
 pr_url="https://github.com/acme/app/pull/7"
 version="$(tr -d '[:space:]' < "$pkg/VERSION")"
@@ -117,7 +118,7 @@ for a in "\$@"; do
   # Only a URL is redirected. The commit identity is a github.com address too,
   # and rewriting it would make git reject the config rather than the remote.
   case "\$a" in
-    https://*@github.com/*) args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
+    https://x-access-token:*@github.com/*) tok="\${a#https://x-access-token:}"; printf '%s\n' "\${tok%%@*}" >> "$work/git_urltokens.log"; args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
     *) args+=("\$a") ;;
   esac
 done
@@ -972,6 +973,29 @@ if jq -e '.evidence.flagged_paths | index("sub/")' <<<"$report" >/dev/null && jq
 if ! "$real_git" --git-dir="$remote" rev-parse --verify --quiet refs/heads/sre-agent/h-nested >/dev/null && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed and no pull request is opened"; else echo "FAIL a branch or pull request exists"; fail=1; fi
 stop_fixture
 
+echo "--- 41. SRE_AGENT_GITHUB_TOKEN gives the agent a token of its own, and the runner keeps pushing with its own ---"
+: > "$work/git_urltokens.log"
+start_fixture agenttoken
+queue_one h-agenttoken acme/app
+export STUB_OPENCODE_MODE=fix STUB_EXPECT_GH_TOKEN="$agent_token" STUB_RUNNER_TOKEN="$github_token"
+SRE_AGENT_GITHUB_TOKEN="$agent_token" run_once agenttoken
+export STUB_EXPECT_GH_TOKEN="$github_token"
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the pull request still lands"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if grep -qx "gh_token: matches" "$opencode_log" && grep -qx "runner_token_visible: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_TOKEN: no" "$opencode_log"; then echo "ok   the agent holds the agent token as GH_TOKEN and the runner token is nowhere in its environment"; else echo "FAIL $(grep -E 'gh_token|runner_token|sees_' "$opencode_log")"; fail=1; fi
+if grep -qx 'sees_SRE_AGENT_GITHUB_TOKEN: no' "$opencode_log"; then echo "ok   the variable that names the agent token is not itself in the agent's environment"; else echo "FAIL $(grep AGENT_GITHUB "$opencode_log")"; fail=1; fi
+if [ -s "$work/git_urltokens.log" ] && ! grep -qvx "$github_token" "$work/git_urltokens.log"; then echo "ok   every clone, fetch, ls-remote and push the runner made used the runner token ($(wc -l < "$work/git_urltokens.log") calls)"; else echo "FAIL tokens in URLs: $(sort -u "$work/git_urltokens.log" | cut -c1-24 | tr '\n' ' ')"; fail=1; fi
+stop_fixture
+
+echo "--- 41b. a token the agent prints is redacted whichever token it is ---"
+start_fixture agenttokenleak
+queue_one h-agenttokenleak acme/app
+export STUB_OPENCODE_MODE=leak STUB_OPENCODE_LEAK="$agent_token"
+SRE_AGENT_GITHUB_TOKEN="$agent_token" run_once agenttokenleak
+unset STUB_OPENCODE_LEAK STUB_RUNNER_TOKEN
+export STUB_OPENCODE_MODE=fix
+if ! jq -r '.summary' <<<"$report" | grep -qF "$agent_token" && jq -r '.summary' <<<"$report" | grep -qF '[redacted]' && ! grep -qF "$agent_token" "$gh_body"; then echo "ok   it is replaced in the report and in the pull request body"; else echo "FAIL summary: $report"; fail=1; fi
+stop_fixture
+
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"
 # The runner cannot deploy, so it cannot verify a fix in a running system. The
 # scan is over every report every case posted rather than over one of them,
@@ -982,6 +1006,7 @@ echo "--- 11 and 12. no credential appears in any line the runner wrote ---"
 if ! grep -qF "$api_key" "$work"/*.out; then echo "ok   the API key appears in no log line"; else echo "FAIL the API key was logged"; fail=1; fi
 if ! grep -qF "$handoff_token" "$work"/*.out; then echo "ok   the handoff credential appears in no log line"; else echo "FAIL the handoff credential was logged"; fail=1; fi
 if ! grep -qF "$github_token" "$work"/*.out; then echo "ok   the repository credential appears in no log line"; else echo "FAIL the repository credential was logged"; fail=1; fi
+if ! grep -qF "$agent_token" "$work"/*.out "$work"/*.requests.jsonl; then echo "ok   the agent's own token appears in no log line and no report"; else echo "FAIL the agent token was logged or reported"; fail=1; fi
 
 echo "--- the fixture servers this test started are all stopped ---"
 stop_fixture
