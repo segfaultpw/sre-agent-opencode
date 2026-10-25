@@ -33,6 +33,7 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     if [ -z "${GH_TOKEN+set}" ]; then printf 'gh_token: absent\n'; elif [ "${GH_TOKEN}" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then printf 'gh_token: matches\n'; else printf 'gh_token: differs\n'; fi
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
+    printf 'provider_key: [%s]\n' "${OPENROUTER_API_KEY-unset}"
     printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
       printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
@@ -133,6 +134,13 @@ case "${STUB_OPENCODE_MEMORY:-}" in
     ln -s /etc/passwd .sre-agent-memory/scripts/link.sh
     printf 'x\n' > ".sre-agent-memory/scripts/bad name"
     printf 'x\n' > .sre-agent-memory/stray.txt
+    ;;
+  churn)
+    # Fifty scripts replaced by fifty others and the note changed: 101 changes
+    # in one directory, more than a report carries.
+    rm -f .sre-agent-memory/scripts/a*
+    for number in $(seq -w 1 50); do printf '#!/bin/sh\n# b%s\n' "$number" > ".sre-agent-memory/scripts/b$number"; done
+    printf 'the churn run was here\n' >> .sre-agent-memory/NOTES.md
     ;;
   big)
     head -c 70000 /dev/zero | tr '\0' 'a' > .sre-agent-memory/NOTES.md

@@ -147,6 +147,15 @@ test('migrate never treats the runner own directories as owners', () => {
   assert.ok(fs.existsSync(path.join(ws, 'agent-home/acme/.git/HEAD')), 'the agent home is not an owner');
 });
 
+test('migrate never treats the runner own restore and mirror state as an owner', () => {
+  const ws = fresh();
+  put(ws, '.memory-restore-4242/acme/.git/HEAD', 'x');
+  put(ws, '.memory-mirror-pending', '{}');
+  assert.deepEqual(memory.migrate(ws), []);
+  assert.ok(fs.existsSync(path.join(ws, '.memory-restore-4242/acme/.git/HEAD')), 'a staged restore is not moved under repos');
+  assert.ok(!fs.existsSync(path.join(ws, 'repos/.memory-restore-4242')));
+});
+
 test('migrate skips a directory that cannot be an owner, such as the lost+found of a mounted disk', () => {
   const ws = fresh();
   put(ws, 'acme/api/.git/HEAD', 'x');
@@ -438,6 +447,32 @@ test('changes caps at 50 entries, keeping the first by path', () => {
   assert.equal(listed[0].path, 'acme/api/scripts/s00.sh');
   assert.equal(listed[49].path, 'acme/api/scripts/s49.sh');
   assert.ok(listed.every((entry) => entry.change === 'added'));
+});
+
+test('changes can be asked for every entry, as the mirror does, while the report keeps fifty', () => {
+  const before = new Map();
+  const after = new Map();
+  for (let i = 0; i < 60; i += 1) {
+    before.set(`scripts/a${String(i).padStart(2, '0')}`, { bytes: 1, sha256: `a${i}` });
+    after.set(`scripts/b${String(i).padStart(2, '0')}`, { bytes: 1, sha256: `b${i}` });
+  }
+  before.set('NOTES.md', { bytes: 1, sha256: 'n1' });
+  after.set('NOTES.md', { bytes: 1, sha256: 'n2' });
+  assert.equal(memory.changes(before, after, 'acme/api').length, 50);
+  const everything = memory.changes(before, after, 'acme/api', { limit: Infinity, maxPath: Infinity });
+  assert.equal(everything.length, 121);
+  assert.equal(everything.filter((entry) => entry.change === 'added').length, 60);
+  assert.equal(everything.filter((entry) => entry.change === 'removed').length, 60);
+  assert.ok(everything.some((entry) => entry.path === 'acme/api/scripts/b59' && entry.change === 'added'));
+});
+
+test('changes with no limit keeps a path longer than the report allows, because the mirror still has to copy it', () => {
+  const long = `scripts/${'n'.repeat(100)}`;
+  const after = new Map([[long, { bytes: 1, sha256: '1' }]]);
+  assert.equal(memory.changes(new Map(), after, 'p'.repeat(250)).length, 0);
+  const listed = memory.changes(new Map(), after, 'p'.repeat(250), { limit: Infinity, maxPath: Infinity });
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].path.length, 250 + 1 + long.length);
 });
 
 test('changes sorts by code unit, not by locale', () => {

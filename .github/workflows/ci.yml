@@ -57,6 +57,7 @@ jobs:
       - run: node tests/bundle_test.js
       - run: bash tests/runner_test.sh
       - run: bash tests/bucket_test.sh
+      - run: bash tests/secret_trim_test.sh
       - run: bash tests/uid_split_ci_test.sh
       - run: bash tests/image_test.sh
       - run: bash tests/install_runner_test.sh

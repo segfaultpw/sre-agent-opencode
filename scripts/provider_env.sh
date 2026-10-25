@@ -5,7 +5,37 @@
 # lists three and GOOGLE_GENERATIVE_AI_API_KEY is the one its SDK documents.
 # An unknown prefix exits 2 so the workflow fails before opencode starts,
 # instead of running with a key nobody reads.
+#
+# `provider_env.sh --all` prints every variable in the table, one per line: the
+# self-hosted runner trims exactly these where it reads its environment
+# (runner/runner.js), and tests/provider_env_test.sh holds the two lists equal.
 set -euo pipefail
+
+# provider prefix, then the variable that receives its key.
+table='anthropic ANTHROPIC_API_KEY
+openai OPENAI_API_KEY
+google GOOGLE_GENERATIVE_AI_API_KEY
+openrouter OPENROUTER_API_KEY
+xai XAI_API_KEY
+groq GROQ_API_KEY
+mistral MISTRAL_API_KEY
+deepseek DEEPSEEK_API_KEY
+togetherai TOGETHER_API_KEY
+fireworks-ai FIREWORKS_API_KEY
+cerebras CEREBRAS_API_KEY
+moonshotai MOONSHOT_API_KEY
+deepinfra DEEPINFRA_API_KEY
+huggingface HF_TOKEN
+zai ZHIPU_API_KEY
+minimax MINIMAX_API_KEY
+nvidia NVIDIA_API_KEY
+opencode OPENCODE_API_KEY
+vercel AI_GATEWAY_API_KEY'
+
+if [ "${1:-}" = "--all" ]; then
+  while read -r _ variable; do echo "$variable"; done <<<"$table"
+  exit 0
+fi
 
 model="${1:-}"
 provider="${model%%/*}"
@@ -14,28 +44,12 @@ if [ -z "$provider" ] || [ "$provider" = "$model" ]; then
   exit 2
 fi
 
-case "$provider" in
-  anthropic) echo ANTHROPIC_API_KEY ;;
-  openai) echo OPENAI_API_KEY ;;
-  google) echo GOOGLE_GENERATIVE_AI_API_KEY ;;
-  openrouter) echo OPENROUTER_API_KEY ;;
-  xai) echo XAI_API_KEY ;;
-  groq) echo GROQ_API_KEY ;;
-  mistral) echo MISTRAL_API_KEY ;;
-  deepseek) echo DEEPSEEK_API_KEY ;;
-  togetherai) echo TOGETHER_API_KEY ;;
-  fireworks-ai) echo FIREWORKS_API_KEY ;;
-  cerebras) echo CEREBRAS_API_KEY ;;
-  moonshotai) echo MOONSHOT_API_KEY ;;
-  deepinfra) echo DEEPINFRA_API_KEY ;;
-  huggingface) echo HF_TOKEN ;;
-  zai) echo ZHIPU_API_KEY ;;
-  minimax) echo MINIMAX_API_KEY ;;
-  nvidia) echo NVIDIA_API_KEY ;;
-  opencode) echo OPENCODE_API_KEY ;;
-  vercel) echo AI_GATEWAY_API_KEY ;;
-  *)
-    echo "unknown provider prefix '${provider}' in model '${model}': see scripts/provider_env.sh for the providers the workflow maps" >&2
-    exit 2
-    ;;
-esac
+while read -r prefix variable; do
+  if [ "$prefix" = "$provider" ]; then
+    echo "$variable"
+    exit 0
+  fi
+done <<<"$table"
+
+echo "unknown provider prefix '${provider}' in model '${model}': see scripts/provider_env.sh for the providers the workflow maps" >&2
+exit 2

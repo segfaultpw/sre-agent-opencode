@@ -126,7 +126,8 @@ queue_one() {
 }
 
 reset_aws() {
-  rm -rf "$ctl/uploaded" "$ctl/bucket_tree" "$ctl/aws_fail" "$ctl/aws_fail_on" "$ctl/aws_partial_fail"
+  rm -rf "$ctl/uploaded" "$ctl/bucket_tree" "$ctl/aws_fail" "$ctl/aws_fail_on" "$ctl/aws_partial_fail" \
+    "$ctl/aws_fail_first" "$ctl/aws_kill_runner" "$ctl/aws_exit2" "$ctl/aws_hang" "$ctl/aws_sleep"
   : > "$ctl/aws_calls.log"
   : > "$ctl/aws_seen.log"
   : > "$ctl/aws_env.log"
@@ -146,6 +147,17 @@ argline() {
   printf '%s' "$joined"
 }
 
+# The restore downloads into a staging directory beside memory/, named for the
+# runner's pid, so the call is matched by its shape.
+restore_call() {
+  local line="$1" source="$2" head rest
+  head="s3${us}cp${us}--recursive${us}${source}${us}${workspace}/.memory-restore-"
+  [[ "$line" == "$head"* ]] || return 1
+  rest="${line#"$head"}"
+  [[ "$rest" =~ ^[0-9]+/${us}--only-show-errors${us}$ ]]
+}
+no_staging() { test -z "$(find "$workspace" -maxdepth 1 -name '.memory-restore-[0-9]*' -print -quit 2>/dev/null)"; }
+
 env_args() {
   env_extra=()
   if [ -n "$BUCKET_V" ]; then env_extra+=("SRE_MEMORY_BUCKET=$BUCKET_V"); fi
@@ -164,7 +176,10 @@ run_runner() {
   report="$(jq -c 'select(.path | endswith("/report")) | .body' "$fixture_log" 2>/dev/null | tail -n 1 || true)"
 }
 
-# handleJob called from a script, so the result it hands back can be read.
+# What the runner does around a job, called from a script, so the result it
+# hands back can be read: the restore at start, then the retry and the job.
+# DRIVER_DEADLINE_MS shortens the mirror's overall limit for the cases that
+# prove it.
 run_driver() {
   : > "$opencode_log"
   out="$work/$1.out"
@@ -175,19 +190,22 @@ run_driver() {
   (cd "$work" && timeout 120 env \
     SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
     SRE_WORKSPACE="$workspace" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
-    DRIVER_JOB="$work/job.json" DRIVER_OUT="$work/$1.result.json" \
+    DRIVER_JOB="$work/job.json" DRIVER_OUT="$work/$1.result.json" DRIVER_DEADLINE_MS="${driver_deadline_ms:-}" \
     "${env_extra[@]}" node -e '
       const fs = require("node:fs");
       const runner = require(process.argv[1]);
       const config = runner.loadConfig();
+      if (process.env.DRIVER_DEADLINE_MS) config.memoryBucket.deadlineMs = Number(process.env.DRIVER_DEADLINE_MS);
       const job = JSON.parse(fs.readFileSync(process.env.DRIVER_JOB, "utf8"));
-      runner.handleJob(config, job).then((result) => {
-        fs.writeFileSync(process.env.DRIVER_OUT, JSON.stringify({
-          changes: result.memoryChanges,
-          bucket: result.bucket === undefined ? "missing" : result.bucket,
-          outcome: result.outcome,
-        }));
-      });
+      runner.startMemory(config)
+        .then(() => runner.serveJob(config, job))
+        .then((result) => {
+          fs.writeFileSync(process.env.DRIVER_OUT, JSON.stringify({
+            changes: result.memoryChanges,
+            mirror: result.mirror === undefined ? "missing" : result.mirror,
+            outcome: result.outcome,
+          }));
+        });
     ' "$runner") > "$out" 2>&1 || rc=$?
   report="$(jq -c 'select(.path | endswith("/report")) | .body' "$fixture_log" 2>/dev/null | tail -n 1 || true)"
 }
@@ -277,7 +295,7 @@ const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'fleet/',
   }
 
   const before = count();
-  emit({ kind: 'nobucket-restore', result: await bucket.restoreIfEmpty(settings({ bucket: '' })), calls: count() - before });
+  emit({ kind: 'nobucket-restore', result: await bucket.restore(settings({ bucket: '' })), calls: count() - before });
   emit({ kind: 'nobucket-mirror', result: await bucket.mirror(settings({ bucket: '' }), [{ path: '_estate/NOTES.md', change: 'modified', bytes: 1 }]), calls: count() - before });
   emit({ kind: 'nochanges', result: await bucket.mirror(settings(), []), calls: count() - before });
 
@@ -289,10 +307,6 @@ const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'fleet/',
     '../x/NOTES.md',
     '/abs/NOTES.md',
     'acme/../../x/NOTES.md',
-    'repos/x/NOTES.md',
-    'gitdirs/x/NOTES.md',
-    'agent-home/x/NOTES.md',
-    'scratch/x/NOTES.md',
     'acme/api/extra.txt',
     'acme/api/scripts/sub/x',
     'acme/NOTES.md',
@@ -318,8 +332,18 @@ const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'fleet/',
   }
   {
     const start = count();
+    const result = await bucket.mirror(settings(), [{ path: 'linked/api/NOTES.md', change: 'modified', bytes: 1 }]);
+    emit({ kind: 'linked-owner', result, calls: count() - start });
+  }
+  {
+    const start = count();
     const result = await bucket.mirror(settings(), [{ path: 'acme/api/scripts/gone.sh', change: 'added', bytes: 1 }]);
     emit({ kind: 'missing-file', result, calls: count() - start });
+  }
+  for (const owner of ['repos', 'gitdirs', 'agent-home', 'scratch', 'memory']) {
+    const start = count();
+    const result = await bucket.mirror(settings(), [{ path: `${owner}/x/NOTES.md`, change: 'added', bytes: 1 }]);
+    emit({ kind: 'owner-named-like-a-workspace-directory', owner, result, calls: count() - start });
   }
   {
     const start = count();
@@ -334,6 +358,20 @@ const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'fleet/',
     ]);
     emit({ kind: 'valid-nested', result, calls: count() - start });
   }
+  emit({ kind: 'journal', left: fs.existsSync(path.join(workspace, '.memory-mirror-pending')) });
+
+  if (process.getuid() !== 0) {
+    const readOnly = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'retry-'));
+    fs.writeFileSync(path.join(readOnly, '.memory-restore-pending'), '{}\n');
+    fs.chmodSync(readOnly, 0o500);
+    const config = settings({ workspace: readOnly, state: {} });
+    const start = count();
+    const first = await bucket.retryRestore(config);
+    const second = await bucket.retryRestore(config);
+    fs.chmodSync(readOnly, 0o700);
+    fs.rmSync(readOnly, { recursive: true, force: true });
+    emit({ kind: 'retry-throws', first, second, failures: config.state.failures, calls: count() - start });
+  }
 })();
 EOF
 reset_aws
@@ -342,6 +380,13 @@ mkdir -p "$workspace/memory/acme/api/scripts"
 printf 'real file\n' > "$work/real_notes"
 ln -s "$work/real_notes" "$workspace/memory/acme/api/NOTES.md"
 printf '#!/bin/sh\n' > "$workspace/memory/acme/api/scripts/ok.sh"
+mkdir -p "$work/linkedtarget/api"
+printf 'a real file behind a linked owner directory\n' > "$work/linkedtarget/api/NOTES.md"
+ln -s "$work/linkedtarget" "$workspace/memory/linked"
+for owner in repos gitdirs agent-home scratch memory; do
+  mkdir -p "$workspace/memory/$owner/x"
+  printf 'an owner called %s\n' "$owner" > "$workspace/memory/$owner/x/NOTES.md"
+done
 (cd "$work" && node --max-old-space-size=256 "$work/unit.js" "$pkg" "$workspace" "$ctl/aws_calls.log") > "$work/unit.out" 2>&1 || { echo "FAIL the unit driver failed: $(cat "$work/unit.out")"; fail=1; }
 unit() { jq -c --arg kind "$1" 'select(.kind == $kind)' "$work/unit.out"; }
 env_case() { jq -c --argjson env "$1" 'select(.kind == "env" and .env == $env)' "$work/unit.out"; }
@@ -365,12 +410,20 @@ refused="$(unit hostile | jq -s '[.[] | select(.result.ok == false and .calls ==
 check "every one of the $hostile_total names that are not a memory file is refused and calls nothing" test "$refused" -eq "$hostile_total"
 check "a leftover directory of a stopped save is not mirrored" test "$(unit leftover | jq -s '[.[] | select(.result.ok == true and .calls == 0)] | length')" -eq 2
 check_jq "a memory file that is a symlink is not uploaded" '.result.ok == false and .calls == 0' "$(unit symlinked-file)"
+check_jq "a real file reached through a linked owner directory is not uploaded" '.result.ok == false and .calls == 0 and (.result.error | contains("outside"))' "$(unit linked-owner)"
+check "an owner named like a workspace directory is an ordinary owner under memory/, mirrored" test "$(unit owner-named-like-a-workspace-directory | jq -s '[.[] | select(.result.ok == true and .calls == 1)] | length')" -eq 5
+check_jq "a refused or finished mirror leaves no journal behind" '.left == false' "$(unit journal)"
 check_jq "a memory file that is gone is reported, not uploaded" '.result.ok == false and .calls == 0' "$(unit missing-file)"
 check_jq "a local path with spaces reaches aws as one argument" '.result.ok == true and .calls == 1' "$(unit space-name)"
 check_jq "a removal and an upload are two calls" '.result.ok == true and .calls == 2' "$(unit valid-nested)"
-check "argv is the absolute local path (spaces and metacharacters intact), the s3 URI under the prefix, and the flag" test "$(call_line 1)" = "$(argline s3 cp "$workspace/memory/acme/api/scripts/ok.sh" s3://acme-sre-memory/fleet/acme/api/scripts/ok.sh --only-show-errors)"
+check "argv is the absolute local path (spaces and metacharacters intact), the s3 URI under the prefix, and the flag" grep -qxF "$(argline s3 cp "$workspace/memory/acme/api/scripts/ok.sh" s3://acme-sre-memory/fleet/acme/api/scripts/ok.sh --only-show-errors)" "$ctl/aws_calls.log"
 check "the removal is an s3 rm of the key" test "$(grep -F 'acme/api/NOTES.md' "$ctl/aws_calls.log" | tail -n 1)" = "$(argline s3 rm s3://acme-sre-memory/fleet/acme/api/NOTES.md --only-show-errors)"
 check "no shell ran anything in these names" test -z "$(pwned)"
+if [ "$(id -u)" -eq 0 ]; then
+  echo "ok   skipped: a read-only workspace does not stop root"
+else
+  check_jq "a restore that cannot even stage is a failed try with a backoff, not an error before every request" '.first.skipped != null and .first.restored == null and .failures == 1 and (.second.skipped | contains("waiting")) and .calls == 0' "$(unit retry-throws)"
+fi
 
 echo "--- 3. no bucket: nothing is called, and the memory is saved as before ---"
 reset_aws
@@ -403,7 +456,8 @@ PREFIX_V="team-a/memory"
 run_runner restore
 check "a restoring run exits 0" test "$rc" -eq 0
 check "exactly one aws call on start (nothing changed, so nothing is mirrored)" test "$(calls)" -eq 1
-check "the call is one recursive cp of the prefix into memory/" test "$(call_line 1)" = "$(argline s3 cp --recursive s3://acme-sre-memory/team-a/memory/ "$workspace/memory/" --only-show-errors)"
+check "the call is one recursive cp of the prefix into a staging directory beside memory/, never into memory/ itself" restore_call "$(call_line 1)" s3://acme-sre-memory/team-a/memory/
+check "the staging directory is gone and memory/ holds the judged tree" no_staging
 check "the bucket was read before the runner's first request to the platform" test "$(seen_at 1)" -eq 0
 check "the estate's restored note is in the prompt" grep -qF 'restored: the nightly page goes to the on-call.' "$brief_seen"
 check "the restored files are on the volume" test -f "$workspace/memory/acme/api/NOTES.md" -a -f "$workspace/memory/acme/api/scripts/check.sh"
@@ -471,8 +525,8 @@ check "a run after a tampered restore exits 0 and answers" test "$rc" -eq 0 -a -
 check "no symlink is left under memory/" test -z "$(find "$workspace/memory" -type l -print -quit)"
 check "no FIFO or other special file is left under memory/" test -z "$(find "$workspace/memory" ! -type f ! -type d -print -quit)"
 check "nothing outside the workspace's memory was written through a link" test "$(cat "$work/outside/precious")" = "do not touch" -a "$(find "$work/outside" -type f | wc -l)" -eq 1
-check "no reserved workspace name appears at the top of the workspace" test ! -e "$workspace/repos" -a ! -e "$workspace/gitdirs" -a ! -e "$workspace/agent-home"
-check "the top of memory/ holds only the estate and the owners" test "$(find "$workspace/memory" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')" = "_estate acme "
+check "an owner named like a workspace directory is restored under memory/ and nowhere else" test -f "$workspace/memory/repos/x/NOTES.md" -a -f "$workspace/memory/gitdirs/x/NOTES.md" -a -f "$workspace/memory/agent-home/x/NOTES.md" -a -f "$workspace/memory/scratch/x/NOTES.md" -a -f "$workspace/memory/memory/x/NOTES.md" -a ! -e "$workspace/repos" -a ! -e "$workspace/gitdirs" -a ! -e "$workspace/agent-home"
+check "the top of memory/ holds only the estate and the owners (five of them named like workspace directories)" test "$(find "$workspace/memory" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')" = "_estate acme agent-home gitdirs memory repos scratch "
 check "the valid estate note survived" grep -qx 'valid' "$workspace/memory/_estate/NOTES.md"
 check "the valid repository note and script survived" test -f "$workspace/memory/acme/api/NOTES.md" -a -f "$workspace/memory/acme/api/scripts/ok.sh"
 check "the repository holds exactly its note and its script" test "$(cd "$workspace/memory/acme/api" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" = "./NOTES.md ./scripts/ok.sh "
@@ -533,7 +587,7 @@ check "the uploaded note is the saved note" cmp -s "$ctl/uploaded/acme-sre-memor
 check "the uploaded script is the saved script" cmp -s "$ctl/uploaded/acme-sre-memory/fleet/_estate/scripts/check.sh" "$estate/scripts/check.sh"
 check "what the runner cut (a symlink, a bad name, a stray file) is never uploaded" test -z "$(grep -E 'link.sh|bad name|stray' "$ctl/aws_calls.log" || true)"
 check "every call was made after the brief was fetched and before the report was posted" test "$(sort -u "$ctl/aws_seen.log" | tr '\n' ' ')" = "1 "
-check_jqf "the run's result carries the mirror's answer for the report" '.bucket.ok == true' "$work/mirror.result.json"
+check_jqf "the run's result carries the mirror's answer for the report" '.mirror.ok == true' "$work/mirror.result.json"
 check "every aws call saw the AWS variables and none of the runner's other credentials" test "$(sort -u "$ctl/aws_env.log" | grep -v '^$' | tr '\n' '|')" = "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY |"
 check "the agent's environment holds no SRE_MEMORY_ variable" grep -qx 'memory_env: ' "$opencode_log"
 check "the AWS secret is in no log line and no report" test -z "$(grep -lF "$aws_secret" "$work"/*.out "$fixture_log" 2>/dev/null || true)"
@@ -546,7 +600,7 @@ start_fixture quiet
 queue_one h-quiet
 run_driver quiet
 check "an unchanged memory calls aws zero times" test "$(calls)" -eq 0
-check_jqf "and the result has no mirror answer" '.bucket == null' "$work/quiet.result.json"
+check_jqf "and the result has no mirror answer" '.mirror == null' "$work/quiet.result.json"
 stop_fixture
 
 echo "--- 10. a failing aws call is logged and never fails the request ---"
@@ -562,8 +616,8 @@ unset STUB_OPENCODE_MEMORY
 check "the run still exits 0" test "$rc" -eq 0
 check "the request is still reported" test "$(jq -r '.outcome' <<<"$report")" = "not_validated"
 check "the other files were still tried" test "$(calls)" -eq 3
-check_jqf "the result says the mirror failed, naming the file and the aws error" '.bucket.ok == false and (.bucket.error | contains("_estate/NOTES.md") and contains("AccessDenied"))' "$work/failing_mirror.result.json"
-check_jqf "the error is short enough for the report's detail" '(.bucket.error | length) <= 300' "$work/failing_mirror.result.json"
+check_jqf "the result says the mirror failed, naming the file and the aws error" '.mirror.ok == false and (.mirror.error | contains("_estate/NOTES.md") and contains("AccessDenied"))' "$work/failing_mirror.result.json"
+check_jqf "the error is short enough for the report's detail" '(.mirror.error | length) <= 300' "$work/failing_mirror.result.json"
 check "the failure is in the log" grep -qF 'AccessDenied' "$work/failing_mirror.out"
 check "the memory on the volume is untouched by the failure" test -f "$workspace/memory/_estate/scripts/check.sh"
 stop_fixture
@@ -578,7 +632,7 @@ export STUB_OPENCODE_MEMORY=edit
 run_driver all_failing
 unset STUB_OPENCODE_MEMORY
 check "every call failing still exits 0 with the request reported" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
-check_jqf "and the result says how many of the calls failed" '.bucket.ok == false and (.bucket.error | contains("3 of 3"))' "$work/all_failing.result.json"
+check_jqf "and the result says how many of the calls failed" '.mirror.ok == false and (.mirror.error | contains("3 of 3"))' "$work/all_failing.result.json"
 stop_fixture
 
 echo "--- 10b. a memory directory that cannot be saved mirrors nothing ---"
@@ -589,6 +643,7 @@ else
   fresh_workspace
   seed_estate
   original_note="$(cat "$workspace/memory/_estate/NOTES.md")"
+  : > "$workspace/.memory-first-sync"
   chmod 500 "$workspace/memory"
   start_fixture unsaved
   queue_one h-unsaved
@@ -601,9 +656,294 @@ else
   check "the earlier note stands" test "$(cat "$workspace/memory/_estate/NOTES.md")" = "$original_note"
   check_jqf "no change is reported for it" '.changes == []' "$work/unsaved.result.json"
   check "nothing is mirrored for a save that did not happen" test "$(calls)" -eq 0
-  check_jqf "and the result has no mirror answer" '.bucket == null' "$work/unsaved.result.json"
+  check_jqf "and the result has no mirror answer" '.mirror == null' "$work/unsaved.result.json"
   stop_fixture
 fi
+
+echo "--- 12. a restore that is interrupted never leaves unjudged content in memory/, and the next start restores in full ---"
+reset_aws
+fresh_workspace
+t="$ctl/bucket_tree"
+mkdir -p "$t/_estate" "$t/acme/api/scripts" "$t/acme/never-opened/scripts"
+printf '# Estate\n\nvalid\n' > "$t/_estate/NOTES.md"
+head -c 70000 /dev/zero | tr '\0' 'a' > "$t/acme/api/NOTES.md"
+printf '#!/bin/sh\n# truncated by the stop\n' > "$t/acme/api/scripts/check.sh.aB3dE9f0"
+head -c 2000000 /dev/zero | tr '\0' 'a' > "$t/acme/never-opened/scripts/x"
+printf 'stray\n' > "$t/stray.txt"
+: > "$ctl/aws_kill_runner"
+start_fixture interrupted
+queue_one h-interrupted
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_runner interrupted
+check "the runner was stopped between the download and the judging" test "$rc" -ne 0
+check "the download was made (so the stop fell where it is claimed to)" test "$(calls)" -eq 1
+check "nothing from the interrupted download is in memory/" test -z "$(find "$workspace/memory" -mindepth 1 -print -quit 2>/dev/null)"
+stop_fixture
+rm -rf "$t"
+rm -f "$ctl/aws_kill_runner"
+mkdir -p "$t/_estate" "$t/acme/api/scripts" "$t/acme/oversize"
+printf '# Estate\n\nvalid\n' > "$t/_estate/NOTES.md"
+printf '# Notes\n\nvalid api note\n' > "$t/acme/api/NOTES.md"
+printf '#!/bin/sh\n# valid\n' > "$t/acme/api/scripts/check.sh"
+head -c 70000 /dev/zero | tr '\0' 'a' > "$t/acme/oversize/NOTES.md"
+printf 'stray\n' > "$t/stray.txt"
+start_fixture resumed
+queue_one h-resumed
+run_runner resumed
+check "the next start exits 0 and answers" test "$rc" -eq 0 -a -n "$report"
+check "the next start restores the whole tree" test -f "$workspace/memory/_estate/NOTES.md" -a -f "$workspace/memory/acme/api/NOTES.md" -a -f "$workspace/memory/acme/api/scripts/check.sh"
+check "and judges it: the oversize note, the stray file and the truncated temp file are not on the volume" test ! -e "$workspace/memory/acme/oversize" -a ! -e "$workspace/memory/stray.txt" -a ! -e "$workspace/memory/acme/api/scripts/check.sh.aB3dE9f0" -a ! -e "$workspace/memory/acme/never-opened"
+check "the stopped restore's staging directory is gone" no_staging
+check "and the restore is no longer pending" test ! -e "$workspace/.memory-restore-pending"
+stop_fixture
+
+echo "--- 13. a failed restore followed by a job: the bucket's copy is not overwritten, and the restore is retried with the volume winning ---"
+reset_aws
+fresh_workspace
+t="$ctl/bucket_tree"
+mkdir -p "$t/_estate/scripts" "$t/acme/api"
+printf '# Estate\n\nbucket copy of the estate note\n' > "$t/_estate/NOTES.md"
+printf '#!/bin/sh\n# bucket helper\n' > "$t/_estate/scripts/old.sh"
+printf '# api\n\nbucket copy of the api note\n' > "$t/acme/api/NOTES.md"
+printf -- '--recursive' > "$ctl/aws_fail_on"
+start_fixture pending_one
+queue_one h-pending-one
+export STUB_OPENCODE_MEMORY=edit
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_driver pending_one
+unset STUB_OPENCODE_MEMORY
+check "the job is answered" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check "the restore is tried at start and again before the job" test "$(grep -c -- '--recursive' "$ctl/aws_calls.log")" -eq 2
+check "no file is put into the bucket and none is deleted from it while the restore is pending" test -z "$(grep -v -- '--recursive' "$ctl/aws_calls.log" || true)"
+check "the bucket's copy is untouched" test ! -e "$ctl/uploaded"
+check_jqf "the result says nothing was mirrored because the restore has not succeeded" '.mirror.ok == false and (.mirror.error | contains("restore"))' "$work/pending_one.result.json"
+check "the job's note is on the volume" grep -qF 'pool ceiling is 40' "$workspace/memory/_estate/NOTES.md"
+check "the paths still to mirror are kept on the volume" grep -qF '_estate/NOTES.md' "$workspace/.memory-mirror-pending"
+check "the pending restore is recorded on the volume" test -e "$workspace/.memory-restore-pending"
+stop_fixture
+rm -f "$ctl/aws_fail_on"
+: > "$ctl/aws_calls.log"
+: > "$ctl/aws_seen.log"
+start_fixture pending_two
+queue_one h-pending-two
+run_driver pending_two
+check "the next start retries the restore although memory/ is no longer empty" test "$(grep -c -- '--recursive' "$ctl/aws_calls.log")" -eq 1
+check "the volume's own note wins over the bucket's" grep -qF 'pool ceiling is 40' "$workspace/memory/_estate/NOTES.md"
+check "the bucket's older estate note did not replace it" test -z "$(grep -F 'bucket copy of the estate note' "$workspace/memory/_estate/NOTES.md" || true)"
+check "a file the volume lacks comes back from the bucket (the estate helper and the other repository's note)" test -f "$workspace/memory/_estate/scripts/old.sh" -a -f "$workspace/memory/acme/api/NOTES.md"
+check "the volume's script from the first job is kept" test -f "$workspace/memory/_estate/scripts/check.sh"
+check_jqf "the job mirrors what the first job left pending: two uploads" '.mirror.ok == true and .mirror.calls == 2' "$work/pending_two.result.json"
+check "the uploaded note is the volume's note" cmp -s "$ctl/uploaded/acme-sre-memory/memory/_estate/NOTES.md" "$workspace/memory/_estate/NOTES.md"
+check "what came back from the bucket is not uploaded again" test ! -e "$ctl/uploaded/acme-sre-memory/memory/acme"
+check "no journal and no pending restore are left" test ! -e "$workspace/.memory-mirror-pending" -a ! -e "$workspace/.memory-restore-pending"
+stop_fixture
+
+echo "--- 14. a restore that fails once is retried before the first job in the same process ---"
+reset_aws
+fresh_workspace
+mkdir -p "$ctl/bucket_tree/_estate"
+printf '# Estate\n\nrestored by the retry before the job\n' > "$ctl/bucket_tree/_estate/NOTES.md"
+echo 1 > "$ctl/aws_fail_first"
+start_fixture retried_before_job
+queue_one h-retried-before-job
+run_runner retried_before_job
+check "two downloads: the one at start fails, the one before the job works" test "$(grep -c -- '--recursive' "$ctl/aws_calls.log")" -eq 2
+check "the second download ran before the brief was fetched (only the queue had been asked)" test "$(seen_at 2)" -eq 1
+check "the estate note reached the agent's prompt" grep -qF 'restored by the retry before the job' "$brief_seen"
+check "the restore is no longer pending" test ! -e "$workspace/.memory-restore-pending"
+stop_fixture
+
+echo "--- 15. more than fifty changes: every one is mirrored, and the report still carries at most fifty ---"
+reset_aws
+fresh_workspace
+mkdir -p "$workspace/memory/_estate/scripts"
+printf '# Estate\n\nthe first note\n' > "$workspace/memory/_estate/NOTES.md"
+for number in $(seq -w 1 50); do printf '#!/bin/sh\n# a%s\n' "$number" > "$workspace/memory/_estate/scripts/a$number"; done
+start_fixture churn
+queue_one h-churn
+export STUB_OPENCODE_MEMORY=churn
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_driver churn
+unset STUB_OPENCODE_MEMORY
+check "the run exits 0" test "$rc" -eq 0
+check_jqf "the report's list is cut to fifty" '(.changes | length) == 50' "$work/churn.result.json"
+check "all 101 changes made a call" test "$(calls)" -eq 101
+check "the 50 scripts the run removed were deleted from the bucket" test "$(grep -c "^s3${us}rm${us}s3://acme-sre-memory/memory/_estate/scripts/a" "$ctl/aws_calls.log")" -eq 50
+check "the 50 scripts the run added and the changed note were uploaded" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 51
+check "the last of the added scripts is among them" test -f "$ctl/uploaded/acme-sre-memory/memory/_estate/scripts/b50"
+check_jqf "and the mirror says it made them all" '.mirror.ok == true and .mirror.calls == 101' "$work/churn.result.json"
+stop_fixture
+
+echo "--- 16. a bucket that never answers: the mirror stops at its limit, the report goes out, the next job mirrors what is left ---"
+reset_aws
+fresh_workspace
+seed_estate
+: > "$ctl/aws_hang"
+start_fixture hang
+queue_one h-hang
+export STUB_OPENCODE_MEMORY=edit
+driver_deadline_ms=3000
+SECONDS=0
+run_driver hang
+elapsed=$SECONDS
+unset STUB_OPENCODE_MEMORY driver_deadline_ms
+check "the run exits 0 and the request is reported" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check "the whole run, mirror included, ended within seconds of the limit ($elapsed s)" test "$elapsed" -lt 40
+check "the mirror gave up after the first call that did not answer" test "$(calls)" -eq 1
+check_jqf "the result says what was not tried and why" '.mirror.ok == false and (.mirror.error | contains("2 of 3 not tried"))' "$work/hang.result.json"
+check "the three paths wait in the journal" jq -e '.paths | length == 3' "$workspace/.memory-mirror-pending"
+check "nothing reached the bucket" test ! -e "$ctl/uploaded"
+stop_fixture
+rm -f "$ctl/aws_hang"
+: > "$ctl/aws_calls.log"
+start_fixture hang_next
+queue_one h-hang-next
+run_driver hang_next
+check "the next job, with no change of its own, mirrors the pending paths" test "$(calls)" -eq 3
+check_jqf "and says so" '.mirror.ok == true and .mirror.calls == 3' "$work/hang_next.result.json"
+check "the note and the script reached the bucket and the removed script is gone from it" test -s "$ctl/uploaded/acme-sre-memory/memory/_estate/NOTES.md" -a -s "$ctl/uploaded/acme-sre-memory/memory/_estate/scripts/check.sh"
+check "the journal is empty again" test ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 16b. slow calls: the limit cuts the run part way, and what it cut stays pending ---"
+reset_aws
+fresh_workspace
+seed_estate
+echo 1 > "$ctl/aws_sleep"
+start_fixture slow
+queue_one h-slow
+export STUB_OPENCODE_MEMORY=edit
+driver_deadline_ms=2500
+run_driver slow
+unset STUB_OPENCODE_MEMORY driver_deadline_ms
+check "two calls finished inside the limit and the third was cut" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 2
+check_jqf "the result counts one path still pending" '.mirror.ok == false and .mirror.pending == 1' "$work/slow.result.json"
+check "one path waits in the journal" jq -e '.paths | length == 1' "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 17. the CLI exits 2 for a key it skipped: what it did download is kept, judged, and the skip is logged ---"
+reset_aws
+fresh_workspace
+mkdir -p "$ctl/bucket_tree/_estate" "$ctl/bucket_tree/acme/api"
+printf '# Estate\n\nkept despite the skipped key\n' > "$ctl/bucket_tree/_estate/NOTES.md"
+printf 'stray\n' > "$ctl/bucket_tree/stray.txt"
+: > "$ctl/aws_exit2"
+start_fixture exit_two
+queue_one h-exit-two
+run_runner exit_two
+check "the run exits 0" test "$rc" -eq 0
+check "what downloaded is on the volume" grep -qF 'kept despite the skipped key' "$workspace/memory/_estate/NOTES.md"
+check "and was judged like any other restore" test ! -e "$workspace/memory/stray.txt"
+check "the log names what the CLI skipped" grep -qF 'File references a parent directory' "$out"
+check "the restore is not left pending" test ! -e "$workspace/.memory-restore-pending"
+check "the restore ran once, it was not repeated at the next job" test "$(calls)" -eq 1
+stop_fixture
+
+echo "--- 18. a repository job is mirrored under <owner>/<repo>/ ---"
+real_git="$(command -v git)"
+remote="$work/remote/app.git"
+mkdir -p "$work/remote" "$work/gitbin"
+"$real_git" init -q --bare -b main "$remote"
+"$real_git" init -q -b main "$work/seed"
+printf 'the fixture repository\n' > "$work/seed/README.md"
+"$real_git" -C "$work/seed" add README.md
+"$real_git" -C "$work/seed" -c user.name=seed -c user.email=seed@example.invalid commit -q -m seed
+"$real_git" -C "$work/seed" push -q "$remote" main
+cat > "$work/gitbin/git" <<GITEOF
+#!/usr/bin/env bash
+set -euo pipefail
+args=()
+for a in "\$@"; do
+  case "\$a" in
+    https://x-access-token:*@github.com/*) args+=("$remote") ;;
+    *) args+=("\$a") ;;
+  esac
+done
+exec "$real_git" "\${args[@]}"
+GITEOF
+chmod +x "$work/gitbin/git"
+PATH="$work/gitbin:$PATH"
+reset_aws
+fresh_workspace
+start_fixture repo_job
+jq -n --arg id h-repo --arg base "$server_url" --arg token "$handoff_token" \
+  '[{handoff_id: $id, subject_id: "11111111-2222-3333-4444-555555555555", repo_full_name: "acme/app",
+     brief_url: ($base + "/api/handoffs/" + $id + "/brief"), report_url: ($base + "/api/handoffs/" + $id + "/report"), token: $token}]' > "$queue_file"
+export STUB_OPENCODE_MEMORY=edit
+run_driver repo_job
+unset STUB_OPENCODE_MEMORY
+check "the repository job exits 0" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check "the note is on the volume under the owner and the repository" test -f "$workspace/memory/acme/app/NOTES.md"
+check "the note was uploaded under the prefix, the owner and the repository" cmp -s "$ctl/uploaded/acme-sre-memory/memory/acme/app/NOTES.md" "$workspace/memory/acme/app/NOTES.md"
+check "the script was uploaded there too" test -s "$ctl/uploaded/acme-sre-memory/memory/acme/app/scripts/check.sh"
+check "the empty volume was restored once, then two uploads and nothing else" test "$(grep -c -- '--recursive' "$ctl/aws_calls.log")" -eq 1 -a "$(grep -vc -- '--recursive' "$ctl/aws_calls.log")" -eq 2
+check "nothing went to the estate's key" test ! -e "$ctl/uploaded/acme-sre-memory/memory/_estate"
+stop_fixture
+
+echo "--- 19. the first sync: memory that was never mirrored is uploaded once, deletes nothing, and a cut sync finishes on the next job ---"
+seed_three() {
+  seed_estate
+  mkdir -p "$workspace/memory/acme/api"
+  printf '# api\n\nan existing note\n' > "$workspace/memory/acme/api/NOTES.md"
+}
+reset_aws
+fresh_workspace
+seed_three
+start_fixture first_sync
+queue_one h-first-sync
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_driver first_sync
+check "the run exits 0" test "$rc" -eq 0
+check "existing memory is not restored over: no download" test -z "$(grep -F -- '--recursive' "$ctl/aws_calls.log" || true)"
+check "one put per existing file, three in all" test "$(grep -c "^s3${us}cp${us}" "$ctl/aws_calls.log")" -eq 3 -a "$(calls)" -eq 3
+check "the sync deletes nothing in the bucket" test -z "$(grep -F "s3${us}rm${us}" "$ctl/aws_calls.log" || true)"
+check "every file is in the bucket under the prefix" test -s "$ctl/uploaded/acme-sre-memory/memory/_estate/NOTES.md" -a -s "$ctl/uploaded/acme-sre-memory/memory/_estate/scripts/old.sh" -a -s "$ctl/uploaded/acme-sre-memory/memory/acme/api/NOTES.md"
+check_jqf "and the result says the mirror made all three calls" '.mirror.ok == true and .mirror.calls == 3 and .mirror.pending == 0' "$work/first_sync.result.json"
+check "the marker of a finished sync is on the volume" test -e "$workspace/.memory-first-sync"
+check "and no journal is left" test ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+: > "$ctl/aws_calls.log"
+start_fixture first_sync_again
+queue_one h-first-sync-again
+run_driver first_sync_again
+check "a second start does nothing: no aws call" test "$(calls)" -eq 0
+check_jqf "and the result has no mirror answer" '.mirror == null' "$work/first_sync_again.result.json"
+stop_fixture
+
+reset_aws
+fresh_workspace
+seed_three
+echo 1 > "$ctl/aws_sleep"
+start_fixture first_sync_cut
+queue_one h-first-sync-cut
+driver_deadline_ms=2500
+run_driver first_sync_cut
+unset driver_deadline_ms
+check "the deadline cut the sync part way: two files are in the bucket" test "$(find "$ctl/uploaded" -type f 2>/dev/null | wc -l)" -eq 2
+check_jqf "the result counts one path still pending" '.mirror.ok == false and .mirror.pending == 1' "$work/first_sync_cut.result.json"
+check "the marker is not written while the journal holds a path" test ! -e "$workspace/.memory-first-sync"
+check "one path waits in the journal" jq -e '.paths | length == 1' "$workspace/.memory-mirror-pending"
+stop_fixture
+rm -f "$ctl/aws_sleep"
+start_fixture first_sync_rest
+queue_one h-first-sync-rest
+run_driver first_sync_rest
+check "the next job finishes the sync: all three files are in the bucket" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 3
+check_jqf "and says so" '.mirror.ok == true and .mirror.pending == 0' "$work/first_sync_rest.result.json"
+check "the marker is written once the journal is empty" test -e "$workspace/.memory-first-sync" -a ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+reset_aws
+fresh_workspace
+start_fixture first_sync_empty
+queue_one h-first-sync-empty
+run_driver first_sync_empty
+check "an empty volume is restored from the empty bucket, which is a synced volume: the one download, no put, and the marker" test "$(calls)" -eq 1 -a -e "$workspace/.memory-first-sync"
+stop_fixture
 
 echo "--- 11. the entrypoint refuses a bucket it cannot reach, and runs without one ---"
 bash_bin="$(command -v bash)"

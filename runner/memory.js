@@ -32,6 +32,10 @@ const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // these cannot be told from the runner's own directory, so it is not migrated
 // and is cloned again under repos/.
 const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home']);
+// What the runner keeps at the top of the workspace for the bucket mirror: a
+// restore's staging directory, the marker of a restore that has not succeeded
+// and the journal of paths not yet mirrored (runner/bucket.js). None is an owner.
+const STATE_PREFIX = '.memory-';
 
 function validName(name) {
   return typeof name === 'string' && NAME_PATTERN.test(name) && !/^\.+$/.test(name);
@@ -106,7 +110,7 @@ function migrate(workspace) {
   for (const owner of readDirOrEmpty(base)) {
     // A GitHub owner always passes validName; lost+found of a mounted disk and
     // the like do not, and may not even be readable.
-    if (RESERVED.has(owner) || !validName(owner)) continue;
+    if (RESERVED.has(owner) || owner.startsWith(STATE_PREFIX) || !validName(owner)) continue;
     const ownerDir = path.join(base, owner);
     if (!isRealDirectory(ownerDir)) continue;
     for (const name of readDirOrEmpty(ownerDir)) {
@@ -358,9 +362,14 @@ function enforce(dir, previous = new Map()) {
 
 // What a run did to its memory, for the report. `rootPrefix` is the memory
 // directory's place under /workspace/memory (acme/api, or _estate). A removed
-// file reports the size it had. Sorted by path, at most 50, and a path longer
-// than the contract's 300 characters is left out rather than cut.
-function changes(before, after, rootPrefix) {
+// file reports the size it had. Sorted by path. The report takes the defaults:
+// at most 50, and a path longer than the contract's 300 characters is left out
+// rather than cut. The bucket mirror asks for every change
+// ({limit: Infinity, maxPath: Infinity}), because a cut list would leave the
+// bucket different from the volume for good.
+function changes(before, after, rootPrefix, options = {}) {
+  const limit = options.limit === undefined ? MAX_CHANGES : options.limit;
+  const maxPath = options.maxPath === undefined ? MAX_PATH_CHARS : options.maxPath;
   const prefix = rootPrefix ? `${String(rootPrefix).replace(/\/+$/, '')}/` : '';
   const listed = [];
   for (const [rel, now] of after) {
@@ -372,9 +381,9 @@ function changes(before, after, rootPrefix) {
     if (!after.has(rel)) listed.push({ path: `${prefix}${rel}`, change: 'removed', bytes: was.bytes });
   }
   return listed
-    .filter((entry) => entry.path.length <= MAX_PATH_CHARS)
+    .filter((entry) => entry.path.length <= maxPath)
     .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
-    .slice(0, MAX_CHANGES);
+    .slice(0, limit);
 }
 
 // A crash between the two renames that swap a memory directory in leaves
@@ -415,6 +424,7 @@ module.exports = {
   MAX_DIR_BYTES,
   MAX_CHANGES,
   RESERVED,
+  STATE_PREFIX,
   validName,
   layout,
   memoryDir,

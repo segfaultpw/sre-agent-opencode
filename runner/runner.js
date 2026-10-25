@@ -176,7 +176,45 @@ function readPackageFile(relative) {
   return fs.readFileSync(path.join(PACKAGE_ROOT, relative), 'utf8');
 }
 
+// Every model provider key opencode reads, which is what scripts/provider_env.sh
+// maps a model prefix to (tests/provider_env_test.sh holds the two lists equal).
+// The runner passes its whole environment on to the agent, so these are trimmed
+// where they are read, like the runner's own secrets.
+const PROVIDER_KEY_VARIABLES = [
+  'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY',
+  'GROQ_API_KEY', 'MISTRAL_API_KEY', 'DEEPSEEK_API_KEY', 'TOGETHER_API_KEY', 'FIREWORKS_API_KEY',
+  'CEREBRAS_API_KEY', 'MOONSHOT_API_KEY', 'DEEPINFRA_API_KEY', 'HF_TOKEN', 'ZHIPU_API_KEY',
+  'MINIMAX_API_KEY', 'NVIDIA_API_KEY', 'OPENCODE_API_KEY', 'AI_GATEWAY_API_KEY',
+];
+const SECRET_VARIABLES = ['SRE_API_KEY', 'SRE_GITHUB_TOKEN', 'SRE_AGENT_GITHUB_TOKEN', ...PROVIDER_KEY_VARIABLES];
+
+// A key pasted from a terminal or written with echo arrives with a trailing
+// newline, which an Authorization header refuses and a credential helper sends
+// as part of the secret. Surrounding whitespace is removed from the environment
+// itself, once, so every use (the poll, git, the agent's own environment) sees
+// the secret alone. A value that is only whitespace is treated as not set. A
+// line break inside a value is not a paste artefact, so it is refused, and the
+// sentence names the variable and never carries the value. Returns the names
+// whose value changed.
+function trimSecrets(env) {
+  const changed = [];
+  for (const name of SECRET_VARIABLES) {
+    const value = env[name];
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (/[\r\n]/.test(trimmed)) {
+      throw fatal(`${name} has a line break inside its value, so it cannot be one secret; set it again as a single line (the value is not printed)`);
+    }
+    if (trimmed === value) continue;
+    changed.push(name);
+    if (trimmed === '') delete env[name];
+    else env[name] = trimmed;
+  }
+  return changed;
+}
+
 function loadConfig() {
+  const trimmed = trimSecrets(process.env);
   const missing = ['SRE_SERVER_URL', 'SRE_API_KEY', 'SRE_MODEL'].filter((name) => !process.env[name]);
   if (missing.length > 0) {
     throw fatal(`the runner needs ${missing.join(', ')} in its environment and will not start without it`);
@@ -215,6 +253,8 @@ function loadConfig() {
     // sets it, and a typo must leave the agent without the task role.
     agentAwsAccess: process.env.SRE_AGENT_AWS_ACCESS === '1',
     identity: loadIdentity(process.env, { uid: process.getuid(), gid: process.getgid() }),
+    // The names of the secrets that had whitespace around them, for the log.
+    trimmed,
   };
 }
 
@@ -403,16 +443,23 @@ function awsEnv() {
 
 // The settings bucket.js works with, or null when no bucket is configured. The
 // aws calls are argument arrays handed to runProcess, as the runner's own
-// account, so no shell sees a path.
+// account, so no shell sees a path. `state` is kept on the config so the
+// restore's retry backoff survives from one request to the next, and
+// config.memoryBucket.deadlineMs (unset in production) shortens the mirror's
+// overall limit for the tests that prove it.
 function bucketSettings(config) {
   const chosen = config.memoryBucket;
   if (!chosen || !chosen.bucket) return null;
+  if (!config.memoryState) config.memoryState = {};
   const workspace = path.resolve(config.workspace);
   return {
     bucket: chosen.bucket,
     prefix: chosen.prefix,
     workspace,
+    deadlineMs: chosen.deadlineMs,
+    state: config.memoryState,
     log,
+    own: ownByRunner,
     run: async (command, args, options = {}) => {
       const result = await runProcess(command, args, { cwd: workspace, env: awsEnv(), as: 'runner', timeoutMs: options.timeoutMs });
       return { ...result, stdout: redact(result.stdout), stderr: redact(result.stderr) };
@@ -1213,6 +1260,9 @@ function closeMemory(mem, result) {
       if (entry.content && entry.content.length >= MEMORY_COPY_MIN_BYTES) mem.blobs.add(memory.blobSha(entry.content));
     }
     result.memoryChanges = memory.changes(mem.before, after, mem.prefix);
+    // The report carries at most fifty entries; the bucket must be told about
+    // every one, or it drifts from the volume for good.
+    result.memoryMirror = memory.changes(mem.before, after, mem.prefix, { limit: Infinity, maxPath: Infinity });
     if (memoryDiffers(mem.before, after)) replaceMemory(mem, after);
     if (result.memoryChanges.length > 0) {
       const count = result.memoryChanges.length;
@@ -1225,6 +1275,7 @@ function closeMemory(mem, result) {
     // mirror: a list computed before the save failed would send a file that
     // is not on the volume to the bucket.
     result.memoryChanges = [];
+    result.memoryMirror = [];
   } finally {
     fs.rmSync(mem.copy, { recursive: true, force: true });
   }
@@ -1604,13 +1655,16 @@ async function handleJob(config, job) {
     actions: [],
     evidence: { runner_version: `v${config.version}`, model: config.model },
     // For the report of what the run did to its memory; the report body does
-    // not carry them yet.
+    // not carry them yet. memoryChanges is the report's list (at most fifty);
+    // memoryMirror is every change, which is what the bucket is told.
     memoryChanges: [],
+    memoryMirror: [],
     memorySummary: '',
     memoryNotes: [],
-    // The mirror's answer ({ok: true} or {ok: false, error}) when memory
-    // changed and a bucket is configured; null otherwise.
-    bucket: null,
+    // The mirror's answer ({ok, calls, pending, error?}) when a bucket is
+    // configured and the mirror had something to do; null otherwise. Named
+    // mirror, not bucket: the report's memory.bucket is the bucket's name.
+    mirror: null,
   };
 
   try {
@@ -1753,38 +1807,27 @@ async function handleJob(config, job) {
 }
 
 // Whatever the outcome, the changes the run made to its memory follow it to the
-// bucket before the request is reported. A failure is logged and returned in
-// result.bucket; it never fails the request.
+// bucket before the request is reported, together with whatever an earlier
+// request left unmirrored. A failure is logged and returned in result.mirror; it
+// never fails the request, and the mirror stops at its own overall limit.
 async function mirrorMemory(config, result) {
   const settings = bucketSettings(config);
-  if (!settings || result.memoryChanges.length === 0) return;
+  if (!settings) return;
   try {
-    result.bucket = await bucket.mirror(settings, result.memoryChanges);
+    const answer = await bucket.mirror(settings, result.memoryMirror);
+    if (!answer.idle) result.mirror = answer;
   } catch (error) {
-    result.bucket = { ok: false, error: `the mirror stopped: ${redact(error.message)}` };
-    log('warn', `memory bucket: ${result.bucket.error}`);
+    result.mirror = { ok: false, calls: 0, error: `the mirror stopped: ${redact(error.message)}` };
+    log('warn', `memory bucket: ${result.mirror.error}`);
   }
 }
 
-async function main() {
-  const config = loadConfig();
-  constantSecrets.push(config.apiKey);
-  if (config.githubToken) constantSecrets.push(config.githubToken);
-  if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
-  logLevel = LEVELS[(process.env.SRE_LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
-
-  identity = config.identity;
-  // Files the runner and its children create are the runner's alone; the
-  // directories the agent has to walk through are opened explicitly.
-  if (identity.mode !== 'none') process.umask(0o077);
-  log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}, running ${describeIdentity()}`);
-  if (identity.mode === 'none') {
-    log(
-      'warn',
-      'no agent account is configured (SRE_AGENT_UID), so the agent runs as the runner\'s own account: taking credentials out of its environment is not a boundary, because it can read this process\'s environment and write the memory directory. The container image and the systemd install configure the split.'
-    );
-  }
-
+// Once, before the first poll: the layout, the interrupted saves, the modes, and
+// the restore of an empty (or half restored) volume from the bucket. A restore
+// that cannot finish is not an error here: serveJob tries it again before each
+// request, and nothing is mirrored until it has succeeded.
+async function startMemory(config) {
+  identity = config.identity || NO_IDENTITY;
   try {
     const moved = memory.migrate(config.workspace);
     if (moved.length > 0) {
@@ -1804,11 +1847,64 @@ async function main() {
   if (settings) {
     log('info', `the memory is mirrored to s3://${settings.bucket}/${settings.prefix}, and restored from it onto an empty memory directory`);
     try {
-      await bucket.restoreIfEmpty(settings);
+      await bucket.restore(settings);
     } catch (error) {
       log('warn', `memory bucket: the memory could not be restored (${redact(error.message)}); the runner starts without it`);
     }
+    syncMemory(settings);
   }
+}
+
+// Memory that was never mirrored completely (an upgrade, or a bucket added
+// later) is journaled for the bucket once; the next request's mirror uploads it.
+function syncMemory(settings) {
+  try {
+    bucket.firstSync(settings);
+  } catch (error) {
+    log('warn', `memory bucket: the first sync could not be prepared (${redact(error.message)})`);
+  }
+}
+
+// One request: a restore that has not succeeded is tried again first (before
+// the brief is fetched, so the platform's clock for the request is not spent
+// on it more than once), then the request.
+async function serveJob(config, job) {
+  const settings = bucketSettings(config);
+  if (settings) {
+    try {
+      await bucket.retryRestore(settings);
+    } catch (error) {
+      log('warn', `memory bucket: the restore could not be retried (${redact(error.message)})`);
+    }
+    syncMemory(settings);
+  }
+  return handleJob(config, job);
+}
+
+async function main() {
+  const config = loadConfig();
+  constantSecrets.push(config.apiKey);
+  if (config.githubToken) constantSecrets.push(config.githubToken);
+  if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
+  logLevel = LEVELS[(process.env.SRE_LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
+
+  if (config.trimmed.length > 0) {
+    log('info', `removed the whitespace around ${config.trimmed.join(', ')}; a value pasted from a terminal or written with echo carries a line break at the end`);
+  }
+
+  identity = config.identity;
+  // Files the runner and its children create are the runner's alone; the
+  // directories the agent has to walk through are opened explicitly.
+  if (identity.mode !== 'none') process.umask(0o077);
+  log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}, running ${describeIdentity()}`);
+  if (identity.mode === 'none') {
+    log(
+      'warn',
+      'no agent account is configured (SRE_AGENT_UID), so the agent runs as the runner\'s own account: taking credentials out of its environment is not a boundary, because it can read this process\'s environment and write the memory directory. The container image and the systemd install configure the split.'
+    );
+  }
+
+  await startMemory(config);
 
   for (;;) {
     let jobs = [];
@@ -1830,13 +1926,13 @@ async function main() {
       log('info', `the queue answered with ${jobs.length} requests; taking one and polling again for the rest`);
     }
     if (jobs.length > 0) {
-      await handleJob(config, jobs[0]);
+      await serveJob(config, jobs[0]);
     }
     if (config.once) return;
   }
 }
 
-module.exports = { loadConfig, handleJob, internals: { openMemory, closeMemory, replaceMemory, makeBaseBundle } };
+module.exports = { loadConfig, handleJob, startMemory, serveJob, PROVIDER_KEY_VARIABLES, internals: { openMemory, closeMemory, replaceMemory, makeBaseBundle } };
 
 if (require.main === module) {
   process.on('uncaughtException', (error) => {
