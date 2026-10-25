@@ -360,6 +360,36 @@ function enforce(dir, previous = new Map()) {
   return result;
 }
 
+// Which of a directory's files the bounds admit, judged from their relative
+// paths (NOTES.md or scripts/<name>) and sizes alone, for a caller that has no
+// reason to read or copy them. It gives the answer enforce() gives for a
+// directory nothing came before: a note over its bound goes, the scripts after
+// the first fifty by name go, and then the largest files go until the directory
+// fits. Returns the admitted paths, sorted.
+function admit(files) {
+  const byRel = (a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
+  const kept = [];
+  let scripts = 0;
+  for (const file of [...files].sort(byRel)) {
+    if (file.rel === NOTES) {
+      if (file.bytes <= MAX_NOTES_BYTES) kept.push(file);
+    } else if (file.rel.startsWith(`${SCRIPTS}/`) && !file.rel.slice(SCRIPTS.length + 1).includes('/') && validName(file.rel.slice(SCRIPTS.length + 1))) {
+      if (scripts < MAX_SCRIPTS) {
+        kept.push(file);
+        scripts += 1;
+      }
+    }
+  }
+  const byLargest = (a, b) => b.bytes - a.bytes || byRel(a, b);
+  for (;;) {
+    const total = kept.reduce((sum, file) => sum + file.bytes, 0);
+    if (total <= MAX_DIR_BYTES) break;
+    kept.sort(byLargest);
+    kept.shift();
+  }
+  return kept.map((file) => file.rel).sort();
+}
+
 // What a run did to its memory, for the report. `rootPrefix` is the memory
 // directory's place under /workspace/memory (acme/api, or _estate). A removed
 // file reports the size it had. Sorted by path. The report takes the defaults:
@@ -431,6 +461,7 @@ module.exports = {
   migrate,
   snapshot,
   enforce,
+  admit,
   changes,
   check,
   blobSha,

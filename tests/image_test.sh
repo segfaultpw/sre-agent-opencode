@@ -105,7 +105,11 @@ check "$dockerfile" 'linux-x64-baseline' 'the amd64 build is the baseline one, w
 
 echo "--- the entrypoint refuses rather than starting without its configuration ---"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+# The setup scripts live apart from $work: that is under /tmp, which the entrypoint
+# refuses as a place for a script that runs as root, so a script placed there
+# would be refused for that reason and prove nothing about the others.
+setup_dir="$(mktemp -d "${HOME:-/root}/.sre-image-test-setup.XXXXXX")"
+trap 'rm -rf "$work" "$setup_dir"' EXIT
 mkdir -p "$work/bin" "$work/workspace"
 
 # The account lookups of a root start, answered from a table: runner 10001,
@@ -247,8 +251,7 @@ run_as FAKE_ID_U=1000
 if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=::' "$STUB_LOG"; then echo "ok   without root and without an agent account nothing is resolved (the runner warns in its own log)"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 
 echo "--- SRE_RUNNER_SETUP runs once as root before the runner starts, and a failure stops the start ---"
-mkdir -p "$work/setup"
-cat > "$work/setup/ok.sh" <<EOF
+cat > "$setup_dir/ok.sh" <<EOF
 #!/usr/bin/env bash
 printf 'setup ran\\n' >> "$STUB_LOG"
 printf 'setup sees SRE_API_KEY=%s SRE_GITHUB_TOKEN=%s\\n' "\${SRE_API_KEY-unset}" "\${SRE_GITHUB_TOKEN-unset}" >> "$STUB_LOG"
@@ -257,18 +260,18 @@ printf 'setup keeps SRE_SETUP_CHANNEL=%s HTTPS_PROXY=%s HOME=%s\\n' "\${SRE_SETU
 echo "installing the extra package"
 echo "a warning" >&2
 EOF
-cat > "$work/setup/fail.sh" <<'EOF'
+cat > "$setup_dir/fail.sh" <<'EOF'
 #!/usr/bin/env bash
 echo "apt-get could not reach the mirror" >&2
 exit 3
 EOF
-printf '#!/usr/bin/env bash\nexit 0\n' > "$work/setup/not-executable.sh"
-chmod +x "$work/setup/ok.sh" "$work/setup/fail.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$setup_dir/not-executable.sh"
+chmod +x "$setup_dir/ok.sh" "$setup_dir/fail.sh"
 
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent
 if ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   with no SRE_RUNNER_SETUP nothing runs"; else echo "FAIL a setup ran with none named"; fail=1; fi
 
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/ok.sh" \
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/ok.sh" \
   SRE_GITHUB_TOKEN=runner-token-value SRE_AGENT_GITHUB_TOKEN=agent-token-value OPENROUTER_API_KEY=provider-key-value \
   AWS_SECRET_ACCESS_KEY=aws-secret-value SRE_SETUP_CHANNEL=stable HTTPS_PROXY=http://proxy.example.invalid:3128
 if [ "$rc" -eq 0 ] && [ "$(grep -cx 'setup ran' "$STUB_LOG")" -eq 1 ]; then echo "ok   the setup script runs once"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
@@ -280,28 +283,56 @@ if grep -qx 'setup sees SRE_AGENT_GITHUB_TOKEN=unset OPENROUTER_API_KEY=unset AW
 if grep -qx 'setup keeps SRE_SETUP_CHANNEL=stable HTTPS_PROXY=http://proxy.example.invalid:3128 HOME=/root' "$STUB_LOG"; then echo "ok   it keeps the operator's SRE_SETUP_* variables and the proxy, with root's home"; else echo "FAIL $(grep 'setup keeps' "$STUB_LOG")"; fail=1; fi
 if grep -qF 'setup: installing the extra package' <<<"$out" && grep -qF 'setup: a warning' <<<"$out"; then echo "ok   its output, standard output and standard error, is logged"; else echo "FAIL output: $out"; fail=1; fi
 
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/fail.sh"
-if [ "$rc" -ne 0 ] && grep -qF 'exited 3' <<<"$out" && grep -qF "$work/setup/fail.sh" <<<"$out" && grep -qF 'did not start' <<<"$out"; then echo "ok   a failing setup script stops the start and the log says which script and how it failed"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/fail.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'exited 3' <<<"$out" && grep -qF "$setup_dir/fail.sh" <<<"$out" && grep -qF 'did not start' <<<"$out"; then echo "ok   a failing setup script stops the start and the log says which script and how it failed"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 if grep -qF 'apt-get could not reach the mirror' <<<"$out" && ! grep -q 'runner/runner.js' "$STUB_LOG"; then echo "ok   the script's own error is in the log and the runner never started"; else echo "FAIL out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/missing.sh"
-if [ "$rc" -ne 0 ] && grep -qF "$work/setup/missing.sh" <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a setup script that does not exist stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/not-executable.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/missing.sh"
+if [ "$rc" -ne 0 ] && grep -qF "$setup_dir/missing.sh" <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a setup script that does not exist stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/not-executable.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'not executable' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   one that is not executable stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 mkdir -p "$work/workspace/agent-home"
-cp "$work/setup/ok.sh" "$work/workspace/agent-home/setup.sh"
-ln -sf "$work/workspace/agent-home/setup.sh" "$work/setup/link-into-workspace.sh"
+cp "$setup_dir/ok.sh" "$work/workspace/agent-home/setup.sh"
+ln -sf "$work/workspace/agent-home/setup.sh" "$setup_dir/link-into-workspace.sh"
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/workspace/agent-home/setup.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a setup script on the workspace (which the agent writes) is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/link-into-workspace.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/link-into-workspace.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link outside the workspace that points into it is refused too"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
-relative_setup="$(realpath --relative-to="$PWD" "$work/setup/ok.sh")"
+relative_setup="$(realpath --relative-to="$PWD" "$setup_dir/ok.sh")"
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$relative_setup"
 if [ "$rc" -ne 0 ] && grep -qF 'not an absolute path' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a relative setup path is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="https://example.invalid/setup.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'URL' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a URL is refused: the runner never fetches a script"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
-run_as FAKE_ID_U=1000 SRE_RUNNER_SETUP="$work/setup/ok.sh"
+run_as FAKE_ID_U=1000 SRE_RUNNER_SETUP="$setup_dir/ok.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'root' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a start that is not root refuses a setup script rather than running it as somebody else"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+
+echo "--- a setup script is never run from a place the agent can write ---"
+# /tmp, /var/tmp and /dev/shm are writable by every account in the container,
+# the agent's included, and the script runs as root at the next start.
+for dir in /tmp /var/tmp /dev/shm; do
+  if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then echo "ok   skipped: $dir is not a writable directory here"; continue; fi
+  planted="$(mktemp -d "$dir/sre-image-test.XXXXXX")"
+  printf '#!/usr/bin/env bash\nprintf "setup ran\\n" >> "%s"\n' "$STUB_LOG" > "$planted/setup.sh"
+  chmod +x "$planted/setup.sh"
+  run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$planted/setup.sh"
+  if [ "$rc" -ne 0 ] && grep -qF "is under ${dir}" <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG" && ! grep -q 'runner/runner.js' "$STUB_LOG"; then echo "ok   a setup script under ${dir} is refused, and neither it nor the runner starts"; else echo "FAIL ${dir}: rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+  link_name="link-into-$(basename "$dir").sh"
+  ln -sf "$planted/setup.sh" "$setup_dir/$link_name"
+  run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/$link_name"
+  if [ "$rc" -ne 0 ] && grep -qF "is under ${dir}" <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link in the image that points under ${dir} is refused too"; else echo "FAIL link to ${dir}: rc=$rc out=$out"; fail=1; fi
+  rm -rf "$planted"
+done
+for spelling in / // /./ /../; do
+  : > "$STUB_LOG"
+  rc=0
+  out="$(env PATH="$work/bin:$PATH" FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/ok.sh" \
+    SRE_SERVER_URL=https://app.example.invalid SRE_API_KEY=not-a-real-key \
+    SRE_MODEL=openrouter/deepseek/deepseek-v4-pro SRE_WORKSPACE="$spelling" \
+    bash "$entrypoint" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ] && grep -qF 'workspace is /' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG" && ! grep -q 'runner/runner.js' "$STUB_LOG"; then echo "ok   a setup script with SRE_WORKSPACE=${spelling} (the whole file system) is refused"; else echo "FAIL SRE_WORKSPACE=${spelling}: rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+done
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/ok.sh"
+if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a script in a directory of its own, outside those, still runs"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 
 echo "--- the workflows build the image on both architectures ---"
 # Every runs-on in this repository's own workflows reads the organization's

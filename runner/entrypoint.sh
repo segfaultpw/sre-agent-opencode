@@ -56,6 +56,16 @@ fi
 # Kept in step with runner.js's own default, which is what a run with no
 # SRE_WORKSPACE would use.
 workspace="${SRE_WORKSPACE:-/workspace}"
+# With a setup script, the workspace is resolved once here: the script is refused
+# when it is on the workspace, and a workspace of / puts every path there.
+workspace_real=""
+if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
+  workspace_real="$(realpath -m -- "$workspace")"
+  if [ "$workspace_real" = "/" ]; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP is set and the workspace is / (SRE_WORKSPACE=${workspace}), which would make every file in the container part of the volume the agent writes; point SRE_WORKSPACE at a directory of its own" >&2
+    exit 1
+  fi
+fi
 mkdir -p "$workspace" 2>/dev/null || true
 if [ ! -d "$workspace" ] || [ ! -w "$workspace" ]; then
   echo "sre-agent-fix-runner: the workspace ${workspace} does not exist or is not writable by uid $(id -u); mount it writable, or point SRE_WORKSPACE somewhere this account owns" >&2
@@ -134,6 +144,7 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   fi
   # The workspace is the volume the agent writes (its home and checkouts live there), so a
   # script on it is one the agent could replace before the next start, when it runs as root.
+  # /tmp, /var/tmp and /dev/shm are refused below for the same reason.
   case "$setup" in
     /*) ;;
     *)
@@ -142,13 +153,23 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
       ;;
   esac
   setup_real="$(realpath -e -- "$setup")"
-  workspace_real="$(realpath -m -- "$workspace")"
   case "$setup_real/" in
     "$workspace_real"/*)
       echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is on the workspace ${workspace}; the agent can write there and the script runs as root, so put it in the image" >&2
       exit 1
       ;;
   esac
+  # Every account in the container can write these, the agent's included, and
+  # they are not the image's: the same reason as the workspace.
+  for open_dir in /tmp /var/tmp /dev/shm; do
+    open_real="$(realpath -m -- "$open_dir")"
+    case "$setup_real/" in
+      "$open_dir"/* | "$open_real"/*)
+        echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is under ${open_dir}; the agent can write there and the script runs as root, so put it in the image" >&2
+        exit 1
+        ;;
+    esac
+  done
   echo "sre-agent-fix-runner: running the setup script ${setup}"
   set +e
   setup_env=(PATH="$PATH" HOME=/root)

@@ -138,6 +138,13 @@ fresh_workspace() {
   mkdir -p "$workspace"
 }
 
+# The marker a finished first sync leaves: it names the bucket and prefix the
+# volume was mirrored to, because a volume mirrored to one bucket has not been
+# mirrored to another.
+write_sync_marker() {
+  printf '{"at":"2026-01-01T00:00:00.000Z","target":"s3://%s/%s"}\n' "$1" "$2" > "$workspace/.memory-first-sync"
+}
+
 calls() { grep -c '' "$ctl/aws_calls.log" || true; }
 call_line() { sed -n "${1}p" "$ctl/aws_calls.log"; }
 seen_at() { sed -n "${1}p" "$ctl/aws_seen.log"; }
@@ -643,7 +650,7 @@ else
   fresh_workspace
   seed_estate
   original_note="$(cat "$workspace/memory/_estate/NOTES.md")"
-  : > "$workspace/.memory-first-sync"
+  write_sync_marker acme-sre-memory fleet/
   chmod 500 "$workspace/memory"
   start_fixture unsaved
   queue_one h-unsaved
@@ -944,6 +951,125 @@ queue_one h-first-sync-empty
 run_driver first_sync_empty
 check "an empty volume is restored from the empty bucket, which is a synced volume: the one download, no put, and the marker" test "$(calls)" -eq 1 -a -e "$workspace/.memory-first-sync"
 stop_fixture
+
+echo "--- 20. the first sync uploads only what passes the memory bounds ---"
+reset_aws
+fresh_workspace
+m="$workspace/memory"
+mkdir -p "$m/acme/note/scripts" "$m/acme/huge/scripts" "$m/acme/many/scripts" "$m/acme/mix/scripts" "$m/acme/fine/scripts" "$m/acme/odd/scripts"
+head -c 70000 /dev/zero | tr '\0' 'a' > "$m/acme/note/NOTES.md"
+printf '#!/bin/sh\n# ok\n' > "$m/acme/note/scripts/ok.sh"
+head -c 2000000 /dev/zero | tr '\0' 'a' > "$m/acme/huge/scripts/huge.sh"
+printf '#!/bin/sh\n# ok\n' > "$m/acme/huge/scripts/ok.sh"
+for number in $(seq -w 1 60); do printf '#!/bin/sh\n' > "$m/acme/many/scripts/s$number"; done
+head -c 70000 /dev/zero | tr '\0' 'a' > "$m/acme/mix/NOTES.md"
+head -c 2000000 /dev/zero | tr '\0' 'a' > "$m/acme/mix/scripts/huge.sh"
+for number in $(seq -w 1 60); do printf '#!/bin/sh\n' > "$m/acme/mix/scripts/s$number"; done
+printf '# fine\n\nwithin every bound\n' > "$m/acme/fine/NOTES.md"
+printf '#!/bin/sh\n# fine\n' > "$m/acme/fine/scripts/ok.sh"
+mkfifo "$m/acme/odd/scripts/pipe"
+ln -s /etc/hostname "$m/acme/odd/scripts/link.sh"
+printf '#!/bin/sh\n' > "$m/acme/odd/scripts/bad name"
+printf '#!/bin/sh\n' > "$m/acme/odd/scripts/ok.sh"
+start_fixture bounded_sync
+queue_one h-bounded-sync
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+run_driver bounded_sync
+up="$ctl/uploaded/acme-sre-memory/memory/acme"
+uploaded_in() { find "$up/$1" -type f 2>/dev/null | wc -l; }
+check "the run exits 0" test "$rc" -eq 0
+check "an oversize NOTES.md is not uploaded, and the script beside it is" test ! -e "$up/note/NOTES.md" -a -s "$up/note/scripts/ok.sh"
+check "a script over the directory's byte limit is not uploaded, and the one beside it is" test ! -e "$up/huge/scripts/huge.sh" -a -s "$up/huge/scripts/ok.sh"
+check "of 60 scripts in one directory 50 are uploaded, the first fifty by name" test "$(uploaded_in many)" -eq 50 -a -s "$up/many/scripts/s50" -a ! -e "$up/many/scripts/s51"
+check "a directory with an oversize note, a 2 MB script and 60 scripts uploads neither the note nor the script, and 49 of the scripts (the 2 MB one held one of the fifty places before the size cut, as it does in a restore)" test ! -e "$up/mix/NOTES.md" -a ! -e "$up/mix/scripts/huge.sh" -a "$(uploaded_in mix)" -eq 49
+check "a directory within every bound is uploaded whole" test -s "$up/fine/NOTES.md" -a -s "$up/fine/scripts/ok.sh"
+check "a FIFO, a link and a name outside the allowed set are not uploaded" test "$(uploaded_in odd)" -eq 1 -a -s "$up/odd/scripts/ok.sh"
+check "no file the volume holds beyond its bounds made an aws call" test "$(calls)" -eq "$(find "$ctl/uploaded" -type f | wc -l)"
+check "the sync deletes nothing in the bucket" test -z "$(grep -F "s3${us}rm${us}" "$ctl/aws_calls.log" || true)"
+check "the log says files were left out for breaking a bound, naming the first" grep -qF 'break the memory bounds and are not uploaded' "$work/bounded_sync.out"
+check "the marker of a finished sync is on the volume" test -e "$workspace/.memory-first-sync" -a ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 21. the first-sync marker is for one bucket and prefix, and another bucket or prefix journals every file again ---"
+reset_aws
+fresh_workspace
+seed_three
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+start_fixture marker_a
+queue_one h-marker-a
+run_driver marker_a
+check "the first bucket gets the three files" test "$(find "$ctl/uploaded/acme-sre-memory/memory" -type f | wc -l)" -eq 3
+check_jqf "the marker names the bucket and the prefix it was written for" '.target == "s3://acme-sre-memory/memory/"' "$workspace/.memory-first-sync"
+stop_fixture
+: > "$ctl/aws_calls.log"
+start_fixture marker_same
+queue_one h-marker-same
+run_driver marker_same
+check "the same bucket and prefix again: no call" test "$(calls)" -eq 0
+stop_fixture
+BUCKET_V="other-sre-memory"
+start_fixture marker_b
+queue_one h-marker-b
+run_driver marker_b
+check "a changed bucket journals every file again: three uploads to the new bucket" test "$(find "$ctl/uploaded/other-sre-memory/memory" -type f | wc -l)" -eq 3
+check_jqf "and the marker now names the new bucket" '.target == "s3://other-sre-memory/memory/"' "$workspace/.memory-first-sync"
+check "the new bucket's sync deleted nothing" test -z "$(grep -F "s3${us}rm${us}" "$ctl/aws_calls.log" || true)"
+stop_fixture
+PREFIX_V="team-b"
+start_fixture marker_c
+queue_one h-marker-c
+run_driver marker_c
+check "a changed prefix journals every file again: three uploads under the new prefix" test "$(find "$ctl/uploaded/other-sre-memory/team-b" -type f | wc -l)" -eq 3
+check_jqf "and the marker names the new prefix" '.target == "s3://other-sre-memory/team-b/"' "$workspace/.memory-first-sync"
+stop_fixture
+rm -rf "$ctl/uploaded"
+: > "$ctl/aws_calls.log"
+: > "$workspace/.memory-first-sync"
+start_fixture marker_empty
+queue_one h-marker-empty
+run_driver marker_empty
+check "a marker that names no bucket (empty or from an earlier release) counts as no marker: three uploads" test "$(find "$ctl/uploaded/other-sre-memory/team-b" -type f | wc -l)" -eq 3
+stop_fixture
+
+echo "--- 22. a journal that cannot be read is logged and the volume is synced again ---"
+reset_aws
+fresh_workspace
+seed_three
+BUCKET_V="acme-sre-memory"
+PREFIX_V=""
+start_fixture journal_ok
+queue_one h-journal-ok
+run_driver journal_ok
+check "a first sync completes: three files in the bucket and a marker" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 3 -a -e "$workspace/.memory-first-sync"
+stop_fixture
+rm -rf "$ctl/uploaded"
+: > "$ctl/aws_calls.log"
+printf '{"version":1,"paths":{"_estate/NO' > "$workspace/.memory-mirror-pending"
+start_fixture journal_cut
+queue_one h-journal-cut
+run_driver journal_cut
+check "the run exits 0 and answers" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
+check "the log says the journal could not be read" grep -qF 'could not be read' "$work/journal_cut.out"
+check "and that every file is mirrored again" grep -qF 'mirrored again' "$work/journal_cut.out"
+check "a truncated journal does not lose the paths: all three files are uploaded again" test "$(find "$ctl/uploaded" -type f | wc -l)" -eq 3
+check "the unreadable journal is gone and the sync is complete" test ! -e "$workspace/.memory-mirror-pending" -a -e "$workspace/.memory-first-sync"
+check_jqf "the marker is the new one" '.target == "s3://acme-sre-memory/memory/"' "$workspace/.memory-first-sync"
+stop_fixture
+rm -rf "$ctl/uploaded"
+: > "$ctl/aws_calls.log"
+rm -rf "$workspace/.memory-mirror-pending"
+mkdir "$workspace/.memory-mirror-pending"
+start_fixture journal_dir
+queue_one h-journal-dir
+run_driver journal_dir
+check "a journal that is a directory is handled the same way: all three files are uploaded" test "$rc" -eq 0 -a "$(find "$ctl/uploaded" -type f | wc -l)" -eq 3
+check "and the directory is gone" test ! -e "$workspace/.memory-mirror-pending"
+stop_fixture
+
+echo "--- 22b. the mirror's loop has no flag of its own for a call that timed out ---"
+check "a call's time limit is the time left, so a call that times out leaves none and a flag could never matter" test -z "$(grep -nw stopped "$pkg/runner/bucket.js" || true)"
 
 echo "--- 11. the entrypoint refuses a bucket it cannot reach, and runs without one ---"
 bash_bin="$(command -v bash)"

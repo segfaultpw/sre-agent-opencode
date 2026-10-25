@@ -18,12 +18,14 @@
 //                            the bucket, because the bucket may hold the only
 //                            copy of what the volume is missing.
 //   .memory-first-sync       the volume has been mirrored completely at least
-//                            once: its files are all in the bucket, or the
-//                            bucket is where they came from. Without it, the
-//                            runner journals every file on the volume for
-//                            upload at start (an upgrade with memory already on
-//                            the volume, or a bucket added later), under the
-//                            same deadline, and writes it when the journal
+//                            once to the bucket and prefix it names: its files
+//                            are all there, or that is where they came from.
+//                            Without it, or with one that names another bucket
+//                            or prefix, the runner journals every file on the
+//                            volume that passes the memory bounds for upload at
+//                            start (an upgrade with memory already on the
+//                            volume, or a bucket added or changed later), under
+//                            the same deadline, and writes it when the journal
 //                            empties. That sync only puts; it never deletes.
 //   .memory-mirror-pending   the paths the volume has changed that the bucket
 //                            has not been told about yet (a path is dropped
@@ -54,10 +56,10 @@ const RESTORE_TIMEOUT_MS = 600_000;
 // back for the length of a full restore (the platform fails one after 45
 // minutes).
 const RETRY_TIMEOUT_MS = 300_000;
-const CALL_TIMEOUT_MS = 120_000;
 // The whole mirror after one request, not each call: a bucket that drops
 // packets would otherwise cost every call its full timeout and hold the report
-// back for as long as there are paths.
+// back for as long as there are paths. A call is given the time that is left,
+// so one that gets no answer uses all of it and ends the mirror.
 const MIRROR_DEADLINE_MS = 120_000;
 const RETRY_BACKOFF_BASE_MS = 30_000;
 const RETRY_BACKOFF_MAX_MS = 600_000;
@@ -188,7 +190,15 @@ function writeState(config, name, text) {
   const temp = `${target}.tmp-${process.pid}`;
   fs.mkdirSync(workspaceDir(config), { recursive: true });
   fs.rmSync(temp, { force: true });
-  fs.writeFileSync(temp, text, { mode: 0o600, flag: 'wx' });
+  // Flushed before the rename: a rename that reaches the disk ahead of the
+  // bytes it names leaves a truncated file after a host crash.
+  const fd = fs.openSync(temp, 'wx', 0o600);
+  try {
+    fs.writeFileSync(fd, text);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   own(config, temp);
   fs.renameSync(temp, target);
 }
@@ -206,6 +216,26 @@ function stateExists(config, name) {
 function removeStale(config) {
   for (const name of entries(workspaceDir(config))) {
     if (STALE_STATE.test(name)) fs.rmSync(path.join(workspaceDir(config), name), { recursive: true, force: true });
+  }
+}
+
+function syncTarget(config) {
+  return `s3://${config.bucket}/${config.prefix}`;
+}
+
+function writeSyncMarker(config) {
+  writeState(config, SYNC_MARKER, `${JSON.stringify({ at: new Date().toISOString(), target: syncTarget(config) })}\n`);
+}
+
+// The marker counts for this bucket and prefix only: a volume mirrored to one
+// place has not been mirrored to another. One that is empty, unreadable or
+// names no target (not one this release wrote) counts for none.
+function syncMarkerTarget(config) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(workspaceDir(config), SYNC_MARKER), 'utf8'));
+    return parsed && typeof parsed.target === 'string' ? parsed.target : null;
+  } catch {
+    return null;
   }
 }
 
@@ -251,16 +281,45 @@ function sourceFile(config, segments) {
 // path -> added | modified | removed, the latest change winning.
 function loadJournal(config) {
   const journal = new Map();
+  const file = path.join(workspaceDir(config), MIRROR_JOURNAL);
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return journal;
+    return lostJournal(config, file, error.message, journal);
+  }
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(path.join(workspaceDir(config), MIRROR_JOURNAL), 'utf8'));
-  } catch {
-    return journal;
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return lostJournal(config, file, error.message, journal);
   }
-  const paths = parsed && typeof parsed === 'object' && parsed.paths && typeof parsed.paths === 'object' ? parsed.paths : {};
-  for (const [rel, kind] of Object.entries(paths)) {
+  // A journal is never written empty (saveJournal removes the file instead), so
+  // one without its paths object is not a journal.
+  if (!parsed || typeof parsed !== 'object' || !parsed.paths || typeof parsed.paths !== 'object') {
+    return lostJournal(config, file, 'it has no list of paths', journal);
+  }
+  for (const [rel, kind] of Object.entries(parsed.paths)) {
     if (KINDS.has(kind) && classify(rel).segments) journal.set(rel, kind);
   }
+  return journal;
+}
+
+// A journal that cannot be read (a write that never reached the disk, a file
+// something else damaged) has lost the paths the bucket was still to be told
+// about. Uploads are idempotent, so the answer is to forget the first sync's
+// marker and let the next one put every file on the volume into a new journal.
+function lostJournal(config, file, reason, journal) {
+  say(config, 'warn', `memory bucket: the journal of paths still to be mirrored could not be read (${firstLine(reason)}); it is removed and every file on the volume is mirrored again`);
+  try {
+    fs.rmSync(file, { recursive: true, force: true });
+    removeState(config, SYNC_MARKER);
+  } catch (error) {
+    say(config, 'warn', `memory bucket: the unreadable journal could not be removed (${firstLine(error.message)})`);
+  }
+  if (config.state) config.state.syncing = false;
+  journal.lost = true;
   return journal;
 }
 
@@ -280,12 +339,19 @@ function saveJournal(config, journal) {
 // call and a path leaves it when its call succeeds, so nothing a stop, a
 // failure or the time limit cuts is forgotten. While a restore has not
 // succeeded the calls are not made at all. A failing call is logged and the
-// rest still run; one that times out ends the mirror, because the bucket is not
-// answering. Nothing here ever throws into the request.
+// rest still run; one that times out has used all the time that was left, so it
+// ends the mirror, because the bucket is not answering. Nothing here ever
+// throws into the request.
 async function mirror(config, changes) {
   if (!config || !config.bucket) return { ok: true, skipped: 'no bucket is configured' };
   const refused = [];
-  const journal = loadJournal(config);
+  let journal = loadJournal(config);
+  if (journal.lost) {
+    // The paths it held are gone: journal the whole volume now, so this request
+    // carries them to the bucket instead of the next one.
+    firstSync(config);
+    journal = loadJournal(config);
+  }
   for (const change of Array.isArray(changes) ? changes : []) {
     const rel = change && change.path;
     const kind = change && change.change;
@@ -317,10 +383,9 @@ async function mirror(config, changes) {
   const failed = [];
   let calls = 0;
   let notTried = 0;
-  let stopped = false;
   for (const rel of [...journal.keys()].sort()) {
     const remaining = deadlineMs - (Date.now() - started);
-    if (stopped || remaining <= 0) {
+    if (remaining <= 0) {
       notTried += 1;
       continue;
     }
@@ -343,7 +408,7 @@ async function mirror(config, changes) {
     calls += 1;
     let result;
     try {
-      result = await config.run('aws', args, { timeoutMs: Math.min(CALL_TIMEOUT_MS, remaining) });
+      result = await config.run('aws', args, { timeoutMs: remaining });
     } catch (error) {
       result = { code: null, stdout: '', stderr: error.message, timedOut: false };
     }
@@ -352,12 +417,11 @@ async function mirror(config, changes) {
       saveJournal(config, journal);
     } else {
       failed.push(`aws s3 ${args[1]} ${rel}: ${failureText(result)}`);
-      if (result.timedOut) stopped = true;
     }
   }
   saveJournal(config, journal);
   if (journal.size === 0 && config.state && config.state.syncing) {
-    writeState(config, SYNC_MARKER, `${JSON.stringify({ at: new Date().toISOString() })}\n`);
+    writeSyncMarker(config);
     config.state.syncing = false;
     say(config, 'info', 'memory bucket: the first sync of the volume to the bucket is complete');
   }
@@ -518,7 +582,7 @@ async function attempt(config, timeoutMs) {
     removeState(config, RESTORE_MARKER);
     // What the volume has now came from the bucket, apart from what the journal
     // lists, so there is nothing to sync for the first time.
-    writeState(config, SYNC_MARKER, `${JSON.stringify({ at: new Date().toISOString() })}\n`);
+    writeSyncMarker(config);
     for (const note of settled.notes) say(config, 'warn', `memory bucket: ${note}`);
     say(config, 'info', `memory bucket: restored ${settled.files} memory file${settled.files === 1 ? '' : 's'} from ${source}`);
     return { restored: settled.files, notes: settled.notes };
@@ -553,67 +617,90 @@ async function restore(config, options = {}) {
   return attempt(config, options.timeoutMs || RESTORE_TIMEOUT_MS);
 }
 
-// The files on the volume that are memory, by path below memory/, without
-// reading any of them. A link is skipped here and refused again by the mirror.
+// The files on the volume that are memory and inside the bounds, by path below
+// memory/, without reading any of them: names and sizes only. What breaks a
+// bound (a note over 65,536 bytes, the scripts after the fiftieth, the largest
+// files of a directory over 1 MiB) is left out, counted in `skipped`, because a
+// restore would judge it away and the bucket should not hold what the volume's
+// own rules refuse. A link or another special file is skipped here and refused
+// again by the mirror.
 function memoryFiles(config) {
   const root = memoryRoot(config);
   const files = [];
+  const skipped = [];
   const isDir = (target) => {
     const stat = lstatOrNull(target);
     return Boolean(stat && stat.isDirectory());
   };
-  const isFile = (target) => {
+  const sizeOfFile = (target) => {
     const stat = lstatOrNull(target);
-    return Boolean(stat && stat.isFile());
+    return stat && stat.isFile() ? stat.size : null;
   };
-  const keep = (rel) => {
-    if (classify(rel).segments) files.push(rel);
-  };
-  if (!isDir(root)) return files;
+  if (!isDir(root)) return { files, skipped };
   for (const name of entries(root)) {
     const top = path.join(root, name);
     if (!isDir(top)) continue;
     const leaves = name === memory.ESTATE ? [[name, top]] : entries(top).map((repo) => [`${name}/${repo}`, path.join(top, repo)]);
     for (const [label, dir] of leaves) {
       if (!isDir(dir)) continue;
-      if (isFile(path.join(dir, memory.NOTES))) keep(`${label}/${memory.NOTES}`);
+      const candidates = [];
+      const noteSize = sizeOfFile(path.join(dir, memory.NOTES));
+      if (noteSize !== null) candidates.push({ rel: memory.NOTES, bytes: noteSize });
       const scripts = path.join(dir, memory.SCRIPTS);
-      if (!isDir(scripts)) continue;
-      for (const script of entries(scripts)) {
-        if (isFile(path.join(scripts, script))) keep(`${label}/${memory.SCRIPTS}/${script}`);
+      if (isDir(scripts)) {
+        for (const script of entries(scripts)) {
+          const bytes = sizeOfFile(path.join(scripts, script));
+          if (bytes !== null) candidates.push({ rel: `${memory.SCRIPTS}/${script}`, bytes });
+        }
+      }
+      const admitted = new Set(memory.admit(candidates));
+      for (const candidate of candidates) {
+        const rel = `${label}/${candidate.rel}`;
+        if (!admitted.has(candidate.rel) || !classify(rel).segments) skipped.push(rel);
+        else files.push(rel);
       }
     }
   }
-  return files;
+  return { files, skipped };
 }
 
 // At start and before a request: a volume that has never been mirrored
-// completely (no marker) gets every file on it journaled for upload, once, and
-// the mirror that follows works through the journal under its usual deadline.
-// A cut leaves the rest pending and the marker is written only when the journal
-// empties. It never deletes anything in the bucket, and it waits while a
-// restore is pending, because then the bucket may hold what the volume lacks.
+// completely to this bucket and prefix (no marker, or one that names another
+// place) gets every file on it that passes the memory bounds journaled for
+// upload, once, and the mirror that follows works through the journal under its
+// usual deadline. A cut leaves the rest pending and the marker is written only
+// when the journal empties. It never deletes anything in the bucket, and it
+// waits while a restore is pending, because then the bucket may hold what the
+// volume lacks.
 function firstSync(config) {
   if (!config || !config.bucket) return { skipped: 'no bucket is configured' };
   if (!config.state) config.state = {};
-  if (stateExists(config, SYNC_MARKER)) return { skipped: 'the volume has been mirrored completely before' };
+  const marked = syncMarkerTarget(config);
+  if (marked === syncTarget(config)) return { skipped: 'the volume has been mirrored completely before' };
   if (restorePending(config)) return { skipped: 'a restore is pending' };
   if (config.state.syncing) return { skipped: 'the first sync is under way' };
+  if (marked !== null) {
+    say(config, 'info', `memory bucket: the volume was last mirrored completely to ${marked}, not to ${syncTarget(config)}, so every file is mirrored again`);
+  }
   const journal = loadJournal(config);
+  const found = memoryFiles(config);
   let journaled = 0;
-  for (const rel of memoryFiles(config)) {
+  for (const rel of found.files) {
     if (journal.has(rel)) continue;
     journal.set(rel, 'added');
     journaled += 1;
   }
+  if (found.skipped.length > 0) {
+    say(config, 'warn', `memory bucket: ${found.skipped.length} file${found.skipped.length === 1 ? '' : 's'} on the volume break${found.skipped.length === 1 ? 's' : ''} the memory bounds and ${found.skipped.length === 1 ? 'is' : 'are'} not uploaded (first: ${found.skipped[0]})`);
+  }
   if (journal.size === 0) {
-    writeState(config, SYNC_MARKER, `${JSON.stringify({ at: new Date().toISOString() })}\n`);
-    return { journaled: 0 };
+    writeSyncMarker(config);
+    return { journaled: 0, skipped: found.skipped.length };
   }
   saveJournal(config, journal);
   config.state.syncing = true;
   say(config, 'info', `memory bucket: ${journaled} file${journaled === 1 ? '' : 's'} on the volume ${journaled === 1 ? 'was' : 'were'} never mirrored; they are uploaded with the next request`);
-  return { journaled };
+  return { journaled, skipped: found.skipped.length };
 }
 
 // Before a request, while a restore has not succeeded: tried again at once the

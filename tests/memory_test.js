@@ -621,6 +621,42 @@ test('blobSha is the sha1 git hashes a file with', () => {
   assert.equal(memory.blobSha(Buffer.alloc(0)), 'e69de29bb2d1d6434b8b29ae775ad8c2e48c5391');
 });
 
+test('admit keeps exactly the files enforce would keep from a directory nothing came before', () => {
+  const cases = {
+    'a note over the bound': { 'NOTES.md': 70000, 'scripts/ok.sh': 10 },
+    'a note at the bound': { 'NOTES.md': 65536, 'scripts/ok.sh': 10 },
+    'a script over the directory bound': { 'scripts/huge.sh': 2000000, 'scripts/ok.sh': 10 },
+    'sixty scripts': Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`scripts/s${String(index + 1).padStart(2, '0')}`, 5])),
+    'the probe: a note, a 2 MB script and sixty scripts': {
+      'NOTES.md': 70000,
+      'scripts/huge.sh': 2000000,
+      ...Object.fromEntries(Array.from({ length: 60 }, (_, index) => [`scripts/s${String(index + 1).padStart(2, '0')}`, 5])),
+    },
+    'scripts that together pass the directory bound': { 'NOTES.md': 100, 'scripts/a': 600000, 'scripts/b': 600000, 'scripts/c': 100 },
+    'two scripts of one size': { 'scripts/a': 600000, 'scripts/b': 600000 },
+    'the note is the largest in a full directory': { 'NOTES.md': 65000, 'scripts/a': 500000, 'scripts/b': 500000 },
+    'a name outside the allowed set': { 'scripts/ok.sh': 5, 'scripts/bad name': 5, 'scripts/semi;colon': 5 },
+    'nothing': {},
+  };
+  for (const [label, sizes] of Object.entries(cases)) {
+    const dir = fresh();
+    for (const [rel, bytes] of Object.entries(sizes)) put(dir, rel, Buffer.alloc(bytes, 97));
+    const candidates = Object.entries(sizes).map(([rel, bytes]) => ({ rel, bytes }));
+    const admitted = memory.admit(candidates);
+    const { kept } = memory.enforce(dir, new Map());
+    assert.deepEqual(admitted, kept, label);
+  }
+});
+
+test('admit judges names and sizes only, and never lists more than the bounds allow', () => {
+  assert.deepEqual(memory.admit([]), []);
+  const sixty = Array.from({ length: 60 }, (_, index) => ({ rel: `scripts/s${String(index + 1).padStart(2, '0')}`, bytes: 5 }));
+  const admitted = memory.admit([{ rel: 'NOTES.md', bytes: 65537 }, ...sixty]);
+  assert.equal(admitted.length, memory.MAX_SCRIPTS);
+  assert.ok(!admitted.includes('NOTES.md'));
+  assert.deepEqual(memory.admit([{ rel: 'other.txt', bytes: 1 }, { rel: 'scripts/sub/x', bytes: 1 }, { rel: 'scripts/..', bytes: 1 }]), []);
+});
+
 fs.rmSync(root, { recursive: true, force: true });
 
 if (failed > 0) {
