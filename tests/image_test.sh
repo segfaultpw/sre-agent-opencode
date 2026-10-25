@@ -53,6 +53,9 @@ check "$dockerfile" '/usr/local/bin/mise' 'mise is on the PATH of every account,
 check "$dockerfile" 'mise --version' 'mise is installed and proved at build time'
 check "$dockerfile" 'ENV SRE_RUNNER_USER=runner' 'the entrypoint is told which account the runner files belong to'
 check "$dockerfile" 'ENV SRE_AGENT_USER=agent' 'the entrypoint is told which account the agent runs as'
+for deb in build-essential python3 python3-pip python3-venv make xz-utils; do
+  check "$dockerfile" "        ${deb} \\" "the base toolset has ${deb}, so a typical repository builds and tests without a setup script"
+done
 check "$dockerfile" 'util-linux' 'setpriv, which a runner without root starts the agent through, is installed by name'
 check "$dockerfile" 'USER root' 'the container starts as root, which the runner needs to start the agent as another account'
 if ! grep -qE '^USER (runner|agent|[0-9]+)' "$dockerfile"; then echo "ok   no later USER line takes root away from the entrypoint"; else echo "FAIL a USER line other than root remains in the Dockerfile"; fail=1; fi
@@ -242,6 +245,47 @@ out="$(env PATH="$work/nosetpriv" SRE_AGENT_USER=agent FAKE_ID_U=1000 \
 if [ "$rc" -ne 0 ] && grep -qF 'setpriv' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a split without root needs setpriv and says so"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 run_as FAKE_ID_U=1000
 if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=::' "$STUB_LOG"; then echo "ok   without root and without an agent account nothing is resolved (the runner warns in its own log)"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+
+echo "--- SRE_RUNNER_SETUP runs once as root before the runner starts, and a failure stops the start ---"
+mkdir -p "$work/setup"
+cat > "$work/setup/ok.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'setup ran\n' >> "$STUB_LOG"
+printf 'setup sees SRE_API_KEY=%s SRE_GITHUB_TOKEN=%s\n' "${SRE_API_KEY-unset}" "${SRE_GITHUB_TOKEN-unset}" >> "$STUB_LOG"
+echo "installing the extra package"
+echo "a warning" >&2
+EOF
+cat > "$work/setup/fail.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "apt-get could not reach the mirror" >&2
+exit 3
+EOF
+printf '#!/usr/bin/env bash\nexit 0\n' > "$work/setup/not-executable.sh"
+chmod +x "$work/setup/ok.sh" "$work/setup/fail.sh"
+
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent
+if ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   with no SRE_RUNNER_SETUP nothing runs"; else echo "FAIL a setup ran with none named"; fail=1; fi
+
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/ok.sh"
+if [ "$rc" -eq 0 ] && [ "$(grep -cx 'setup ran' "$STUB_LOG")" -eq 1 ]; then echo "ok   the setup script runs once"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+setup_line="$(grep -nx 'setup ran' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+runner_line="$(grep -n 'runner/runner.js' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
+if [ -n "$setup_line" ] && [ -n "$runner_line" ] && [ "$setup_line" -lt "$runner_line" ]; then echo "ok   it runs before the runner starts, so before the first poll"; else echo "FAIL setup at line '$setup_line', runner at line '$runner_line'"; fail=1; fi
+if grep -qx 'setup sees SRE_API_KEY=unset SRE_GITHUB_TOKEN=unset' "$STUB_LOG"; then echo "ok   it is not given the runner's poll key or repository token"; else echo "FAIL $(grep 'setup sees' "$STUB_LOG")"; fail=1; fi
+if grep -qF 'setup: installing the extra package' <<<"$out" && grep -qF 'setup: a warning' <<<"$out"; then echo "ok   its output, standard output and standard error, is logged"; else echo "FAIL output: $out"; fail=1; fi
+
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/fail.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'exited 3' <<<"$out" && grep -qF "$work/setup/fail.sh" <<<"$out" && grep -qF 'did not start' <<<"$out"; then echo "ok   a failing setup script stops the start and the log says which script and how it failed"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+if grep -qF 'apt-get could not reach the mirror' <<<"$out" && ! grep -q 'runner/runner.js' "$STUB_LOG"; then echo "ok   the script's own error is in the log and the runner never started"; else echo "FAIL out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/missing.sh"
+if [ "$rc" -ne 0 ] && grep -qF "$work/setup/missing.sh" <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a setup script that does not exist stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/not-executable.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'not executable' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   one that is not executable stops the start"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="https://example.invalid/setup.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'URL' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a URL is refused: the runner never fetches a script"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+run_as FAKE_ID_U=1000 SRE_RUNNER_SETUP="$work/setup/ok.sh"
+if [ "$rc" -ne 0 ] && grep -qF 'root' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a start that is not root refuses a setup script rather than running it as somebody else"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 
 echo "--- the workflows build the image on both architectures ---"
 # Every runs-on in this repository's own workflows reads the organization's

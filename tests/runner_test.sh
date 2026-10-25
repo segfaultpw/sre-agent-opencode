@@ -117,7 +117,7 @@ for a in "\$@"; do
   # Only a URL is redirected. The commit identity is a github.com address too,
   # and rewriting it would make git reject the config rather than the remote.
   case "\$a" in
-    https://*github.com/*) args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
+    https://*@github.com/*) args+=("\$(cat "$work/ctl/remote" 2>/dev/null || echo "$remote")") ;;
     *) args+=("\$a") ;;
   esac
 done
@@ -148,7 +148,7 @@ export PATH="$work/bin:$PATH"
 mkdir -p "$work/ctl"
 : > "$work/git_leaks.log"
 : > "$work/gh_leaks.log"
-export STUB_OPENCODE_LOG="$opencode_log" STUB_OPENCODE_BRIEF_OUT="$brief_seen"
+export STUB_OPENCODE_LOG="$opencode_log" STUB_OPENCODE_BRIEF_OUT="$brief_seen" STUB_EXPECT_GH_TOKEN="$github_token" STUB_PROBE_GIT="$real_git"
 export FIXTURE_PORT_FILE="$port_file" FIXTURE_API_KEY="$api_key"
 export FIXTURE_HANDOFF_TOKEN="$handoff_token" FIXTURE_BRIEF_FILE="$brief_file"
 export FIXTURE_QUEUE_FILE="$queue_file" FIXTURE_QUEUE_STATUSES=200
@@ -245,6 +245,7 @@ if grep -q -- "--model $model" "$opencode_log"; then echo "ok   the configured m
 if grep -qx "default_agent: sre-fix" "$opencode_log"; then echo "ok   the config travels through OPENCODE_CONFIG_CONTENT with sre-fix as the default agent"; else echo "FAIL config: $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "bash_fence: deny" "$opencode_log"; then echo "ok   the package's own fences reach the agent"; else echo "FAIL fences: $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "sees_SRE_API_KEY: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_TOKEN: no" "$opencode_log"; then echo "ok   the runner's own credentials are stripped from the agent's environment"; else echo "FAIL the agent could see a runner credential: $(cat "$opencode_log")"; fail=1; fi
+if grep -qx "gh_token: matches" "$opencode_log"; then echo "ok   the agent gets the repository token as GH_TOKEN, to clone private repositories"; else echo "FAIL gh_token: $(grep gh_token "$opencode_log")"; fail=1; fi
 if grep -qx "autoupdate_disabled: 1" "$opencode_log"; then echo "ok   the agent cannot update the binary that enforces its fences"; else echo "FAIL autoupdate: $(cat "$opencode_log")"; fail=1; fi
 if grep -qxF "$marker" "$brief_seen"; then echo "ok   the brief reaches the agent on stdin"; else echo "FAIL the agent did not receive the brief"; fail=1; fi
 if grep -q "sre-agent-opencode:v${version}" "$workspace/repos/acme/app/.opencode/agents/sre-fix.md"; then echo "ok   the agent file is written into the checkout with the version stamped in"; else echo "FAIL the agent file is missing or unstamped"; fail=1; fi
@@ -463,6 +464,7 @@ start_fixture hostile
 queue_one h-hostile acme/app
 run_once hostile
 if [ "$rc" -eq 0 ]; then echo "ok   a hostile checkout still runs to a report"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if grep -qx 'git_status_clean: yes' "$opencode_log"; then echo "ok   the agent's git status is clean at the start, though the runner removed the repository's own opencode files from the tree"; else echo "FAIL $(grep git_status "$opencode_log")"; fail=1; fi
 if [ ! -e "$workspace/repos/acme/app/opencode.json" ]; then echo "ok   the repository's own opencode.json is gone from the checkout"; else echo "FAIL the checkout kept its opencode.json"; fail=1; fi
 kept=""
 for d in $loaded_dirs; do
@@ -772,8 +774,8 @@ if [ ! -e "$work/fsmonitor-ran" ] && [ ! -e "$work/alias-ran" ]; then echo "ok  
 if ! grep -qE 'fsmonitor|alias' "$gitdir/config" && grep -qF "url = https://github.com/acme/app.git" "$gitdir/config"; then echo "ok   the config is the runner's own, with the clean origin URL"; else echo "FAIL config: $(cat "$gitdir/config")"; fail=1; fi
 if [ ! -e "$clone/ignored-leftover.tmp" ]; then echo "ok   an ignored file from an earlier request is cleaned"; else echo "FAIL the ignored file survived"; fail=1; fi
 if [ -s "$work/git_raw.log" ] && ! grep -q '^plain-env ' "$work/git_raw.log"; then echo "ok   every git call, the runner's own and the ones its scripts start, ran with the hook, fsmonitor, attributes and replace-object settings in its environment ($(wc -l < "$work/git_raw.log") calls)"; else echo "FAIL calls without them: $(grep '^plain-env ' "$work/git_raw.log" | head -n 3)"; fail=1; fi
-if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log")" -ge 8 ] && ! grep -v -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log" | grep -qv -E '^hardened-env (rev-parse|update-index|ls-files) '; then echo "ok   the runner's own git calls carry the settings as arguments too; only its scripts' calls rely on the environment"; else echo "FAIL calls: $(grep -v -E ' -c core\.hooksPath=/dev/null ' "$work/git_raw.log" | head -n 5)"; fail=1; fi
-unnamed="$(grep -E ' (add|commit|push|checkout|clean|diff|fetch|ls-files) ' "$work/git_raw.log" | grep -v -E '^hardened-env (rev-parse|update-index|ls-files) ' | grep -v -- '--git-dir=' || true)"
+if [ "$(grep -c -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log")" -ge 8 ] && ! grep -v -E ' -c core\.hooksPath=/dev/null -c core\.fsmonitor=false -c core\.attributesFile=/dev/null ' "$work/git_raw.log" | grep -qv -E '^hardened-env (rev-parse|update-index|ls-files|init|fetch|remote|symbolic-ref|reset|update-ref) '; then echo "ok   the runner's own git calls carry the settings as arguments too; only its scripts' calls rely on the environment"; else echo "FAIL calls: $(grep -v -E ' -c core\.hooksPath=/dev/null ' "$work/git_raw.log" | head -n 5)"; fail=1; fi
+unnamed="$(grep -E ' (add|commit|push|checkout|clean|diff|fetch|ls-files) ' "$work/git_raw.log" | grep -v -E '^hardened-env (rev-parse|update-index|ls-files|init|fetch|remote|symbolic-ref|reset|update-ref) ' | grep -v -- '--git-dir=' || true)"
 if [ -z "$unnamed" ]; then echo "ok   every call that works on the tree names the runner's git directory and the tree explicitly"; else echo "FAIL calls: $(head -n 3 <<<"$unnamed")"; fail=1; fi
 if [ ! -s "$work/git_leaks.log" ] && [ ! -s "$work/gh_leaks.log" ]; then echo "ok   no git or gh call saw the poll key, the model setting or a provider or AWS variable"; else echo "FAIL leaks: $(sort -u "$work/git_leaks.log" "$work/gh_leaks.log" | tr '\n' ' ')"; fail=1; fi
 stop_fixture
@@ -928,10 +930,12 @@ printf '[filter "evil"]\n\tclean = touch %s/global-filter\n[core]\n\tfsmonitor =
 start_fixture planted
 queue_one h-planted acme/app
 export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=plant STUB_PLANT_MARKER="$work/markers/tree-config"
-HOME="$work/fakehome" run_once planted
+# The agent shares this HOME in this mode, and its own git reading the operator's
+# global config is its business; the runner's calls are what is under test.
+HOME="$work/fakehome" GIT_CONFIG_GLOBAL=/dev/null run_once planted
 unset STUB_OPENCODE_MEMORY STUB_PLANT_MARKER
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request is answered with a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
-if [ -z "$(ls -A "$work/markers")" ]; then echo "ok   no filter, fsmonitor or other planted command ran"; else echo "FAIL these ran: $(find "$work/markers" -mindepth 1 -printf '%f ')"; fail=1; fi
+if [ -z "$(ls -A "$work/markers")" ]; then echo "ok   no filter, fsmonitor, hook or other planted command ran, though the agent planted them in its own .git/config and .git/hooks"; else echo "FAIL these ran: $(find "$work/markers" -mindepth 1 -printf '%f ')"; fail=1; fi
 branch_parent="$("$real_git" --git-dir="$remote" rev-parse refs/heads/sre-agent/h-planted^ 2>/dev/null || true)"
 if [ "$branch_parent" = "$real_head" ]; then echo "ok   the pushed commit is built on the real base"; else echo "FAIL parent is '$branch_parent', expected $real_head"; fail=1; fi
 if ! "$real_git" --git-dir="$remote" rev-list refs/heads/sre-agent/h-planted 2>/dev/null | grep -q "$evil_commit"; then echo "ok   the planted commit is not in the pushed history"; else echo "FAIL the planted commit was pushed"; fail=1; fi
@@ -940,6 +944,32 @@ pushed_readme="$("$real_git" --git-dir="$remote" show refs/heads/sre-agent/h-pla
 if [ "$pushed_readme" = "$real_readme"$'\n'"a line the fix added" ]; then echo "ok   the pushed README is the real one plus the agent's line"; else echo "FAIL pushed README: $pushed_readme"; fail=1; fi
 if [ ! -e "$gd/commondir" ] && [ ! -e "$gd/objects/info/alternates" ] && [ ! -e "$gd/info/grafts" ] && [ ! -e "$gd/refs/replace/$real_head" ] && [ ! -e "$gd/config.worktree" ] && [ ! -e "$gd/info/attributes" ]; then echo "ok   the runner removed every one of them from the git directory"; else echo "FAIL left: $(find "$gd" -name commondir -o -name alternates -o -name grafts -o -name config.worktree -o -name attributes -o -path '*refs/replace/*' | tr '\n' ' ')"; fail=1; fi
 if [ ! -e "$workspace/repos/acme/app/.git" ]; then echo "ok   no .git is left in the tree"; else echo "FAIL .git is in the tree"; fail=1; fi
+stop_fixture
+
+echo "--- 39. the agent works in a real repository, and the pull request is the tree against the real base ---"
+real_head="$("$real_git" --git-dir="$remote" rev-parse refs/heads/main)"
+real_readme="$("$real_git" --git-dir="$remote" show refs/heads/main:README.md)"
+start_fixture history
+queue_one h-history acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=githistory
+run_once history
+unset STUB_OPENCODE_MEMORY
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request ends in a pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if grep -qx 'git_status_clean: yes' "$opencode_log" && [ "$(grep '^git_log_commits:' "$opencode_log" | cut -d' ' -f2)" -ge 1 ]; then echo "ok   git status is clean at the start and the history is there"; else echo "FAIL $(grep git_ "$opencode_log")"; fail=1; fi
+if [ "$("$real_git" --git-dir="$remote" rev-parse refs/heads/sre-agent/h-history^)" = "$real_head" ]; then echo "ok   the pushed commit sits on the real base, one commit above it"; else echo "FAIL parent: $("$real_git" --git-dir="$remote" rev-parse refs/heads/sre-agent/h-history^ 2>&1)"; fail=1; fi
+if [ "$("$real_git" --git-dir="$remote" show refs/heads/sre-agent/h-history:history.txt)" = $'first change\nsecond change' ] && [ "$("$real_git" --git-dir="$remote" show refs/heads/sre-agent/h-history:README.md)" = "$real_readme"$'\n'"a line the fix added" ]; then echo "ok   the pull request holds exactly what the tree holds"; else echo "FAIL pushed tree differs"; fail=1; fi
+if [ "$("$real_git" --git-dir="$remote" rev-list --count "$real_head"..refs/heads/sre-agent/h-history)" = "1" ] && ! "$real_git" --git-dir="$remote" branch --list 'scratch-branch' 'another-branch' | grep -q .; then echo "ok   the agent's local commits, amend and branches did not reach the remote"; else echo "FAIL the remote holds the agent's history"; fail=1; fi
+if [ ! -e "$workspace/repos/acme/app/.git" ]; then echo "ok   the agent's .git is deleted when the run ends"; else echo "FAIL .git survived"; fail=1; fi
+stop_fixture
+
+echo "--- 40. an embedded repository is refused, with the reason ---"
+start_fixture nested
+queue_one h-nested acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=nested
+run_once nested
+unset STUB_OPENCODE_MEMORY
+if jq -e '.evidence.flagged_paths | index("sub/")' <<<"$report" >/dev/null && jq -e '.summary | test("git repository")' <<<"$report" >/dev/null; then echo "ok   the report names the embedded repository and says why nothing was published"; else echo "FAIL report: $report"; fail=1; fi
+if ! "$real_git" --git-dir="$remote" rev-parse --verify --quiet refs/heads/sre-agent/h-nested >/dev/null && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed and no pull request is opened"; else echo "FAIL a branch or pull request exists"; fail=1; fi
 stop_fixture
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"

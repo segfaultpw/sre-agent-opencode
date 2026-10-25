@@ -93,4 +93,47 @@ elif [ -n "${SRE_AGENT_USER:-}" ]; then
   resolve_account agent "$SRE_AGENT_USER" SRE_AGENT
 fi
 
+# An optional setup script of the operator's, for what the image does not carry
+# (system packages, a certificate, a proxy setting). It is a file in the
+# container, mounted or baked into a derived image, and the runner never fetches
+# one. It runs here, once per container start, as root, after the accounts exist
+# and before the runner starts, so before the first poll and before anything is
+# handed to the agent. Its output is logged; if it fails the runner does not
+# start. It is not given the poll key or the repository token: it is the
+# operator's own script, but nothing it does needs them and its log is
+# somebody's aggregator.
+if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
+  setup="$SRE_RUNNER_SETUP"
+  case "$setup" in
+    *://*)
+      echo "sre-agent-fix-runner: SRE_RUNNER_SETUP is a URL (${setup%%://*}://...); it names a file in the container, and the runner never fetches a script" >&2
+      exit 1
+      ;;
+  esac
+  if [ "$(id -u)" != "0" ]; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP is run as root by the container entrypoint, and this start is not root; on a host, do what the script does yourself" >&2
+    exit 1
+  fi
+  if [ ! -f "$setup" ]; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not a file in this container" >&2
+    exit 1
+  fi
+  if [ ! -x "$setup" ]; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not executable" >&2
+    exit 1
+  fi
+  echo "sre-agent-fix-runner: running the setup script ${setup}"
+  set +e
+  env -u SRE_API_KEY -u SRE_GITHUB_TOKEN "$setup" 2>&1 | while IFS= read -r line; do
+    printf 'sre-agent-fix-runner: setup: %s\n' "$line"
+  done
+  setup_status="${PIPESTATUS[0]}"
+  set -e
+  if [ "$setup_status" -ne 0 ]; then
+    echo "sre-agent-fix-runner: the setup script ${setup} exited ${setup_status}; the runner did not start" >&2
+    exit 1
+  fi
+  echo "sre-agent-fix-runner: the setup script finished"
+fi
+
 exec node "${package_root}/runner/runner.js" "$@"

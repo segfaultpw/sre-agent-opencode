@@ -92,11 +92,13 @@ EOF
 cat > "$work/bin/git" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-id -u >> "\$(cat "$work/ctl/git_uid_log")"
+# The agent's own git (it works in a repository of its own) is judged by its uid
+# being the agent's; this log is the runner's calls.
+if [ "\$(id -u)" != "$agent_uid" ]; then id -u >> "\$(cat "$work/ctl/git_uid_log")"; fi
 args=()
 for a in "\$@"; do
   case "\$a" in
-    https://*github.com/*) args+=("$remote") ;;
+    https://*@github.com/*) args+=("$remote") ;;
     *) args+=("\$a") ;;
   esac
 done
@@ -186,7 +188,7 @@ prove() {
       HOME="$runner_home" \
       AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
       STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe_file" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor_file" \
-      STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" \
+      STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" \
       STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" \
       node "$runner" > "$out" 2>&1 || rc=$?
     stop_fixture
@@ -205,7 +207,8 @@ prove() {
   if grep -qx 'memory_list: denied' "$probe" && grep -qx 'memory_write: denied' "$probe"; then echo "ok   $label: the agent can neither read nor write /workspace/memory"; else echo "FAIL $label: $(grep memory "$probe")"; fail=1; fi
   if grep -qx 'other_read: denied' "$probe" && grep -qx 'other_write: denied' "$probe"; then echo "ok   $label: another repository's clone is closed to the agent"; else echo "FAIL $label: $(grep other "$probe")"; fail=1; fi
   if grep -qx 'own_write: allowed' "$probe" && grep -qx 'home_write: allowed' "$probe"; then echo "ok   $label: the agent can write its checkout and its home"; else echo "FAIL $label: $(cat "$probe")"; fail=1; fi
-  if grep -qx 'tree_git: absent' "$probe" && grep -qx 'git_in_tree: none' "$probe"; then echo "ok   $label: the agent's tree has no git directory in it, and git finds no repository there"; else echo "FAIL $label: $(grep -E 'tree_git|git_in_tree' "$probe")"; fail=1; fi
+  if grep -qx 'tree_git: present' "$probe" && grep -qx 'git_in_tree: works' "$probe" && grep -qx 'git_history: ok' "$probe" && grep -qx "git_repo_owner: $agent_uid" "$probe"; then echo "ok   $label: the agent works in a real repository of its own, with history, that it owns"; else echo "FAIL $label: $(grep -E 'tree_git|git_in_tree|git_history|git_repo_owner' "$probe")"; fail=1; fi
+  if grep -qx 'git_alternates: absent' "$probe" && grep -qx 'git_origin: https://github.com/acme/app.git' "$probe"; then echo "ok   $label: its repository shares no object store with the runner's, and origin is the github.com URL with no token in it"; else echo "FAIL $label: $(grep -E 'git_alternates|git_origin' "$probe")"; fail=1; fi
   if grep -qx 'gitdir_list: denied' "$probe" && grep -qx 'gitdir_write: denied' "$probe"; then echo "ok   $label: the agent can neither read the git directory nor write commondir, alternates, grafts, a replace ref, config.worktree, attributes, config or a hook into it"; else echo "FAIL $label: $(grep gitdir "$probe")"; fail=1; fi
   if [ -z "$(ls -A "$work/markers")" ]; then echo "ok   $label: the filter and fsmonitor the agent planted in its tree never ran"; else echo "FAIL $label: these ran: $(find "$work/markers" -mindepth 1 -printf '%f ')"; fail=1; fi
   if [ "$(stat -c '%a %u' "$ws/gitdirs/acme/app")" = "700 $owner" ] && [ "$(stat -c '%a %u' "$ws/gitdirs")" = "700 $owner" ]; then echo "ok   $label: the git directory is the runner's, mode 0700"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/gitdirs" "$ws/gitdirs/acme/app")"; fail=1; fi
@@ -226,7 +229,10 @@ prove() {
   if [ -f "$agent_home/.gitconfig" ] && [ "$(stat -c %u "$agent_home/.gitconfig")" = "$agent_uid" ]; then echo "ok   $label: the home holds a git configuration of the agent's"; else echo "FAIL $label: no .gitconfig in $agent_home"; fail=1; fi
   if grep -qx "path_first: $agent_home/.local/bin" "$probe" && grep -qx 'path_has_mise_shims: yes' "$probe"; then echo "ok   $label: user-space installs and mise shims are on its PATH"; else echo "FAIL $label: $(grep path_ "$probe")"; fail=1; fi
   if grep -qx "npm_prefix: $agent_home/.npm-global" "$probe" && grep -qx "mise_data_dir: $agent_home/.local/share/mise" "$probe"; then echo "ok   $label: npm's global prefix and mise's data directory are under its home"; else echo "FAIL $label: $(grep -E 'npm_prefix|mise_data' "$probe")"; fail=1; fi
-  if grep -qx 'token_env: ' "$probe"; then echo "ok   $label: it holds no repository token, no poll key and none of the runner's account variables"; else echo "FAIL $label: $(grep token_env "$probe")"; fail=1; fi
+  if grep -qx 'token_env: ' "$probe"; then echo "ok   $label: it holds no poll key and none of the runner's account variables"; else echo "FAIL $label: $(grep token_env "$probe")"; fail=1; fi
+  if grep -qx 'gh_token: matches' "$probe" && grep -qx 'credential_helper: ok' "$probe"; then echo "ok   $label: it does hold the repository token, as GH_TOKEN, and its git credential helper answers github.com with it"; else echo "FAIL $label: $(grep -E 'gh_token|credential_helper' "$probe")"; fail=1; fi
+  if grep -qx 'pip_break: 1' "$probe"; then echo "ok   $label: pip --user works on the image python, which marks itself externally managed"; else echo "FAIL $label: $(grep pip_break "$probe")"; fail=1; fi
+  if ! grep -qF "$github_token" "$work/$label.out" "$work/requests.jsonl"; then echo "ok   $label: the token is in no log line and no report, though the agent holds it"; else echo "FAIL $label: the token was logged or reported"; fail=1; fi
   if grep -qx 'clone_local: ok' "$probe" && grep -qx 'commit_local: ok' "$probe" && ! grep -qx 'git_user: none' "$probe"; then echo "ok   $label: it clones a repository by path and commits in the clone with the identity in its home"; else echo "FAIL $label: $(grep -E 'clone_local|commit_local|git_user' "$probe")"; fail=1; fi
   if grep -qx 'tool: installed' "$probe"; then echo "ok   $label: the first run installs a tool into its home"; else echo "FAIL $label: $(grep tool: "$probe")"; fail=1; fi
 

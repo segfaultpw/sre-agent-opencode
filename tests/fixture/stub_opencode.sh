@@ -22,6 +22,13 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'autoupdate_disabled: %s\n' "${OPENCODE_DISABLE_AUTOUPDATE:-missing}"
     if [ -n "${SRE_API_KEY+set}" ]; then printf 'sees_SRE_API_KEY: yes\n'; else printf 'sees_SRE_API_KEY: no\n'; fi
     if [ -n "${SRE_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_GITHUB_TOKEN: no\n'; fi
+    if [ -n "${STUB_PROBE_GIT:-}" ] && [ -e .git ]; then
+      printf 'git_status_clean: %s\n' "$(if [ -z "$("$STUB_PROBE_GIT" status --porcelain 2>/dev/null)" ]; then echo yes; else echo no; fi)"
+      printf 'git_log_commits: %s\n' "$("$STUB_PROBE_GIT" rev-list --count HEAD 2>/dev/null || echo 0)"
+    else
+      printf 'git_status_clean: no repository\n'
+    fi
+    if [ -z "${GH_TOKEN+set}" ]; then printf 'gh_token: absent\n'; elif [ "${GH_TOKEN}" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then printf 'gh_token: matches\n'; else printf 'gh_token: differs\n'; fi
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
     if [ -d .sre-agent-memory ]; then
@@ -65,7 +72,10 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'path_has_mise_shims: %s\n' "$(case ":$PATH:" in *":$HOME/.local/share/mise/shims:"*) echo yes ;; *) echo no ;; esac)"
     printf 'npm_prefix: %s\n' "${NPM_CONFIG_PREFIX:-}"
     printf 'mise_data_dir: %s\n' "${MISE_DATA_DIR:-}"
-    printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|GH_TOKEN|GITHUB_TOKEN|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
+    printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
+    printf 'gh_token: %s\n' "$(if [ -z "${GH_TOKEN+set}" ]; then echo absent; elif [ "$GH_TOKEN" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then echo matches; else echo differs; fi)"
+    printf 'pip_break: %s\n' "${PIP_BREAK_SYSTEM_PACKAGES:-}"
+    printf 'credential_helper: %s\n' "$(if printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -qx "password=${GH_TOKEN:-unset}"; then echo ok; else echo failed; fi)"
     printf 'git_user: %s\n' "$("${STUB_PROBE_GIT:?}" config --global user.name 2>/dev/null || echo none)"
     if [ -n "${STUB_CLONE_SOURCE:-}" ]; then
       clone_dir="$(mktemp -d)/clone"
@@ -78,6 +88,10 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     fi
     printf 'tree_git: %s\n' "$(if [ -e .git ]; then echo present; else echo absent; fi)"
     printf 'git_in_tree: %s\n' "$(if "${STUB_PROBE_GIT:?}" status --porcelain >/dev/null 2>&1; then echo works; else echo none; fi)"
+    printf 'git_history: %s\n' "$(if "${STUB_PROBE_GIT:?}" log --oneline -n 1 >/dev/null 2>&1 && "${STUB_PROBE_GIT:?}" blame README.md >/dev/null 2>&1; then echo ok; else echo failed; fi)"
+    printf 'git_repo_owner: %s\n' "$(stat -c %u .git 2>/dev/null || echo none)"
+    printf 'git_alternates: %s\n' "$(if [ -e .git/objects/info/alternates ]; then echo present; else echo absent; fi)"
+    printf 'git_origin: %s\n' "$("${STUB_PROBE_GIT:?}" remote get-url origin 2>/dev/null || echo none)"
     gd="${STUB_PROBE_GITDIR:-}"
     if [ -n "$gd" ]; then
       printf 'gitdir_list: %s\n' "$(allowed ls "$gd")"
@@ -125,12 +139,41 @@ case "${STUB_OPENCODE_MEMORY:-}" in
     rm -rf .sre-agent-memory
     ln -s /etc .sre-agent-memory
     ;;
+  githistory)
+    # What a developer does in a clone: read the history, commit, rewrite a
+    # commit, make a branch. The pull request is the tree against the base,
+    # whatever this leaves in .git.
+    git="${STUB_PROBE_GIT:?}"
+    "$git" log --oneline -n 3 >/dev/null
+    "$git" blame README.md >/dev/null
+    "$git" diff --stat >/dev/null
+    printf 'first change\n' > history.txt
+    "$git" add history.txt
+    "$git" commit -q -m "first local commit"
+    printf 'second change\n' >> history.txt
+    "$git" commit -q -a -m "second local commit"
+    "$git" commit -q --amend -m "second local commit, reworded"
+    "$git" branch scratch-branch
+    "$git" checkout -q -b another-branch
+    "$git" checkout -q -
+    ;;
+  nested)
+    # An embedded repository: git add would record it as a gitlink.
+    git="${STUB_PROBE_GIT:?}"
+    "$git" init -q sub
+    printf 'inside\n' > sub/file.txt
+    "$git" -C sub add file.txt
+    "$git" -C sub -c user.name=a -c user.email=a@example.invalid -c commit.gpgsign=false commit -q -m inner
+    ;;
   plant)
     # What an agent that owns its tree can leave for the runner's git: a .git
     # of its own with a filter and an fsmonitor in it, and attributes that name
     # the filter. The runner never discovers a repository from the tree.
-    mkdir -p .git
-    printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n' "${STUB_PLANT_MARKER:?}" "${STUB_PLANT_MARKER}.fsmonitor" > .git/config
+    mkdir -p .git/hooks
+    printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n\thooksPath = %s\n' "${STUB_PLANT_MARKER:?}" "${STUB_PLANT_MARKER}.fsmonitor" "$PWD/.git/hooks" > .git/config
+    printf '#!/bin/sh\ntouch %s\n' "${STUB_PLANT_MARKER}.hook" > .git/hooks/pre-commit
+    printf '#!/bin/sh\ntouch %s\n' "${STUB_PLANT_MARKER}.hook" > .git/hooks/pre-push
+    chmod +x .git/hooks/pre-commit .git/hooks/pre-push
     printf '* filter=evil\n' > .gitattributes
     ;;
   copyout)

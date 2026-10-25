@@ -201,7 +201,7 @@ chmod 0755 "${staging}/runner/entrypoint.sh"
 # What the runner opens on its first job, checked in the staged tree while the
 # old one is still in place.
 for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
-  scripts/strip_repo_config.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/entrypoint.sh; do
+  scripts/strip_repo_config.sh scripts/init_agent_repo.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/entrypoint.sh; do
   if [ ! -f "${staging}/${relative}" ]; then
     echo "the staged package is missing ${relative}; nothing was replaced" >&2
     exit 1

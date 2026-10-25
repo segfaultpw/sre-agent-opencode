@@ -637,7 +637,11 @@ async function chownTree(dir, who) {
 // cargo, go, gem, mix or mise is still there for the next request. It has no
 // root and no capability, so system packages are not among the things it can
 // install. Its git configuration is its own: an identity for the commits it
-// makes in clones of its own, no credential helper and nothing to push with.
+// makes in clones of its own, and a credential helper for github.com that
+// answers with GH_TOKEN from its environment, so it can clone private
+// repositories without the token ever being written into its home. The token
+// can push as well as clone; what stops a push is the package's fence on git
+// push, and it is the runner that pushes.
 const AGENT_GITCONFIG = [
   '[user]',
   '\tname = sre-agent-fix-agent',
@@ -648,6 +652,8 @@ const AGENT_GITCONFIG = [
   '\tdetachedHead = false',
   '[credential]',
   '\thelper =',
+  '[credential "https://github.com"]',
+  '\thelper = "!f() { test \\"$1\\" = get && echo username=x-access-token && echo \\"password=$GH_TOKEN\\"; }; f"',
   '',
 ].join('\n');
 
@@ -669,7 +675,11 @@ function settleAgentHome() {
     if (error.code !== 'ENOENT') throw error;
     present = false;
   }
-  if (!present) {
+  // The runner's file: rewritten whenever it differs from the template, so a
+  // change to it reaches homes made by an earlier release. What the agent wants
+  // of its own goes in ~/.config/git/config, which git also reads.
+  if (!present || fs.readFileSync(gitconfig, 'utf8') !== AGENT_GITCONFIG) {
+    fs.rmSync(gitconfig, { force: true });
     fs.writeFileSync(gitconfig, AGENT_GITCONFIG, { flag: 'wx', mode: 0o600 });
     fs.chownSync(gitconfig, identity.agent.uid, identity.agent.gid);
   }
@@ -682,6 +692,10 @@ function agentToolEnv(env, home) {
   const mise = path.join(home, '.local', 'share', 'mise');
   env.NPM_CONFIG_PREFIX = path.join(home, '.npm-global');
   env.GEM_HOME = gem;
+  // The image's python marks itself externally managed, which makes pip --user
+  // fail. The agent cannot write the system's site-packages, so a user install
+  // is the only kind it can make and the flag costs nothing.
+  env.PIP_BREAK_SYSTEM_PACKAGES = '1';
   env.MISE_DATA_DIR = mise;
   env.PATH = [
     path.join(home, '.local', 'bin'),
@@ -702,6 +716,51 @@ async function handOver(dir) {
   settleAgentHome();
   await chownTree(dir, 'agent');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+}
+
+// The agent works in a real repository: the full history of the base branch,
+// HEAD and the index at the base, a clean status, origin set to the github.com
+// URL without a token. It is made from a bundle the runner writes for the
+// purpose, by a script that runs as the agent in the tree, so it is the agent's
+// and shares nothing with the runner's git directory (no alternates, no
+// --shared: the agent's account cannot read that directory and must not).
+// The runner never reads it. It stages and commits from its own git directory
+// against the same base, so the agent's local commits, rewrites and branches
+// change nothing about what is published, and the tree's .git is deleted when
+// the run ends.
+async function makeBaseBundle(workspace) {
+  const bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-bundle-'));
+  try {
+    ownByRunner(bundleDir);
+    fs.chmodSync(bundleDir, 0o711);
+    const bundle = path.join(bundleDir, 'base.bundle');
+    // No work tree for this one: the tree is the agent's by the time it matters,
+    // and a bundle is made from the git directory alone.
+    await git([`--git-dir=${workspace.gitdir}`, 'bundle', 'create', '-q', bundle, `refs/heads/${workspace.branch}`]);
+    fs.chmodSync(bundle, 0o644);
+    return { dir: bundleDir, file: bundle };
+  } catch (error) {
+    fs.rmSync(bundleDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function initAgentRepository(workspace, bundle) {
+  const made = await runProcess(
+    'bash',
+    [
+      path.join(PACKAGE_ROOT, 'scripts', 'init_agent_repo.sh'),
+      bundle.file,
+      workspace.branch,
+      workspace.defaultBranch,
+      workspace.baseSha,
+      workspace.cleanUrl,
+    ],
+    { cwd: workspace.dir, env: gitEnv(), as: 'agent', timeoutMs: 300_000 }
+  );
+  if (made.code !== 0) {
+    throw new Error(`the agent's repository could not be made from the base commit: ${redact(made.stderr || made.stdout).trim()}`);
+  }
 }
 
 // A process the agent left behind (a daemon it started, something that put
@@ -738,8 +797,8 @@ async function reclaim(dir) {
   await killAgentProcesses();
   await chownTree(dir, 'runner');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
-  // The tree has no git directory of its own, so one that is there is the
-  // agent's. The runner never reads it; it goes so it cannot be mistaken for one.
+  // The repository in the tree is the agent's. The runner never reads it; it
+  // goes so it cannot be mistaken for the runner's.
   fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
 }
 
@@ -796,7 +855,7 @@ async function prepareCheckout(config, job, repo) {
   const lay = memory.layout(config.workspace);
   const dir = path.join(lay.repos, repo.owner, repo.name);
   const gitdir = path.join(lay.gitdirs, repo.owner, repo.name);
-  const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, authUrl, cleanUrl };
+  const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, authUrl, cleanUrl, baseSha: null };
 
   const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', authUrl, 'HEAD'], { env: gitEnv() });
   if (symref.code !== 0) {
@@ -859,6 +918,7 @@ async function prepareCheckout(config, job, repo) {
   // script) are the other half of what a request leaves for the next one, and
   // the second f takes a nested repository with it.
   await gitIn(workspace, ['clean', '-ffdx']);
+  workspace.baseSha = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
 
   // The runner keeps the agent's notes in .sre-agent-memory/ in the checkout
   // for the length of a run and deletes it afterwards, so a repository that
@@ -1164,6 +1224,11 @@ async function runAgent(config, workspace, prompt) {
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
+  // The agent does get the repository token, as GH_TOKEN: it clones private
+  // repositories as a CI job does, and its git credential helper reads the
+  // variable. It does not get the poll key, the AWS variables or anything of the
+  // runner's environment, and the fences deny git push.
+  if (config.githubToken) env.GH_TOKEN = config.githubToken;
   // The agent's shell would otherwise read the task role's credentials from
   // the container credentials endpoint (or the instance's from its metadata
   // service variables) and reach anything the role holds. The runner's own
@@ -1174,8 +1239,8 @@ async function runAgent(config, workspace, prompt) {
     if (/^SRE_(RUNNER|AGENT)_(UID|GID|HOME|USER)$/.test(name)) delete env[name];
   }
   if (identity.mode !== 'none') agentToolEnv(env, identity.agent.home);
-  // The tree has no git directory, and git must not go looking above it for a
-  // repository that is not this request's.
+  // The tree holds the agent's own repository, and git must not go looking
+  // above it for one that is not this request's.
   env.GIT_CEILING_DIRECTORIES = path.dirname(workspace);
   if (!config.agentAwsAccess) {
     for (const name of Object.keys(env)) {
@@ -1239,13 +1304,20 @@ async function stageAndGate(workspace, memoryBlobs) {
   resetGitDir(gitdir, cleanUrl);
   excludeFromGit(gitdir, '.opencode/');
   excludeFromGit(gitdir, `${MEMORY_COPY}/`);
+  // An embedded repository (the agent ran git init in a subdirectory) would be
+  // added as a gitlink: a pointer at history that is in no pull request. git
+  // lists such a directory, untracked, with a trailing slash; nothing is staged.
+  const untracked = (await gitIn(workspace, ['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean);
+  const embedded = untracked.filter((entry) => entry.endsWith('/'));
+  if (embedded.length > 0) return { changed: embedded, flagged: embedded, memoryCopies: [], embedded };
+
   await gitIn(workspace, ['add', '-A']);
   const staged = (await gitIn(workspace, ['diff', '--cached', '--name-only']))
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
 
-  if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [] };
+  if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [] };
 
   const gate = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'protected_paths.sh')], {
     input: `${staged.join('\n')}\n`,
@@ -1258,19 +1330,28 @@ async function stageAndGate(workspace, memoryBlobs) {
     throw new Error(`the protected paths gate failed to run: ${gate.stderr.trim()}`);
   }
 
-  // The path gate cannot see memory content copied into another file. Memory is
-  // small and its blobs are known, so a staged blob that is a memory file byte
-  // for byte is refused whatever it is called.
+  // What the staged change records, by mode and blob. A gitlink (160000) or a
+  // path inside a .git is refused whatever put it there. The path gate also
+  // cannot see memory content copied into another file: memory is small and its
+  // blobs are known, so a staged blob that is a memory file byte for byte is
+  // refused whatever it is called.
   const memoryCopies = [];
-  if (memoryBlobs.size > 0) {
-    const raw = await gitIn(workspace, ['diff', '--cached', '--raw', '--abbrev=40', '--no-renames', '-z']);
-    const tokens = raw.split('\0');
-    for (let index = 0; index + 1 < tokens.length; index += 2) {
-      const meta = /^:\d+ \d+ [0-9a-f]+ ([0-9a-f]+) [AMT]$/.exec(tokens[index]);
-      if (meta && memoryBlobs.has(meta[1])) memoryCopies.push(tokens[index + 1]);
-    }
+  const gitlinks = [];
+  const raw = await gitIn(workspace, ['diff', '--cached', '--raw', '--abbrev=40', '--no-renames', '-z']);
+  const tokens = raw.split('\0');
+  for (let index = 0; index + 1 < tokens.length; index += 2) {
+    const meta = /^:(\d+) (\d+) [0-9a-f]+ ([0-9a-f]+) [A-Z]$/.exec(tokens[index]);
+    if (!meta) continue;
+    const name = tokens[index + 1];
+    if (meta[2] === '160000' || /(^|\/)\.git(\/|$)/.test(name)) gitlinks.push(name);
+    else if (memoryBlobs.has(meta[3]) && /^[AMT]$/.test(tokens[index].slice(-1))) memoryCopies.push(name);
   }
-  return { changed: staged, flagged: [...new Set([...flagged, ...memoryCopies])], memoryCopies };
+  return {
+    changed: staged,
+    flagged: [...new Set([...flagged, ...memoryCopies, ...gitlinks])],
+    memoryCopies,
+    embedded: gitlinks,
+  };
 }
 
 // The pull request title and the commit message are one line, a Conventional
@@ -1489,8 +1570,13 @@ async function handleJob(config, job) {
     }
     let agent;
     let reclaimed = false;
+    // Made while the tree is still the runner's: the bundle needs the runner's
+    // git directory, and nothing of the agent's.
+    const bundle = repo ? await makeBaseBundle(workspace) : null;
     try {
       await handOver(workspace.dir);
+      if (repo) await initAgentRepository(workspace, bundle);
+      if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
       agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief);
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
@@ -1498,6 +1584,7 @@ async function handleJob(config, job) {
       // checkout that cannot be taken back fails the request, and its memory
       // copy is dropped unread.
       try {
+        if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
         await reclaim(workspace.dir);
         reclaimed = true;
       } finally {
@@ -1553,7 +1640,7 @@ async function handleJob(config, job) {
       return result;
     }
 
-    const { changed, flagged, memoryCopies } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
+    const { changed, flagged, memoryCopies, embedded } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
       return result;
@@ -1563,6 +1650,10 @@ async function handleJob(config, job) {
     if (flagged.length > 0) {
       result.evidence.flagged_paths = flagged;
       result.summary = `${result.summary}\n\nNothing was published: the change touched ${flagged.join(', ')}, which the protected paths gate refuses.`;
+      if (embedded.length > 0) {
+        result.summary = `${result.summary} ${embedded.join(', ')} is an embedded git repository (or a pointer to one), which git records as a pointer at history that is in no pull request; nothing was published.`;
+        result.evidence.embedded_repositories = embedded;
+      }
       if (memoryCopies.length > 0) {
         result.summary = `${result.summary} ${memoryCopies.join(', ')} holds a copy of what the agent keeps in its memory, and memory never goes into a pull request.`;
         result.evidence.memory_copy_paths = memoryCopies;

@@ -51,13 +51,19 @@ ARG MISE_VERSION=2026.10.12
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
+        build-essential \
         ca-certificates \
         curl \
         git \
         jq \
         less \
+        make \
+        python3 \
+        python3-pip \
+        python3-venv \
         unzip \
         util-linux \
+        xz-utils \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
