@@ -248,10 +248,12 @@ if [ "$rc" -eq 0 ] && grep -qxF 'env: runner=:: agent=::' "$STUB_LOG"; then echo
 
 echo "--- SRE_RUNNER_SETUP runs once as root before the runner starts, and a failure stops the start ---"
 mkdir -p "$work/setup"
-cat > "$work/setup/ok.sh" <<'EOF'
+cat > "$work/setup/ok.sh" <<EOF
 #!/usr/bin/env bash
-printf 'setup ran\n' >> "$STUB_LOG"
-printf 'setup sees SRE_API_KEY=%s SRE_GITHUB_TOKEN=%s\n' "${SRE_API_KEY-unset}" "${SRE_GITHUB_TOKEN-unset}" >> "$STUB_LOG"
+printf 'setup ran\\n' >> "$STUB_LOG"
+printf 'setup sees SRE_API_KEY=%s SRE_GITHUB_TOKEN=%s\\n' "\${SRE_API_KEY-unset}" "\${SRE_GITHUB_TOKEN-unset}" >> "$STUB_LOG"
+printf 'setup sees SRE_AGENT_GITHUB_TOKEN=%s OPENROUTER_API_KEY=%s AWS_SECRET_ACCESS_KEY=%s\\n' "\${SRE_AGENT_GITHUB_TOKEN-unset}" "\${OPENROUTER_API_KEY-unset}" "\${AWS_SECRET_ACCESS_KEY-unset}" >> "$STUB_LOG"
+printf 'setup keeps SRE_SETUP_CHANNEL=%s HTTPS_PROXY=%s HOME=%s\\n' "\${SRE_SETUP_CHANNEL-unset}" "\${HTTPS_PROXY-unset}" "\${HOME-unset}" >> "$STUB_LOG"
 echo "installing the extra package"
 echo "a warning" >&2
 EOF
@@ -266,12 +268,16 @@ chmod +x "$work/setup/ok.sh" "$work/setup/fail.sh"
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent
 if ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   with no SRE_RUNNER_SETUP nothing runs"; else echo "FAIL a setup ran with none named"; fail=1; fi
 
-run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/ok.sh"
+run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/ok.sh" \
+  SRE_GITHUB_TOKEN=runner-token-value SRE_AGENT_GITHUB_TOKEN=agent-token-value OPENROUTER_API_KEY=provider-key-value \
+  AWS_SECRET_ACCESS_KEY=aws-secret-value SRE_SETUP_CHANNEL=stable HTTPS_PROXY=http://proxy.example.invalid:3128
 if [ "$rc" -eq 0 ] && [ "$(grep -cx 'setup ran' "$STUB_LOG")" -eq 1 ]; then echo "ok   the setup script runs once"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
 setup_line="$(grep -nx 'setup ran' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
 runner_line="$(grep -n 'runner/runner.js' "$STUB_LOG" | head -n 1 | cut -d: -f1)"
 if [ -n "$setup_line" ] && [ -n "$runner_line" ] && [ "$setup_line" -lt "$runner_line" ]; then echo "ok   it runs before the runner starts, so before the first poll"; else echo "FAIL setup at line '$setup_line', runner at line '$runner_line'"; fail=1; fi
 if grep -qx 'setup sees SRE_API_KEY=unset SRE_GITHUB_TOKEN=unset' "$STUB_LOG"; then echo "ok   it is not given the runner's poll key or repository token"; else echo "FAIL $(grep 'setup sees' "$STUB_LOG")"; fail=1; fi
+if grep -qx 'setup sees SRE_AGENT_GITHUB_TOKEN=unset OPENROUTER_API_KEY=unset AWS_SECRET_ACCESS_KEY=unset' "$STUB_LOG"; then echo "ok   it is not given the agent token, a model provider key or AWS credentials either: its environment is an allowlist"; else echo "FAIL $(grep 'setup sees' "$STUB_LOG")"; fail=1; fi
+if grep -qx 'setup keeps SRE_SETUP_CHANNEL=stable HTTPS_PROXY=http://proxy.example.invalid:3128 HOME=/root' "$STUB_LOG"; then echo "ok   it keeps the operator's SRE_SETUP_* variables and the proxy, with root's home"; else echo "FAIL $(grep 'setup keeps' "$STUB_LOG")"; fail=1; fi
 if grep -qF 'setup: installing the extra package' <<<"$out" && grep -qF 'setup: a warning' <<<"$out"; then echo "ok   its output, standard output and standard error, is logged"; else echo "FAIL output: $out"; fail=1; fi
 
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/setup/fail.sh"

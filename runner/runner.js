@@ -735,8 +735,12 @@ async function makeBaseBundle(workspace) {
   const bundleDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-bundle-'));
   try {
     ownByRunner(bundleDir);
+    // 0711 lets the agent open a file it is told the name of without listing
+    // the directory, and the temp directory itself is listable by every local
+    // account, so the bundle (a private repository's history) is reachable
+    // only through a name nobody else can guess.
     fs.chmodSync(bundleDir, 0o711);
-    const bundle = path.join(bundleDir, 'base.bundle');
+    const bundle = path.join(bundleDir, `base-${crypto.randomBytes(16).toString('hex')}.bundle`);
     // No work tree for this one: the tree is the agent's by the time it matters,
     // and a bundle is made from the git directory alone.
     await git([`--git-dir=${workspace.gitdir}`, 'bundle', 'create', '-q', bundle, `refs/heads/${workspace.branch}`]);
@@ -1750,7 +1754,7 @@ async function main() {
   }
 }
 
-module.exports = { loadConfig, handleJob, internals: { openMemory, closeMemory, replaceMemory } };
+module.exports = { loadConfig, handleJob, internals: { openMemory, closeMemory, replaceMemory, makeBaseBundle } };
 
 if (require.main === module) {
   process.on('uncaughtException', (error) => {

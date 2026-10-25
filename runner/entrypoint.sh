@@ -99,9 +99,11 @@ fi
 # one. It runs here, once per container start, as root, after the accounts exist
 # and before the runner starts, so before the first poll and before anything is
 # handed to the agent. Its output is logged; if it fails the runner does not
-# start. It is not given the poll key or the repository token: it is the
-# operator's own script, but nothing it does needs them and its log is
-# somebody's aggregator.
+# start. It gets an allowlisted environment, never the container's: the poll
+# key, both GitHub tokens and every model provider key live there, nothing a
+# package install does needs them, and its log is somebody's aggregator. What
+# it keeps is what an install needs (PATH, locale, time zone, proxies) and the
+# operator's own SRE_SETUP_* variables.
 if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   setup="$SRE_RUNNER_SETUP"
   case "$setup" in
@@ -124,7 +126,14 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   fi
   echo "sre-agent-fix-runner: running the setup script ${setup}"
   set +e
-  env -u SRE_API_KEY -u SRE_GITHUB_TOKEN "$setup" 2>&1 | while IFS= read -r line; do
+  setup_env=(PATH="$PATH" HOME=/root)
+  for name in LANG LC_ALL TZ TERM HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+    if [ -n "${!name+x}" ]; then setup_env+=("${name}=${!name}"); fi
+  done
+  while IFS= read -r name; do
+    setup_env+=("${name}=${!name}")
+  done < <(compgen -e | grep -E '^SRE_SETUP_[A-Za-z0-9_]+$' || true)
+  env -i "${setup_env[@]}" "$setup" 2>&1 | while IFS= read -r line; do
     printf 'sre-agent-fix-runner: setup: %s\n' "$line"
   done
   setup_status="${PIPESTATUS[0]}"
