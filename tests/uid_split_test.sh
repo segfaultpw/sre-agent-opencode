@@ -66,6 +66,10 @@ chmod 755 "$work"
 mkdir -p "$work/tmp"
 chmod 1777 "$work/tmp"
 export TMPDIR="$work/tmp"
+# Every process started below inherits this directory as its working directory,
+# and the accounts cannot enter the checkout the test was started from (git
+# refuses to run at all when it cannot stat its working directory).
+cd "$work"
 # The accounts below cannot necessarily walk through the directory this
 # checkout is in (a home directory is often 0750), so they run from a copy.
 for item in VERSION config agents scripts runner tests/fixture; do

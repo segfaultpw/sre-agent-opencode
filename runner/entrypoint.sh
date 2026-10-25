@@ -138,10 +138,6 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
     echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not a file in this container" >&2
     exit 1
   fi
-  if [ ! -x "$setup" ]; then
-    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not executable" >&2
-    exit 1
-  fi
   case "$setup" in
     /*) ;;
     *)
@@ -215,6 +211,12 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
       current="${current:-/}"
     done
   done
+  # Last, after where it is: a script in a place the agent writes is refused for
+  # that reason even when the place is also mounted noexec (/run/lock often is).
+  if [ ! -x "$setup" ]; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_SETUP names ${setup}, which is not executable" >&2
+    exit 1
+  fi
   echo "sre-agent-fix-runner: running the setup script ${setup}"
   set +e
   setup_env=(PATH="$PATH" HOME=/root)
