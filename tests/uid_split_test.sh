@@ -570,6 +570,50 @@ prove_survivor() {
 
 prove_survivor
 
+# The pool layout: with SRE_WORKSPACE_PER_INSTANCE=1 this instance keeps its own
+# directories under instances/<id> on the shared volume, the agent's per-repository
+# home moves with them, and the memory stays one shared tree the agent is still
+# closed out of. Proved with real accounts, as root.
+prove_split() {
+  local label="root-split" owner="$runner_uid"
+  local ws="$work/$label-ws" runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent" out="$work/$label.out"
+  local probe="$work/$label.probe" survivor="$work/$label.survivor"
+  echo "--- $label: the account split holds under a per-instance workspace ---"
+  mkdir -p "$ws/memory/acme/app" "$runner_home" "$agent_home"
+  printf 'the earlier notes\n' > "$ws/memory/acme/app/NOTES.md"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  : > "$probe"; : > "$survivor"
+  chmod 666 "$probe" "$survivor"
+  start_fixture
+  queue_job "h-$label" acme/app
+  local rc=0
+  timeout 120 setpriv --groups=20001,20002 -- env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=pool-a \
+    HOME="$runner_home" \
+    STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=edit STUB_OPENCODE_PROBE="$probe" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor" \
+    STUB_PROBE_GIT="$real_git" STUB_EXPECT_GH_TOKEN="$github_token" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  local report app_home="$ws/instances/pool-a/agent-home/acme/app"
+  report="$(jq -c 'select(.path | endswith("/h-'"$label"'/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
+  if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: the request under the split ends in a pull request"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if grep -qx "id: $agent_uid:$agent_uid" "$probe"; then echo "ok   $label: the agent still runs as its own uid"; else echo "FAIL $label: $(grep -E '^id:' "$probe")"; fail=1; fi
+  if grep -qx "home: $app_home" "$probe" && grep -qx "home_owner: $agent_uid" "$probe"; then echo "ok   $label: its home is the instance's own per-repository home under instances/pool-a/agent-home"; else echo "FAIL $label: $(grep -E '^home' "$probe")"; fail=1; fi
+  if grep -qx 'memory_list: denied' "$probe" && grep -qx 'memory_write: denied' "$probe"; then echo "ok   $label: the shared memory directory is still closed to the agent"; else echo "FAIL $label: $(grep memory "$probe")"; fail=1; fi
+  if [ "$(stat -c '%a %u' "$ws/instances/pool-a/gitdirs/acme/app")" = "700 $owner" ]; then echo "ok   $label: the git directory is the runner's, mode 0700, under the instance's gitdirs"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/instances/pool-a/gitdirs/acme/app" 2>&1)"; fail=1; fi
+  if [ ! -e "$ws/repos" ] && [ ! -e "$ws/gitdirs" ] && [ ! -e "$agent_home/acme" ]; then echo "ok   $label: the flat directories and the account's old home were never used"; else echo "FAIL $label: $(ls "$ws") $(ls "$agent_home" 2>/dev/null)"; fail=1; fi
+  if [ "$(stat -c '%a %u' "$ws/memory")" = "700 $owner" ] && [ "$(tail -n 1 "$ws/memory/acme/app/NOTES.md")" = "the pool ceiling is 40 on the primary" ]; then echo "ok   $label: the memory is the shared one and the note reached it"; else echo "FAIL $label: $(cat "$ws/memory/acme/app/NOTES.md" 2>/dev/null)"; fail=1; fi
+  if [ "$(stat -c '%a' "$ws/locks")" = "700" ] && [ -z "$(find "$ws/locks" -type f -print -quit)" ]; then echo "ok   $label: the lock directory is closed to every account and empty once the request ends"; else echo "FAIL $label: $(find "$ws/locks" -printf '%m %p\n' 2>&1)"; fail=1; fi
+  if ! grep -qF "$github_token" "$out" "$work/requests.jsonl"; then echo "ok   $label: the token is in no log line and no report"; else echo "FAIL $label: the token was logged or reported"; fail=1; fi
+}
+
+prove_split
+
 echo "--- a root runner without the account ids refuses to start ---"
 start_fixture
 rc=0

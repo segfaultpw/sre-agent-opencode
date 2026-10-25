@@ -7,6 +7,10 @@
 //   <workspace>/memory/_estate/            the same, for requests naming no repository
 //   <workspace>/scratch/                   untargeted runs
 //
+// With SRE_WORKSPACE_PER_INSTANCE=1 (memory.split below) the working
+// directories are this instance's own under <workspace>/instances/<id> while
+// the memory stays one shared tree on the volume.
+//
 // The agent never touches <workspace>/memory itself: the runner copies a memory
 // directory next to the agent's work before a run and copies it back after, and
 // every bound below is applied by the runner to that copy, not asked of the
@@ -15,6 +19,7 @@
 // Standard library only.
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const NOTES = 'NOTES.md';
@@ -35,12 +40,16 @@ const MAX_ENTRIES = 200;
 const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // Top-level names the runner owns. An old clone under an owner called one of
 // these cannot be told from the runner's own directory, so it is not migrated
-// and is cloned again under repos/.
-const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home']);
+// and is cloned again under repos/. instances/ and locks/ are the pool layout's:
+// the shared working tree of every instance and the leases on the shared memory.
+const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home', 'instances', 'locks']);
 // What the runner keeps at the top of the workspace for the bucket mirror: a
 // restore's staging directory, the marker of a restore that has not succeeded
 // and the journal of paths not yet mirrored (runner/bucket.js). None is an owner.
 const STATE_PREFIX = '.memory-';
+// The instance id falls back to this when neither the operator's nor the host's
+// name passes the shape above (a hostname with a space in it, an empty override).
+const DEFAULT_INSTANCE = 'default';
 
 function validName(name) {
   return typeof name === 'string' && NAME_PATTERN.test(name) && !/^\.+$/.test(name);
@@ -53,6 +62,83 @@ function layout(workspace) {
     gitdirs: path.join(base, 'gitdirs'),
     memory: path.join(base, 'memory'),
     scratch: path.join(base, 'scratch'),
+  };
+}
+
+// A runner instance's id: what the runner tells the platform it is, and the
+// name of its own directory under instances/ on a shared volume. The operator's
+// SRE_RUNNER_INSTANCE wins when it passes the same shape as a repository name
+// (a value that is only dots would be the instances directory itself, so it
+// falls back too), then the hostname, then DEFAULT_INSTANCE: whatever the host
+// says, the id is one path segment and one word in a report.
+function instanceId(env = process.env, hostname = os.hostname()) {
+  const from = (raw) => (typeof raw === 'string' && NAME_PATTERN.test(raw) && !/^\.+$/.test(raw) ? raw : null);
+  return from(env.SRE_RUNNER_INSTANCE) || from(hostname) || DEFAULT_INSTANCE;
+}
+
+// The one decision the runner, the bucket mirror and the memory walkers share:
+// where this instance works and where the memory lives. Only the exact value 1
+// splits the workspace, so a typo or an older deployment keeps the flat layout
+// byte for byte: one runner, one workspace, no locks.
+//
+//   SRE_WORKSPACE_PER_INSTANCE=1
+//     <workspace>/instances/<id>/repos|gitdirs|scratch|agent-home
+//     the memory root is SRE_MEMORY_ROOT, default <workspace>/memory, and the
+//     bucket mirror's three state files and restore staging sit in its parent,
+//     beside the memory as they always have, on its file system for the rename
+//     that moves a restore in
+//     <workspace>/locks holds the leases on the shared tree
+//
+// `stateBase` is where the mirror keeps its state files and `agentHome` is
+// where the per-repository homes live (null in the flat layout, where the
+// account's own home directory stands, as the entrypoint resolved it). A
+// relative SRE_MEMORY_ROOT, or one that is the workspace itself, is refused:
+// the first would move with the process's directory, and the second would make
+// every repository owner a directory the runner owns for other purposes.
+function split(env = process.env) {
+  const raw = env.SRE_WORKSPACE;
+  const workspace = path.resolve(typeof raw === 'string' && raw !== '' ? raw : '/workspace');
+  const instance = instanceId(env);
+  const flat = layout(workspace);
+  if (env.SRE_WORKSPACE_PER_INSTANCE !== '1') {
+    return {
+      workspace,
+      instance,
+      perInstance: false,
+      instanceDir: null,
+      repos: flat.repos,
+      gitdirs: flat.gitdirs,
+      scratch: flat.scratch,
+      agentHome: null,
+      memory: flat.memory,
+      stateBase: workspace,
+      locks: path.join(workspace, 'locks'),
+    };
+  }
+  let memory = flat.memory;
+  const chosen = env.SRE_MEMORY_ROOT;
+  if (chosen !== undefined && chosen !== '') {
+    if (!path.isAbsolute(chosen)) {
+      throw new Error(`SRE_MEMORY_ROOT ${chosen} is not usable: it is an absolute path, the root of the shared memory tree`);
+    }
+    memory = path.resolve(chosen);
+    if (memory === workspace) {
+      throw new Error(`SRE_MEMORY_ROOT ${chosen} is not usable: point it at a directory of its own, not at the workspace itself`);
+    }
+  }
+  const instanceDir = path.join(workspace, 'instances', instance);
+  return {
+    workspace,
+    instance,
+    perInstance: true,
+    instanceDir,
+    repos: path.join(instanceDir, 'repos'),
+    gitdirs: path.join(instanceDir, 'gitdirs'),
+    scratch: path.join(instanceDir, 'scratch'),
+    agentHome: path.join(instanceDir, 'agent-home'),
+    memory,
+    stateBase: path.dirname(memory),
+    locks: path.join(workspace, 'locks'),
   };
 }
 
@@ -79,6 +165,28 @@ function memoryDir(workspace, repo) {
   if (repo === null || repo === undefined) return path.join(memory, ESTATE);
   const { owner, name } = parseRepo(repo);
   return path.join(memory, owner, name);
+}
+
+// The same under a memory root given by the split, which with
+// SRE_WORKSPACE_PER_INSTANCE=1 need not be the workspace's own memory/.
+function memoryDirIn(root, repo) {
+  const base = path.resolve(root);
+  if (repo === null || repo === undefined) return path.join(base, ESTATE);
+  const { owner, name } = parseRepo(repo);
+  return path.join(base, owner, name);
+}
+
+// The three walkers below (migrate, recover, clearTestMarkers) take either the
+// flat workspace, a string, as the earlier releases and the unit tests do, or
+// the split of split(), which is what the runner hands them: only the roots
+// they walk differ between the two.
+function resolveSplit(target) {
+  if (typeof target === 'string') {
+    const flat = layout(target);
+    return { workspace: path.resolve(target), repos: flat.repos, memory: flat.memory };
+  }
+  if (target && typeof target === 'object' && typeof target.repos === 'string' && typeof target.memory === 'string') return target;
+  throw new Error('memory: not a workspace or a layout to walk');
 }
 
 function lstatOrNull(target) {
@@ -109,8 +217,9 @@ function readDirOrEmpty(target) {
 // moves, and never onto something already there, so a second call finds
 // nothing to do and a clone in the new place is never overwritten.
 function migrate(workspace) {
-  const base = path.resolve(workspace);
-  const { repos } = layout(base);
+  const laid = resolveSplit(workspace);
+  const base = laid.workspace;
+  const { repos } = laid;
   const moved = [];
   for (const owner of readDirOrEmpty(base)) {
     // A GitHub owner always passes validName; lost+found of a mounted disk and
@@ -427,7 +536,7 @@ function changes(before, after, rootPrefix, options = {}) {
 // back, every other leftover is removed. Returns one sentence per action.
 function recover(workspace) {
   const notes = [];
-  const { memory: root } = layout(workspace);
+  const { memory: root } = resolveSplit(workspace);
   const parents = [root];
   for (const name of readDirOrEmpty(root)) {
     if (isRealDirectory(path.join(root, name))) parents.push(path.join(root, name));
@@ -454,7 +563,7 @@ function recover(workspace) {
 // relative to it. Only the runner can write there, so there is no link to meet;
 // rmSync never follows one in any case.
 function clearTestMarkers(workspace) {
-  const { memory: root } = layout(workspace);
+  const { memory: root } = resolveSplit(workspace);
   const removed = [];
   const clear = (dir) => {
     const target = path.join(dir, TEST_MARKER);
@@ -488,9 +597,13 @@ module.exports = {
   MAX_CHANGES,
   RESERVED,
   STATE_PREFIX,
+  DEFAULT_INSTANCE,
   validName,
   layout,
+  split,
+  instanceId,
   memoryDir,
+  memoryDirIn,
   migrate,
   snapshot,
   enforce,

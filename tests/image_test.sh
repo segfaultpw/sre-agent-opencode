@@ -312,6 +312,28 @@ cp "$setup_dir/ok.sh" "$work/workspace/agent-home/setup.sh"
 ln -sf "$work/workspace/agent-home/setup.sh" "$setup_dir/link-into-workspace.sh"
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$work/workspace/agent-home/setup.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a setup script on the workspace (which the agent writes) is refused"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
+
+echo "--- SRE_WORKSPACE_PER_INSTANCE=1 creates this instance's directory before the runner starts ---"
+run_entrypoint_split() {
+  : > "$STUB_LOG"
+  rc=0
+  out="$(env PATH="$work/bin:$PATH" \
+    SRE_SERVER_URL="${SRE_SERVER_URL_V-https://app.example.invalid}" \
+    SRE_API_KEY="${SRE_API_KEY_V-not-a-real-key}" \
+    SRE_MODEL="${SRE_MODEL_V-openrouter/deepseek/deepseek-v4-pro}" \
+    SRE_WORKSPACE="${SRE_WORKSPACE_V-$work/workspace}" \
+    "$@" bash "$entrypoint" 2>&1)" || rc=$?
+}
+run_entrypoint_split SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=pool-a
+if [ "$rc" -eq 0 ] && [ -d "$work/workspace/instances/pool-a" ] && grep -qF 'runner/runner.js' "$STUB_LOG"; then echo "ok   the entrypoint creates the instance's own directory and starts the runner"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+rm -rf "$work/workspace/instances"
+: > "$work/workspace/instances"
+run_entrypoint_split SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=pool-a
+if [ "$rc" -ne 0 ] && grep -qF 'instances/pool-a' <<<"$out" && [ ! -s "$STUB_LOG" ]; then echo "ok   a workspace that cannot hold the instance directory refuses to start, naming it, and starts nothing"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+rm -f "$work/workspace/instances"
+run_entrypoint_split SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE='bad name!'
+if [ "$rc" -eq 0 ] && [ -d "$work/workspace/instances/$(hostname)" ] && grep -qF 'SRE_RUNNER_INSTANCE' <<<"$out" && grep -qF 'runner/runner.js' "$STUB_LOG"; then echo "ok   an instance name the runner cannot use falls back to the hostname, says so, and starts"; else echo "FAIL rc=$rc out=$out log=$(cat "$STUB_LOG")"; fail=1; fi
+rm -rf "$work/workspace/instances"
 run_as FAKE_ID_U=0 SRE_RUNNER_USER=runner SRE_AGENT_USER=agent SRE_RUNNER_SETUP="$setup_dir/link-into-workspace.sh"
 if [ "$rc" -ne 0 ] && grep -qF 'on the workspace' <<<"$out" && ! grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   a link outside the workspace that points into it is refused too"; else echo "FAIL rc=$rc out=$out"; fail=1; fi
 relative_setup="$(realpath --relative-to="$PWD" "$setup_dir/ok.sh")"

@@ -72,6 +72,37 @@ if [ ! -d "$workspace" ] || [ ! -w "$workspace" ]; then
   exit 1
 fi
 
+# The workspace split, the same decision runner.js makes from the same
+# variables: with SRE_WORKSPACE_PER_INSTANCE=1 the runner works under
+# <workspace>/instances/<instance>, and the instance id is SRE_RUNNER_INSTANCE
+# when it is a name the runner can use, else the hostname. The directory is
+# made and checked here for the same reason the workspace is: a start that
+# cannot work its own volume refuses now, with the path named, instead of
+# failing its first job.
+if [ "${SRE_WORKSPACE_PER_INSTANCE:-}" = "1" ]; then
+  instance="${SRE_RUNNER_INSTANCE:-}"
+  if [ -n "$instance" ] && { ! printf '%s' "$instance" | grep -Eqx '[A-Za-z0-9._-]{1,100}' || ! printf '%s' "$instance" | grep -q '[^.]'; }; then
+    echo "sre-agent-fix-runner: SRE_RUNNER_INSTANCE is not a name the runner can use (letters, digits, dots, underscores and hyphens, at most 100 characters), so the instance id falls back to the hostname" >&2
+    instance=""
+  fi
+  if [ -z "$instance" ]; then
+    # Read from the kernel rather than the hostname command, so this still runs
+    # on a PATH too broken to resolve one, like the checks above.
+    if [ -r /proc/sys/kernel/hostname ]; then
+      read -r instance < /proc/sys/kernel/hostname
+    else
+      instance="$(hostname 2>/dev/null || true)"
+    fi
+    if ! printf '%s' "$instance" | grep -Eqx '[A-Za-z0-9._-]{1,100}' || ! printf '%s' "$instance" | grep -q '[^.]'; then
+      instance="default"
+    fi
+  fi
+  if ! mkdir -p "$workspace/instances/$instance" 2>/dev/null || [ ! -w "$workspace/instances/$instance" ]; then
+    echo "sre-agent-fix-runner: the instance directory ${workspace}/instances/${instance} does not exist or is not writable by uid $(id -u), and with SRE_WORKSPACE_PER_INSTANCE=1 this runner keeps its own directories under it; mount the workspace writable, or point SRE_WORKSPACE somewhere this account owns" >&2
+    exit 1
+  fi
+fi
+
 # Who runs what. The runner starts every agent run as a second account, so that
 # what the agent can reach is not what the runner can reach (its environment,
 # the memory directory, every other clone). As root, which is how the container

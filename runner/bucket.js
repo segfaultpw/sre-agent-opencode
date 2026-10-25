@@ -163,11 +163,17 @@ function failureText(result) {
   return firstLine(result.stderr) || firstLine(result.stdout) || `exit code ${result.code}`;
 }
 
+// The directory the three state files, the restore staging and the aws calls'
+// own working directory live in: the parent of the memory root, wherever the
+// memory root is. The runner hands it in as `workspace` from the one split
+// decision (memory.split), and a config without it (the unit tests, an older
+// caller) means a flat workspace whose memory root is its own memory/.
 function workspaceDir(config) {
   return path.resolve(config.workspace);
 }
 
 function memoryRoot(config) {
+  if (typeof config.memoryRoot === 'string' && config.memoryRoot !== '') return path.resolve(config.memoryRoot);
   return path.join(workspaceDir(config), 'memory');
 }
 
@@ -246,11 +252,11 @@ function restorePending(config) {
   return Boolean(config && config.bucket) && stateExists(config, RESTORE_MARKER);
 }
 
-// A memory file's path under <workspace>/memory, judged by shape: _estate or
+// A memory file's path under the memory root, judged by shape: _estate or
 // <owner>/<repo>, then NOTES.md or scripts/<name>, every part a legal name. The
 // names the runner keeps at the top of the workspace (repos, gitdirs, scratch,
-// agent-home, memory) are ordinary owners here, because the memory root is
-// below them and nothing written under it can reach them.
+// agent-home, memory, instances, locks) are ordinary owners here, because the
+// memory root is below them and nothing written under it can reach them.
 function classify(rel) {
   if (typeof rel !== 'string' || rel === '') return { error: 'the path is empty' };
   const segments = rel.split('/');

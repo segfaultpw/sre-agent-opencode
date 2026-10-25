@@ -112,6 +112,66 @@ test('memoryDir refuses a name with a slash, dots only, a bad character or too l
   assert.doesNotThrow(() => memory.memoryDir('/workspace', { owner: 'a'.repeat(100), name: 'x.y_z-1' }));
 });
 
+test('the instance id is the operator\'s name, else the hostname, else default, and never a path of its own', () => {
+  assert.equal(memory.instanceId({ SRE_RUNNER_INSTANCE: 'pool-a' }, 'host-1'), 'pool-a');
+  assert.equal(memory.instanceId({}, 'host-1'), 'host-1');
+  assert.equal(memory.instanceId({}, 'a'.repeat(100)), 'a'.repeat(100));
+  for (const bad of ['bad name!', 'a/b', '', 'x'.repeat(101), '.', '...']) {
+    assert.equal(memory.instanceId({ SRE_RUNNER_INSTANCE: bad }, 'host-1'), 'host-1', bad);
+  }
+  assert.equal(memory.instanceId({ SRE_RUNNER_INSTANCE: 'bad name!' }, ''), 'default');
+  assert.equal(memory.instanceId({}, ''), 'default');
+});
+
+test('split keeps the flat layout for any value other than 1', () => {
+  const base = { SRE_WORKSPACE: '/workspace' };
+  for (const value of [undefined, '', '0', 'true', 'yes', ' ']) {
+    const laid = memory.split({ ...base, SRE_WORKSPACE_PER_INSTANCE: value });
+    assert.equal(laid.perInstance, false, `SRE_WORKSPACE_PER_INSTANCE=${JSON.stringify(value)}`);
+    assert.equal(laid.repos, '/workspace/repos');
+    assert.equal(laid.gitdirs, '/workspace/gitdirs');
+    assert.equal(laid.scratch, '/workspace/scratch');
+    assert.equal(laid.memory, '/workspace/memory');
+    assert.equal(laid.agentHome, null);
+    assert.equal(laid.stateBase, '/workspace');
+  }
+  const laid = memory.split(base);
+  assert.equal(laid.instance, memory.instanceId(base));
+});
+
+test('split moves the working directories under the instance and keeps the memory root shared', () => {
+  const laid = memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_RUNNER_INSTANCE: 'pool-a' });
+  assert.equal(laid.perInstance, true);
+  assert.equal(laid.instance, 'pool-a');
+  assert.equal(laid.instanceDir, '/shared/instances/pool-a');
+  assert.equal(laid.repos, '/shared/instances/pool-a/repos');
+  assert.equal(laid.gitdirs, '/shared/instances/pool-a/gitdirs');
+  assert.equal(laid.scratch, '/shared/instances/pool-a/scratch');
+  assert.equal(laid.agentHome, '/shared/instances/pool-a/agent-home');
+  assert.equal(laid.memory, '/shared/memory');
+  assert.equal(laid.stateBase, '/shared');
+  assert.equal(laid.locks, '/shared/locks');
+});
+
+test('split takes the memory root from SRE_MEMORY_ROOT and refuses what it cannot use', () => {
+  const laid = memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: '/data/notes' });
+  assert.equal(laid.memory, '/data/notes');
+  assert.equal(laid.stateBase, '/data');
+  assert.throws(() => memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: 'notes' }), /SRE_MEMORY_ROOT/);
+  assert.throws(() => memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: '/shared' }), /SRE_MEMORY_ROOT/);
+  // The default memory root still works when spelled out.
+  assert.equal(memory.split({ SRE_WORKSPACE: '/shared', SRE_WORKSPACE_PER_INSTANCE: '1', SRE_MEMORY_ROOT: '/shared/memory' }).memory, '/shared/memory');
+  // And it is not read with the split off: the flat layout stands whatever it says.
+  assert.equal(memory.split({ SRE_WORKSPACE: '/shared', SRE_MEMORY_ROOT: '/data/notes' }).memory, '/shared/memory');
+});
+
+test('memoryDirIn places a repository and the estate under a given memory root', () => {
+  assert.equal(memory.memoryDirIn('/data/notes', { owner: 'acme', name: 'api' }), '/data/notes/acme/api');
+  assert.equal(memory.memoryDirIn('/data/notes', 'acme/api'), '/data/notes/acme/api');
+  assert.equal(memory.memoryDirIn('/data/notes', null), '/data/notes/_estate');
+  assert.throws(() => memory.memoryDirIn('/data/notes', '_estate/api'), /memory/);
+});
+
 test('migrate moves an old clone under repos and is a no-op the second time', () => {
   const ws = fresh();
   put(ws, 'acme/api/.git/HEAD', 'ref: refs/heads/main\n');

@@ -963,7 +963,11 @@ const dir = path.join(ws, 'tamper-scratch');
 fs.mkdirSync(path.join(ws, 'memory', '_estate'), { recursive: true });
 fs.writeFileSync(path.join(ws, 'memory', '_estate', 'NOTES.md'), 'the earlier notes\n');
 fs.mkdirSync(dir, { recursive: true });
-const config = { workspace: ws, identity: { mode: 'none', runner: null, agent: null } };
+const config = {
+  workspace: ws,
+  layout: memory.split({ SRE_WORKSPACE: ws }),
+  identity: { mode: 'none', runner: null, agent: null },
+};
 const mem = runner.internals.openMemory(config, { dir }, null);
 fs.writeFileSync(path.join(mem.copy, 'NOTES.md'), 'the notes that were checked\n');
 const realSnapshot = memory.snapshot;
@@ -1328,6 +1332,140 @@ if [ "$cap_eff" = "0000000000000000" ]; then
 else
   echo "ok   skipped: this shell holds capabilities (CapEff ${cap_eff}), so the fallback cannot be provoked from here; tests/uid_split_test.sh covers it with real accounts"
 fi
+
+echo "--- 50. SRE_WORKSPACE_PER_INSTANCE=1 gives this instance its own directories and keeps the memory shared ---"
+start_fixture split
+queue_one h-split acme/app
+export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY=edit
+# A workspace of its own: the earlier cases ran in the flat one and their
+# directories would make the "nothing flat was made" claim meaningless.
+split_ws="$work/workspace-split"
+mkdir -p "$split_ws"
+flat_workspace="$workspace"
+workspace="$split_ws"
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha run_once split
+workspace="$flat_workspace"
+unset STUB_OPENCODE_MEMORY
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a run under the split ends in a pull request as usual"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if [ -f "$split_ws/instances/alpha/repos/acme/app/README.md" ]; then echo "ok   the checkout lives under instances/alpha/repos"; else echo "FAIL no checkout under instances: $(find "$split_ws" -maxdepth 4 -type d | head -20)"; fail=1; fi
+if [ -f "$split_ws/instances/alpha/gitdirs/acme/app/HEAD" ]; then echo "ok   the git directory lives under instances/alpha/gitdirs"; else echo "FAIL no git directory under instances"; fail=1; fi
+if [ ! -e "$split_ws/repos" ] && [ ! -e "$split_ws/gitdirs" ] && [ ! -e "$split_ws/scratch" ]; then echo "ok   the flat directories were not made"; else echo "FAIL the flat layout was made too: $(ls "$split_ws")"; fail=1; fi
+if [ "$(tail -n 1 "$split_ws/memory/acme/app/NOTES.md" 2>/dev/null)" = "the pool ceiling is 40 on the primary" ]; then echo "ok   the memory still lives in the shared memory/ at the top of the workspace"; else echo "FAIL memory: $(find "$split_ws/memory" -type f 2>/dev/null)"; fail=1; fi
+if [ -e "$split_ws/locks/acme/app.lock" ] || [ -e "$split_ws/locks/_state.lock" ]; then echo "FAIL a lock file was left behind"; fail=1; else echo "ok   the repository lock is released when the request ends"; fi
+if [ "$(jq -r 'select(.path | endswith("/api/fix-runner/queue")) | .body.instance' "$fixture_log" | tail -n 1)" = "alpha" ]; then echo "ok   the poll body carries the instance id the operator named"; else echo "FAIL poll body: $(jq -c 'select(.path | endswith("/api/fix-runner/queue")) | .body' "$fixture_log" | tail -n 1)"; fail=1; fi
+stop_fixture
+
+echo "--- 51. a second instance working on the same repository is answered honestly, and the first's memory is intact ---"
+# Two fixtures, one per instance, because each serves its queue once: the two
+# run_once processes must each collect their own job while both live. The
+# server keeps running after the helper returns, so the URL is read from the
+# port file rather than handed back through a command substitution, whose pipe
+# the server would hold open for ever.
+start_extra_fixture() {
+  local name="$1" queue="$2"
+  : > "$work/$name.requests.jsonl"
+  FIXTURE_LOG="$work/$name.requests.jsonl" FIXTURE_QUEUE_FILE="$queue" FIXTURE_PORT_FILE="$work/$name.port" \
+    node "$here/fixture/queue_server.js" &
+  fixture_pids+=("$!")
+  local waited=0
+  while [ ! -s "$work/$name.port" ] && [ "$waited" -lt 200 ]; do sleep 0.05; waited=$((waited + 1)); done
+  [ -s "$work/$name.port" ] || { echo "FAIL the fixture $name did not start"; exit 1; }
+}
+start_extra_fixture busy-a "$work/busy-a.queue.json"
+busy_a_fixture_pid=$!
+start_extra_fixture busy-b "$work/busy-b.queue.json"
+busy_b_fixture_pid=$!
+url_a="http://127.0.0.1:$(cat "$work/busy-a.port")"
+url_b="http://127.0.0.1:$(cat "$work/busy-b.port")"
+server_url="$url_a" queue_file="$work/busy-a.queue.json" queue_one h-busy-a acme/app
+server_url="$url_b" queue_file="$work/busy-b.queue.json" queue_one h-busy-b acme/app
+# The first instance works slowly, so its repository lock is held for a while.
+timeout 120 env SRE_ONCE=1 SRE_SERVER_URL="$url_a" SRE_API_KEY="$runner_api_key" SRE_MODEL="$model" \
+  SRE_WORKSPACE="$workspace" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS="$run_timeout" \
+  SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha \
+  STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=6 STUB_OPENCODE_MEMORY=edit \
+  node "$runner" > "$work/busy-a.out" 2>&1 &
+busy_a_pid=$!
+waited=0
+while [ ! -e "$workspace/locks/acme/app.lock" ] && [ "$waited" -lt 400 ]; do sleep 0.05; waited=$((waited + 1)); done
+if [ -e "$workspace/locks/acme/app.lock" ]; then echo "ok   the first instance holds the repository's lock while it works"; else echo "FAIL the first instance took no lock: $(cat "$work/busy-a.out")"; fail=1; fi
+timeout 120 env SRE_ONCE=1 SRE_SERVER_URL="$url_b" SRE_API_KEY="$runner_api_key" SRE_MODEL="$model" \
+  SRE_WORKSPACE="$workspace" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS="$run_timeout" \
+  SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=beta SRE_LOCK_WAIT_SECONDS=1 \
+  STUB_OPENCODE_MODE=fix \
+  node "$runner" > "$work/busy-b.out" 2>&1 || rc=$?
+report_b="$(jq -c 'select(.path | endswith("/report")) | .body' "$work/busy-b.requests.jsonl" | tail -n 1)"
+wait "$busy_a_pid" || true
+report_a="$(jq -c 'select(.path | endswith("/report")) | .body' "$work/busy-a.requests.jsonl" | tail -n 1)"
+if jq -e '.outcome == "not_validated" and .evidence.busy_repository == "acme/app" and (.summary | test("acme/app") and test("another runner instance"))' <<<"$report_b" >/dev/null; then echo "ok   the second instance reports the repository as busy on another instance, and nothing else"; else echo "FAIL report_b: $report_b"; fail=1; fi
+if jq -e 'has("pr_url") | not' <<<"$report_b" >/dev/null && jq -e 'has("memory") | not' <<<"$report_b" >/dev/null; then echo "ok   the busy answer published nothing and touched no memory"; else echo "FAIL report_b published or saved: $report_b"; fail=1; fi
+if ! branch_exists sre-agent/h-busy-b; then echo "ok   nothing of the second instance reached the repository"; else echo "FAIL the second instance pushed a branch"; fail=1; fi
+if jq -e '.outcome == "not_validated" and .memory.changes[0].path == "acme/app/NOTES.md"' <<<"$report_a" >/dev/null 2>&1 && [ "$(tail -n 1 "$workspace/memory/acme/app/NOTES.md")" = "the pool ceiling is 40 on the primary" ]; then echo "ok   the first instance finished and saved its memory whole, after the second was refused"; else echo "FAIL report_a: $report_a memory: $(cat "$workspace/memory/acme/app/NOTES.md" 2>/dev/null)"; fail=1; fi
+if [ ! -e "$workspace/locks/acme/app.lock" ]; then echo "ok   the lock is gone once both requests have ended"; else echo "FAIL the lock file survived: $(cat "$workspace/locks/acme/app.lock")"; fail=1; fi
+# The two fixtures this case started are stopped here by the pids recorded
+# above, so the last check of the file finds nothing this test left running.
+kill "$busy_a_fixture_pid" "$busy_b_fixture_pid" 2>/dev/null || true
+wait "$busy_a_fixture_pid" 2>/dev/null || true
+wait "$busy_b_fixture_pid" 2>/dev/null || true
+
+echo "--- 52. a lock older than 45 minutes is stale, and the same instance takes its own lock back after a crash ---"
+start_fixture stale
+queue_one h-stale acme/app
+export STUB_OPENCODE_MODE=fix
+mkdir -p "$workspace/locks/acme"
+printf 'ghost 999999 2026-01-01T00:00:00.000Z\n' > "$workspace/locks/acme/app.lock"
+touch -d '46 minutes ago' "$workspace/locks/acme/app.lock"
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha run_once stale
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a lock 46 minutes old is taken over and the request runs"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if [ ! -e "$workspace/locks/acme/app.lock" ]; then echo "ok   the stale lock was replaced and released with the request"; else echo "FAIL the lock file survived"; fail=1; fi
+# A crash of this own instance: the lock names alpha and a pid that is gone, so
+# the next start of alpha takes it back rather than waiting out the bound.
+sleep 5 & ghost_pid=$!
+kill "$ghost_pid" 2>/dev/null || true
+wait "$ghost_pid" 2>/dev/null || true
+mkdir -p "$workspace/locks/acme"
+printf 'alpha %s %s\n' "$ghost_pid" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
+start_fixture crash
+queue_one h-crash acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once crash
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the same instance re-takes its own lock from a dead pid and runs"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+# The same instance with a pid that is alive is a lock that is live, not stale.
+printf 'alpha %s %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
+start_fixture crashlive
+queue_one h-crashlive acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once crashlive
+if jq -e '.evidence.busy_repository == "acme/app"' <<<"$report" >/dev/null; then echo "ok   a lock held by a live pid of the same instance is waited out honestly"; else echo "FAIL report: $report"; fail=1; fi
+rm -f "$workspace/locks/acme/app.lock"
+# What a hostile or broken hand leaves where a lock belongs is never read
+# through: a link and a FIFO both read as stale and are replaced.
+ln -s /etc/passwd "$workspace/locks/acme/app.lock"
+start_fixture locklink
+queue_one h-locklink acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once locklink
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ ! -e "$workspace/locks/acme/app.lock" ] && grep -q 'is not a lock file' "$out"; then echo "ok   a lock file that is a link is treated as stale and replaced"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+stop_fixture
+rm -f "$workspace/locks/acme/app.lock"
+mkfifo "$workspace/locks/acme/app.lock"
+start_fixture lockfifo
+queue_one h-lockfifo acme/app
+SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha SRE_LOCK_WAIT_SECONDS=0 run_once lockfifo
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ ! -e "$workspace/locks/acme/app.lock" ] && grep -q 'is not a lock file' "$out"; then echo "ok   a lock file that is a FIFO is treated as stale, not read, and replaced"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+rm -f "$workspace/locks/acme/app.lock"
+stop_fixture
+
+echo "--- 53. the poll body names the runner's instance, with the split off as well ---"
+start_fixture pollbody
+queue_none
+SRE_RUNNER_INSTANCE=gamma run_once pollbody
+body="$(jq -c 'select(.path | endswith("/api/fix-runner/queue")) | .body' "$fixture_log" | tail -n 1)"
+if [ "$(jq -r '.instance' <<<"$body")" = "gamma" ]; then echo "ok   SRE_RUNNER_INSTANCE names the instance in the poll body even with the split off"; else echo "FAIL poll body: $body"; fail=1; fi
+unset SRE_RUNNER_INSTANCE
+start_fixture polldefault
+queue_none
+run_once polldefault
+body="$(jq -c 'select(.path | endswith("/api/fix-runner/queue")) | .body' "$fixture_log" | tail -n 1)"
+if jq -e '(.instance | type == "string") and (.instance | length >= 1) and (.instance | length <= 100) and (.instance | test("^[A-Za-z0-9._-]+$"))' <<<"$body" >/dev/null; then echo "ok   with nothing configured the poll body carries the hostname as the instance id"; else echo "FAIL poll body: $body"; fail=1; fi
+stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token; do
