@@ -217,6 +217,15 @@ report=""
 
 start_fixture() {
   stop_fixture
+  # The brief every fixture serves is written once, at the top of the suite.
+  # A CI machine once lost it mid-suite and every fixture after that died on
+  # the first /brief request, so its presence is checked here: if it ever
+  # vanishes again, the failure names the cause instead of a socket hang up.
+  if [ ! -s "$brief_file" ]; then
+    echo "FAIL the brief file $brief_file vanished; the work directory holds:" >&2
+    ls -la "$work" >&2
+    exit 1
+  fi
   fixture_log="$work/$1.requests.jsonl"
   : > "$fixture_log"
   rm -f "$port_file"
@@ -1446,9 +1455,11 @@ SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE=alpha run_once stale
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a lock 46 minutes old is taken over and the request runs"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
 if [ ! -e "$workspace/locks/acme/app.lock" ]; then echo "ok   the stale lock was replaced and released with the request"; else echo "FAIL the lock file survived"; fail=1; fi
 # A crash of this own instance: the lock names alpha and a pid that is gone, so
-# the next start of alpha takes it back rather than waiting out the bound.
-sleep 5 & ghost_pid=$!
-kill "$ghost_pid" 2>/dev/null || true
+# the next start of alpha takes it back rather than waiting out the bound. The
+# pid is one that lived and finished on its own (no kill, no wait race): a
+# killed-before-waited job made bash print "No record of process" on CI, and the
+# moment anything in this window misbehaves the whole section is noise.
+sleep 0.3 & ghost_pid=$!
 wait "$ghost_pid" 2>/dev/null || true
 mkdir -p "$workspace/locks/acme"
 printf 'alpha %s %s\n' "$ghost_pid" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/acme/app.lock"
