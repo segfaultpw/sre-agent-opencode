@@ -20,7 +20,7 @@ const API_VERSION = '2022-11-28';
 const REQUEST_TIMEOUT_MS = 30_000;
 // A token is taken again when less than this remains, so a call that starts
 // now is never still running when the token it used expires.
-const TOKEN_MARGIN_MS = 5 * 60_000;
+const TOKEN_MARGIN_MS = 25 * 60_000;
 const TOKEN_LIFETIME_MS = 60 * 60_000;
 // The JWT is valid for nine minutes and issued a minute back, inside GitHub's
 // ten minute ceiling and ahead of any clock skew.
@@ -96,7 +96,12 @@ function createProvider({ appId, privateKey, baseUrl = DEFAULT_API_BASE, now = D
   async function installationId(owner, repo) {
     if (owner === null || owner === undefined) {
       if (installations.has(ESTATE_KEY)) return installations.get(ESTATE_KEY);
-      const list = (await apiCall('GET', '/app/installations')) || [];
+      const list = [];
+      for (let page = 1; page <= 10; page += 1) {
+        const batch = (await apiCall('GET', `/app/installations?per_page=100&page=${page}`)) || [];
+        list.push(...batch);
+        if (batch.length < 100) break;
+      }
       const sorted = [...list].sort((a, b) => a.id - b.id);
       const first = sorted[0];
       if (!first) throw new Error('the GitHub App has no installation, so no token can be minted for a request that names no repository');
@@ -128,7 +133,7 @@ function createProvider({ appId, privateKey, baseUrl = DEFAULT_API_BASE, now = D
   async function agentToken(owner, repo) {
     const id = await installationId(owner, repo);
     const body = { permissions: { contents: 'read' } };
-    if (repo) body.repositories = [{ name: repo }];
+    if (repo) body.repositories = [repo];
     const minted = await apiCall('POST', `/app/installations/${id}/access_tokens`, body);
     return minted.token;
   }

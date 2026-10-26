@@ -2988,7 +2988,7 @@ async function handleJob(config, job) {
     }
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
-    if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors;
+    if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors.map(redact);
 
     if (!agentProcessesEnded) {
       // A process of the agent's account outlived every attempt to end it. It

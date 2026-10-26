@@ -68,8 +68,11 @@ function githubStandIn() {
         if (!id) return sendJson(404, { message: 'Not Found' });
         return sendJson(200, { id, account: { login: state.accountLogins[install[1]] || install[1] } });
       }
-      if (request.method === 'GET' && request.url === '/app/installations') {
-        return sendJson(200, state.installationsList);
+      const installList = request.method === 'GET' && /^\/app\/installations/.exec(request.url);
+      if (installList) {
+        // Page two is empty: a short page ends the runner's walk.
+        const page = Number.parseInt(new URL(request.url, 'https://api.github.com').searchParams.get('page') || '1', 10);
+        return sendJson(200, page > 1 ? [] : state.installationsList);
       }
       const mint = /^\/app\/installations\/(\d+)\/access_tokens$/.exec(request.url);
       if (request.method === 'POST' && mint) {
@@ -159,7 +162,7 @@ function claimsOf(jwt) {
     const provider = wrap.make(app);
     await provider.runnerToken('acme', 'app');
     app.state.mintAnswer[501] = { token: 'ghs_runner-501-second', expires_at: 'in-an-hour' };
-    wrap.clock.nowMs += 56 * 60_000; // past expires_at minus the five minute margin
+    wrap.clock.nowMs += 36 * 60_000; // past expires_at minus the 25 minute margin (a minted token must outlive the push and the pull-request call, each bounded at ten minutes)
     const second = await provider.runnerToken('acme', 'app');
     assert.equal(second, 'ghs_runner-501-second', 'the second call mints again');
     assert.equal(app.seen.filter((r) => /access_tokens$/.test(r.path)).length, 2);
@@ -176,7 +179,7 @@ function claimsOf(jwt) {
     assert.notEqual(agentToken, runnerToken);
     const mints = app.seen.filter((r) => /access_tokens$/.test(r.path));
     const agentMint = mints.find((r) => r.body && r.body.permissions);
-    assert.deepEqual(agentMint.body, { permissions: { contents: 'read' }, repositories: [{ name: 'app' }] });
+    assert.deepEqual(agentMint.body, { permissions: { contents: 'read' }, repositories: ['app'] });
     const runnerMint = mints.find((r) => !r.body);
     assert.equal(runnerMint.body, null, 'the runner mint asks for the installation own permissions');
     app.server.close();

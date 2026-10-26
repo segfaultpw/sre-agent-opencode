@@ -102,8 +102,10 @@ const server = http.createServer((request, response) => {
 
     if (request.method === 'GET' && url.pathname === '/app/installations') {
       // Deliberately not sorted by id: the runner must pick the first by id,
-      // not the first in the answer.
-      send(response, 200, [
+      // not the first in the answer. Page two is empty, which is how GitHub
+      // ends the walk: a short page means no more.
+      const page = Number.parseInt(url.searchParams.get('page') || '1', 10);
+      send(response, 200, page > 1 ? [] : [
         { id: 9002, account: { login: 'zeta' } },
         { id: installationId, account: { login: owner } },
       ]);
@@ -119,6 +121,16 @@ const server = http.createServer((request, response) => {
       if (Number.parseInt(mintMatch[1], 10) !== installationId) {
         send(response, 404, { message: 'Not Found' });
         return;
+      }
+      // GitHub types the downscope body strictly: `repositories` is an array
+      // of name strings, so the fixture refuses the object shape the real API
+      // would answer with 422 (a green suite once hid exactly that).
+      if (body && body.repositories !== undefined) {
+        const valid = Array.isArray(body.repositories) && body.repositories.every((name) => typeof name === 'string');
+        if (!valid) {
+          send(response, 422, { message: 'repositories must be an array of name strings' });
+          return;
+        }
       }
       const scoped = Boolean(body && body.permissions);
       send(response, 201, {
