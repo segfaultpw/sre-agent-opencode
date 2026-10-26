@@ -40,6 +40,24 @@ const HTTP_TIMEOUT_MS = 30_000;
 const DISABLED_POLL_MS = 60_000;
 const RUNNER_DISABLED_CODE = 'runner_disabled';
 
+// The leases on the shared memory tree of a pool of runners, taken only with
+// SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
+// so with the split off nothing changes, lock files included). A lock names
+// the instance, the process and the moment it was taken; a holder silent past
+// the stale bound is assumed gone. The bound is at least 45 minutes and always
+// above SRE_RUN_TIMEOUT_SECONDS plus a cleanup margin, so a slow but live run
+// (a raised timeout) never has its lock read stale. A live one is polled for
+// once a second and waited for at most SRE_LOCK_WAIT_SECONDS.
+const LOCK_STALE_MS = 45 * 60 * 1000;
+// What the run's own cleanup may take past its time bound before another
+// instance is allowed to conclude nobody is coming back.
+const LOCK_STALE_MARGIN_MS = 10 * 60 * 1000;
+// "<instance up to 100> <pid> <iso time>\n" fits in far less than this; the
+// bound is what makes an oversized file read as stale rather than read whole.
+const LOCK_CONTENT_MAX_BYTES = 256;
+const LOCK_POLL_MS = 1_000;
+const LOCK_WAIT_SECONDS = 60;
+
 // A git or gh call that hangs would wedge the runner for ever, so every child
 // has a bound. Only the agent's is the operator's to set.
 const PROCESS_TIMEOUT_MS = 600_000;
@@ -293,11 +311,39 @@ function loadConfig() {
     throw fatal(error.message);
   }
 
+  // The pool split, the one decision the runner, the mirror and the memory
+  // tree share (memory.split). Read here so a SRE_MEMORY_ROOT the runner
+  // cannot use refuses the start with its sentence, and so the agent's
+  // per-repository homes follow this instance under instances/ from the first
+  // job rather than changing directories half way through a poll.
+  let layout;
+  try {
+    layout = memory.split(process.env);
+  } catch (error) {
+    throw fatal(error.message);
+  }
+  const lockWaitSeconds = Number.parseInt(process.env.SRE_LOCK_WAIT_SECONDS || String(LOCK_WAIT_SECONDS), 10);
+  if (!Number.isFinite(lockWaitSeconds) || lockWaitSeconds < 0) {
+    throw fatal('SRE_LOCK_WAIT_SECONDS must be zero or a positive whole number of seconds');
+  }
+  const identity = loadIdentity(process.env, { uid: process.getuid(), gid: process.getgid() });
+  if (layout.perInstance && identity.agent) {
+    identity.agent = { ...identity.agent, home: layout.agentHome };
+  }
+
   return {
     serverUrl: process.env.SRE_SERVER_URL.replace(/\/+$/, ''),
     apiKey: process.env.SRE_API_KEY,
     model: process.env.SRE_MODEL,
     workspace: process.env.SRE_WORKSPACE || '/workspace',
+    // Where this instance works and where the memory lives: the split above.
+    layout,
+    instance: layout.instance,
+    lockWaitMs: lockWaitSeconds * 1000,
+    // At least 45 minutes, and above the run timeout plus its margin, so the
+    // staleness rule can never steal the lock of a run that is still inside
+    // SRE_RUN_TIMEOUT_SECONDS or cleaning up after it.
+    lockStaleMs: Math.max(LOCK_STALE_MS, timeoutSeconds * 1000 + LOCK_STALE_MARGIN_MS),
     // {bucket, prefix}; bucket is '' when the operator configured none.
     memoryBucket,
     githubToken: process.env.SRE_GITHUB_TOKEN || '',
@@ -311,7 +357,7 @@ function loadConfig() {
     // Only the exact value 1 opts in. The module's agent_aws_access variable
     // sets it, and a typo must leave the agent without the task role.
     agentAwsAccess: process.env.SRE_AGENT_AWS_ACCESS === '1',
-    identity: loadIdentity(process.env, { uid: process.getuid(), gid: process.getgid() }),
+    identity,
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
   };
@@ -519,17 +565,27 @@ function bucketSettings(config) {
   const chosen = config.memoryBucket;
   if (!chosen || !chosen.bucket) return null;
   if (!config.memoryState) config.memoryState = {};
-  const workspace = path.resolve(config.workspace);
+  // The three state files and the restore staging live beside the memory root
+  // and the aws calls run there, all from the split (memory.split): with
+  // SRE_MEMORY_ROOT moved off the workspace the journal follows the memory it
+  // describes, and the staging stays on the memory root's own file system.
+  const base = config.layout.stateBase;
   return {
     bucket: chosen.bucket,
     prefix: chosen.prefix,
-    workspace,
+    workspace: base,
+    memoryRoot: config.layout.memory,
     deadlineMs: chosen.deadlineMs,
     state: config.memoryState,
+    // Held around each journal read-modify-write and each marker write, never
+    // across an aws call: a pool shares the journal and the markers, so one
+    // instance's save must never clobber another's. The mirror stops with an
+    // honest error when the lock cannot be had, and the paths stay pending.
+    mutex: (run) => withStateLock(config, run, 'the mirror shared state write'),
     log,
     own: ownByRunner,
     run: async (command, args, options = {}) => {
-      const result = await runProcess(command, args, { cwd: workspace, env: awsEnv(), as: 'runner', timeoutMs: options.timeoutMs });
+      const result = await runProcess(command, args, { cwd: base, env: awsEnv(), as: 'runner', timeoutMs: options.timeoutMs });
       return { ...result, stdout: redact(result.stdout), stderr: redact(result.stderr) };
     },
   };
@@ -647,12 +703,23 @@ function switchedOff(body) {
 
 async function poll(config) {
   const url = `${config.serverUrl}/api/fix-runner/queue`;
+  // The poll still names the queue the same way; it now carries this runner's
+  // instance id, so the platform can lease the job to this instance alone. A
+  // GET with a body is what the wire contract says, and the length is spelled
+  // out so the body is framed whatever the platform reads it with.
+  const body = JSON.stringify({ instance: config.instance });
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
     let failure = '';
     try {
       response = await httpRequest(url, {
-        headers: { Authorization: `Bearer ${config.apiKey}`, Accept: 'application/json' },
+        headers: {
+          Authorization: `Bearer ${config.apiKey}`,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+          'Content-Length': String(Buffer.byteLength(body)),
+        },
+        body,
         timeoutMs: POLL_REQUEST_TIMEOUT_MS,
       });
     } catch (error) {
@@ -791,6 +858,22 @@ function resetGitDir(gitDir, cleanUrl) {
     { flag: 'wx' }
   );
   ownByRunner(configPath);
+}
+
+function safeEntries(dir) {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+function statOrNull(target) {
+  try {
+    return fs.lstatSync(target);
+  } catch {
+    return null;
+  }
 }
 
 function ownByRunner(target) {
@@ -997,6 +1080,220 @@ function writeAgentGitconfig(home) {
     fs.fchownSync(fd, identity.agent.uid, identity.agent.gid);
   } finally {
     fs.closeSync(fd);
+  }
+}
+
+// The leases on the shared memory tree of a pool (the constants above say when
+// one is stale and how long a live one is waited for). They are ordinary files
+// on the volume, written by the runners alone, and read with the discipline
+// every file a writable tree can hold gets: never followed, never blocked,
+// size-bounded, so a symlink, a FIFO, an oversized file or a directory reads
+// as stale and is unlinked, never opened through.
+//
+//   locks/<owner>/<repo>.lock   one repository's memory and its agent homes
+//   locks/_estate.lock          the same, for requests naming no repository
+//   locks/_state.lock           the mirror's state files beside the memory
+//
+// A lock names this instance, this process and the moment it was taken, so a
+// pool can tell a live holder from a dead one: 45 minutes of silence means
+// gone, and this instance's own lock with a dead pid is its own crash, taken
+// back at once rather than waited out.
+function repoLockPath(laid, repo) {
+  return repo ? path.join(laid.locks, repo.owner, `${repo.name}.lock`) : path.join(laid.locks, '_estate.lock');
+}
+
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM names a process of another account, which is alive all the same.
+    return error.code === 'EPERM';
+  }
+}
+
+// {state: 'absent' | 'bad' | 'unreadable' | 'ok', mtimeMs, takenMs, instance, pid}
+// for a lock file. 'bad' is a shape no lock this runner ever writes: a link, a
+// FIFO, a directory, an oversized file, or one whose instance, pid or timestamp
+// does not parse (the window between a crash and the write, a partial write on a
+// full volume), and it is replaced at once rather than waited out. 'unreadable'
+// is a file this account cannot open at all (a mixed-uid pool), which is
+// neither replaceable (unlink would fail the same way) nor readable, so it is
+// waited for like a live lock and reported as busy when it never clears.
+function readHeldLock(file) {
+  const flags = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
+  let fd;
+  try {
+    fd = fs.openSync(file, flags);
+  } catch (error) {
+    if (error.code === 'ENOENT') return { state: 'absent' };
+    if (error.code === 'ELOOP' || error.code === 'ENOTDIR') return { state: 'bad' };
+    return { state: 'unreadable', reason: error.code || 'unreadable' };
+  }
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size > LOCK_CONTENT_MAX_BYTES) return { state: 'bad' };
+    const content = Buffer.alloc(stat.size);
+    let read = 0;
+    while (read < stat.size) {
+      const count = fs.readSync(fd, content, read, stat.size - read, read);
+      if (count === 0) break;
+      read += count;
+    }
+    const [named, numbered, stamped] = content.toString('utf8', 0, read).trim().split(/\s+/);
+    const taken = Date.parse(stamped || '');
+    const instance = /^[A-Za-z0-9._-]{1,100}$/.test(named) ? named : null;
+    const pid = /^[0-9]+$/.test(numbered || '') ? Number.parseInt(numbered, 10) : null;
+    if (instance === null || pid === null || !Number.isFinite(taken)) return { state: 'bad' };
+    return {
+      state: 'ok',
+      mtimeMs: stat.mtimeMs,
+      takenMs: taken,
+      instance,
+      pid,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Leftovers of a crash between the write and the link: a temporary lock is
+// never read, never linked, and worth nothing once its writer is gone, so the
+// sweep keeps the directory tidy without ever touching the lock itself.
+function sweepLockTemps(dir, staleMs) {
+  for (const name of fs.readdirSync(dir)) {
+    if (!/^\.lock-\d+-[0-9a-f]+\.tmp$/.test(name)) continue;
+    const temp = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.lstatSync(temp);
+    } catch {
+      continue;
+    }
+    if (Date.now() - stat.mtimeMs <= staleMs) continue;
+    fs.rmSync(temp, { force: true });
+  }
+}
+
+// Takes `file` for this instance, or returns what it found still holding it
+// after the bound. A stale file is replaced; a live one is polled once a
+// second until the bound runs out. The directory above the lock is the
+// runner's own, settled like every other directory of its layout.
+async function acquireLock(file, options = {}) {
+  const instance = options.instance || memory.DEFAULT_INSTANCE;
+  const deadline = Date.now() + (options.waitMs === undefined ? LOCK_WAIT_SECONDS * 1000 : options.waitMs);
+  // The mtime is the only staleness clock: the file system stamps it, so a
+  // writer whose clock is skewed cannot have a just-taken lock read stale, and
+  // the written timestamp stays what the log names.
+  const staleMs = options.staleMs === undefined ? LOCK_STALE_MS : options.staleMs;
+  let warnedUnreadable = false;
+  settleDir(path.dirname(file), 0o700);
+  // Both levels: a repository lock sits in <locks>/<owner>/ and its temporary,
+  // like every other lock's, lands in the locks root beside _state.lock.
+  sweepLockTemps(path.dirname(file), staleMs);
+  sweepLockTemps(path.dirname(path.dirname(file)), staleMs);
+  for (;;) {
+    // The lock appears whole or not at all: written to a private temporary and
+    // linked into place, so no reader ever observes this runner mid-write and
+    // a lock whose content does not parse is always a crash or a poison file,
+    // never a writer to be stolen from. The link fails with EEXIST when the
+    // lock is already held, which is the answer the open used to give.
+    const temp = path.join(path.dirname(file), `.lock-${process.pid}-${crypto.randomBytes(8).toString('hex')}.tmp`);
+    try {
+      const fd = fs.openSync(temp, 'wx', 0o600);
+      try {
+        fs.writeSync(fd, `${instance} ${process.pid} ${new Date().toISOString()}\n`);
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      try {
+        fs.linkSync(temp, file);
+        return { ok: true, file, instance };
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+    } finally {
+      fs.rmSync(temp, { force: true });
+    }
+    const held = readHeldLock(file);
+    if (held.state === 'absent') continue;
+    const ageMs = (from) => (from === null || from === undefined ? null : Date.now() - from);
+    const mtimeAge = ageMs(held.mtimeMs);
+    const silent = (age) => age !== null && age > staleMs;
+    if (held.state === 'bad') {
+      log('warn', `the lock ${file} is not a lock file (a link, a special file or an unreadable half-written one was left in its place), so it was replaced`);
+    } else if (held.state === 'unreadable') {
+      if (!warnedUnreadable) {
+        log('warn', `the lock ${file} could not be read (${held.reason}), so it is waited for; another account owns it`);
+        warnedUnreadable = true;
+      }
+      if (Date.now() >= deadline) return { ok: false, file, holder: held };
+      await sleep(Math.min(LOCK_POLL_MS, Math.max(0, deadline - Date.now())));
+      continue;
+    } else if (silent(mtimeAge)) {
+      const minutes = Math.max(1, Math.round(staleMs / 60_000));
+      log('warn', `the lock ${file} was held by instance ${held.instance || 'unknown'} (pid ${held.pid || 'unknown'}, taken ${new Date(held.takenMs).toISOString()}) more than ${minutes} minutes ago, so it is assumed gone and was replaced`);
+    } else if (held.instance === instance && !pidIsAlive(held.pid)) {
+      log('info', `the lock ${file} was left by this instance's own pid ${held.pid || 'unknown'}, which is gone, so it was taken back`);
+    } else {
+      if (Date.now() >= deadline) return { ok: false, file, holder: held };
+      await sleep(Math.min(LOCK_POLL_MS, Math.max(0, deadline - Date.now())));
+      continue;
+    }
+    fs.rmSync(file, { force: true });
+  }
+}
+
+// Removes a lock this process holds, and only that one: a lock replaced by
+// another instance after 45 minutes is theirs to release, not this one's to
+// unlink. An absent lock is nothing (the release already ran).
+function releaseLock(lock) {
+  if (!lock || !lock.ok || !lock.file) return;
+  const held = readHeldLock(lock.file);
+  if (held.state === 'absent') return;
+  if (held.state === 'ok' && held.instance === lock.instance && held.pid === process.pid) {
+    fs.rmSync(lock.file, { force: true });
+    return;
+  }
+  log('warn', `the lock ${lock.file} was taken over by instance ${held.instance || 'unknown'} while this run held it, so it was left alone`);
+}
+
+// The repository's lease for one request: taken once the repository is known
+// and before any work is spent on it, so a busy repository is answered before
+// a checkout is made. Held until the memory is saved and the agent's home is
+// this runner's again, which the caller's release after the run's cleanup does.
+// Only a pool leases; a single runner owns the workspace and takes nothing.
+async function acquireRepoLease(config, repo) {
+  if (!config.layout.perInstance) return null;
+  const file = repoLockPath(config.layout, repo);
+  const lock = await acquireLock(file, { instance: config.layout.instance, waitMs: config.lockWaitMs, staleMs: config.lockStaleMs });
+  if (lock.ok) return lock;
+  log('warn', `${repo ? repo.fullName : 'the estate notes'} are being worked on by another runner instance (${lock.holder.instance || 'unknown'}, pid ${lock.holder.pid || 'unknown'}); this request reports that it was not run`);
+  return { busy: lock.holder, file };
+}
+
+// _state.lock, around the writes to the mirror's shared state: the restore,
+// its retry and the first sync each write the three state files beside the
+// memory root, and in a pool those are one set of files. A wait that runs out
+// skips the operation with a sentence: all three are things the next request
+// tries again by design, so a held lock delays nothing that cannot wait.
+async function withStateLock(config, run, what) {
+  if (!config.layout.perInstance) return run();
+  const lock = await acquireLock(path.join(config.layout.locks, '_state.lock'), {
+    instance: config.layout.instance,
+    waitMs: config.lockWaitMs,
+    staleMs: config.lockStaleMs,
+  });
+  if (!lock.ok) {
+    log('warn', `the shared memory state lock is held by instance ${lock.holder.instance || 'unknown'}, so ${what} was not tried now and the next request tries it again`);
+    return null;
+  }
+  try {
+    return await run();
+  } finally {
+    releaseLock(lock);
   }
 }
 
@@ -1235,13 +1532,51 @@ async function reclaim(dir, home) {
 // 0711 and the runner's state is 0700, whoever created it: the migration moves
 // clones with a directory per owner above them, and an older runner created
 // everything for its one account.
+// Like settleDir, but the directory is REFUSED rather than adopted when another
+// account owns it: the locks and the directory they sit in decide who may work
+// on a repository, so they must be this runner's own in every identity mode.
+function ensureOwnedDirectory(dir, mode) {
+  const existed = fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) throw new Error(`${dir} is not a directory`);
+  // The runner ACCOUNT, not the process: a root start makes and chowns the
+  // workspace to the runner's uid on purpose, so that is the owner the locks
+  // must have. Only a directory that was already there can be somebody
+  // else's; one this process just made is adopted and chowned to the runner.
+  const owner = identity.runner && Number.isInteger(identity.runner.uid) ? identity.runner : { uid: process.getuid(), gid: process.getgid() };
+  if (existed && (stat.uid !== owner.uid || stat.gid !== owner.gid)) {
+    throw new Error(
+      `${dir} is owned by uid ${stat.uid}, not by the runner account (uid ${owner.uid}), so its locks would not be this runner's to trust; point SRE_MEMORY_ROOT at a directory this account owns`,
+    );
+  }
+  ownByRunner(dir);
+  fs.chmodSync(dir, mode);
+}
+
 async function settleWorkspace(config) {
   settleRunnerHome();
+  const lay = config.layout;
+  if (lay.perInstance) {
+    // The locks guard the shared memory tree, so they live beside it and every
+    // directory on the way to them is this account's own, whatever
+    // SRE_MEMORY_ROOT points at: a locks directory another account created is
+    // one whose locks it can forge or remove, and the runner refuses to work
+    // rather than trust it. Checked in every identity mode, because the pool
+    // leases even when the account split is off.
+    ensureOwnedDirectory(path.dirname(lay.locks), 0o711);
+    ensureOwnedDirectory(lay.locks, 0o700);
+  }
   if (identity.mode === 'none') return;
   closeAllAgentHomes();
-  const base = path.resolve(config.workspace);
-  const lay = memory.layout(base);
-  settleDir(base, 0o711);
+  settleDir(lay.workspace, 0o711);
+  if (lay.perInstance) {
+    // The instance's own directories sit under instances/<id>, which the agent
+    // walks through to reach its checkout: the two directories above it are
+    // 0711 like the ones above a checkout in the flat layout, never listed.
+    settleDir(path.dirname(lay.instanceDir), 0o711);
+    settleDir(lay.instanceDir, 0o711);
+  }
   settleDir(lay.repos, 0o711);
   for (const owner of fs.readdirSync(lay.repos)) {
     const ownerDir = path.join(lay.repos, owner);
@@ -1266,6 +1601,26 @@ async function settleWorkspace(config) {
       fs.chmodSync(gitDir, 0o700);
     }
   }
+  // The context clones: the parents walk through like the ones above a
+  // checkout (0711, never listable), each clone is re-owned, and the git
+  // directory inside each is re-closed like a gitdir, so a clone left by an
+  // earlier release or a refresh that died part way cannot sit open.
+  settleDir(lay.context, 0o711);
+  for (const owner of safeEntries(lay.context)) {
+    const ownerDir = path.join(lay.context, owner);
+    const ownerStat = statOrNull(ownerDir);
+    if (!ownerStat || !ownerStat.isDirectory()) continue;
+    settleDir(ownerDir, 0o711);
+    for (const name of safeEntries(ownerDir)) {
+      const clone = path.join(ownerDir, name);
+      const stat = statOrNull(clone);
+      if (!stat || !stat.isDirectory()) continue;
+      ownByRunner(clone);
+      const gitDir = path.join(clone, '.git');
+      const gitStat = statOrNull(gitDir);
+      if (gitStat && gitStat.isDirectory()) fs.chmodSync(gitDir, 0o700);
+    }
+  }
   settleDir(lay.memory, 0o700);
   settleDir(lay.scratch, 0o700);
   await chownTree(lay.memory, 'runner');
@@ -1282,7 +1637,7 @@ async function prepareCheckout(config, job, repo) {
     throw new Error('this request names a repository and the runner has no SRE_GITHUB_TOKEN to reach it with');
   }
   const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
-  const lay = memory.layout(config.workspace);
+  const lay = config.layout;
   const dir = path.join(lay.repos, repo.owner, repo.name);
   const gitdir = path.join(lay.gitdirs, repo.owner, repo.name);
   const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, cleanUrl, baseSha: null };
@@ -1389,11 +1744,135 @@ async function prepareCheckout(config, job, repo) {
   return workspace;
 }
 
+// The integration's context repository (the job's context_repo_full_name, null
+// when the organization set none, on every test job, and on a platform older
+// than the key): the organization's own patterns, cloned beside the checkout
+// under context/<owner>/<repo> so the agent can read them as reference
+// material. The platform's brief is what points the agent at the path; this
+// runner guarantees the clone is there, at exactly that relative location.
+//
+// It sits OUTSIDE the request's checkout, so nothing in it is ever staged,
+// gated or pushed: staging works on the checkout's tree alone. It is never a
+// fix target. Best effort on purpose: a context repository that cannot be
+// reached, or a refresh that fails, names itself in the report's evidence and
+// the request runs anyway, because the fix does not depend on it.
+const CONTEXT_ERROR_MAX = 300;
+
+async function prepareContextRepo(config, job) {
+  const named = typeof job.context_repo_full_name === 'string' ? job.context_repo_full_name.trim() : '';
+  if (!named) return null;
+  const failure = (message) => ({ fullName: named, error: oneLine(redact(message), CONTEXT_ERROR_MAX) });
+  let repo;
+  try {
+    repo = parseRepo(named);
+  } catch (error) {
+    return failure(error.message);
+  }
+  if (!config.githubToken) {
+    return failure(`${repo.fullName} could not be read: this organization set a context repository and the runner has no SRE_GITHUB_TOKEN to reach it with`);
+  }
+  const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
+  const dir = path.join(config.layout.context, repo.owner, repo.name);
+  try {
+    // The default branch is asked for the way a checkout's is, so the clone and
+    // every refresh follow the repository's own head rather than a name baked
+    // in when the clone was made.
+    const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', cleanUrl, 'HEAD'], {
+      env: gitAuthEnv(config.githubToken),
+    });
+    if (symref.code !== 0) {
+      throw new Error(`${repo.fullName} could not be read: ${(symref.stderr || symref.stdout).trim()}`);
+    }
+    const defaultBranch = (/^ref:\s+refs\/heads\/(\S+)/m.exec(symref.stdout) || [])[1];
+    if (!defaultBranch) throw new Error(`${repo.fullName} did not name a default branch`);
+    settleDir(config.layout.context, 0o711);
+    settleDir(path.dirname(dir), 0o711);
+    const lstatOrNull = (target) => {
+      try {
+        return fs.lstatSync(target);
+      } catch {
+        return null;
+      }
+    };
+    // What is already there is a clone this runner made, or it is not
+    // reference material at all: a file, a link or a half-made clone is
+    // removed and cloned again, never adopted.
+    const existing = lstatOrNull(dir);
+    const reusable = Boolean(existing && existing.isDirectory() && lstatOrNull(path.join(dir, '.git')));
+    let action;
+    if (!reusable) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await git(['clone', cleanUrl, dir], { token: config.githubToken });
+      action = 'cloned';
+    } else {
+      settleDir(dir, 0o755);
+      action = 'refreshed';
+    }
+    // The same reused-clone discipline as the checkout's: the config and
+    // everything git could run from the git directory are rewritten before the
+    // runner's git touches it, whatever an earlier moment left there.
+    resetGitDir(path.join(dir, '.git'), cleanUrl);
+    if (reusable) {
+      // The git directory and the work tree are named, never discovered, the
+      // way the checkout's calls name both.
+      const inContext = [`--git-dir=${path.join(dir, '.git')}`, `--work-tree=${dir}`];
+      await git([...inContext, 'fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir, token: config.githubToken });
+      await git([...inContext, 'reset', '--hard', `refs/remotes/origin/${defaultBranch}`], { cwd: dir });
+    }
+    // The git directory is closed like the gitdirs, whatever umask made the
+    // clone: one from a start without the account split would otherwise stay
+    // open to the agent's account after an upgrade. Closed BEFORE the tree is
+    // opened: a chmod that cannot finish must not leave the readable half of a
+    // clone behind.
+    const closed = await runProcess('chmod', ['-R', 'go-rwx', path.join(dir, '.git')]);
+    if (closed.code !== 0) {
+      throw new Error(`${repo.fullName}: its clone's git directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
+    }
+    openContextTree(dir);
+    return { fullName: repo.fullName, dir, defaultBranch, action };
+  } catch (error) {
+    // Nothing a later request would adopt: a half-made clone is removed, so
+    // the next one starts clean and reports honestly rather than refreshing a
+    // tree whose shape nobody guaranteed.
+    fs.rmSync(dir, { recursive: true, force: true });
+    return failure(error.message);
+  }
+}
+
+// The clone is the runner's own tree: the agent's account reads it and never
+// writes it. The umask gives the runner's files 0600 and its directories 0700,
+// so after the clone and after every refresh each directory below the clone is
+// opened to 0755 and each regular file to 0644. The git directory stays closed,
+// like the gitdirs: the agent needs the patterns, not the plumbing. Links and
+// other non-regular files are left alone and never followed.
+function openContextTree(dir) {
+  if (identity.mode === 'none') return;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let stat = null;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      continue;
+    }
+    if (stat.isDirectory()) {
+      fs.chmodSync(current, 0o755);
+      for (const name of fs.readdirSync(current)) {
+        if (name === '.git') continue;
+        stack.push(path.join(current, name));
+      }
+    } else if (stat.isFile()) {
+      fs.chmodSync(current, 0o644);
+    }
+  }
+}
+
 function prepareScratch(config) {
   // One fixed directory rather than one per handoff: an untargeted answer has
   // nothing to publish, so the only reason to keep it is for the operator to
   // read the last one, and a directory per request would grow without bound.
-  const dir = memory.layout(config.workspace).scratch;
+  const dir = config.layout.scratch;
   fs.rmSync(dir, { recursive: true, force: true });
   settleDir(dir, 0o700);
   return { dir, gitdir: null, repo: null, branch: null, defaultBranch: null, cleanUrl: null };
@@ -1481,7 +1960,7 @@ function memoryBlock(mem) {
 }
 
 function openMemory(config, workspace, repo) {
-  const source = memory.memoryDir(config.workspace, repo ? { owner: repo.owner, name: repo.name } : null);
+  const source = memory.memoryDirIn(config.layout.memory, repo ? { owner: repo.owner, name: repo.name } : null);
   const copy = path.join(workspace.dir, MEMORY_COPY);
   fs.rmSync(copy, { recursive: true, force: true });
 
@@ -1502,7 +1981,7 @@ function openMemory(config, workspace, repo) {
   return {
     label,
     subject: repo ? `the repository ${repo.fullName}` : 'requests that name no repository',
-    prefix: path.relative(memory.layout(config.workspace).memory, source),
+    prefix: path.relative(config.layout.memory, source),
     source,
     copy,
     before,
@@ -2137,13 +2616,32 @@ function testSummary(config, steps, failed) {
   return `Test job finished: the ${failed.name} step failed (${failed.detail})${tail}.`;
 }
 
+// The repository's lease for a test job's marker steps, with a busy answer
+// that says so rather than a wedge: the marker is skipped, the step fails with
+// this sentence, and nothing of another instance's run is touched. The same
+// lease the fix path takes, because the marker lands in the same memory tree.
+async function testRepoLease(config, repo) {
+  if (!config.layout.perInstance) return { ok: true, file: null };
+  const lock = await acquireLock(repoLockPath(config.layout, repo), {
+    instance: config.layout.instance,
+    waitMs: config.lockWaitMs,
+    staleMs: config.lockStaleMs,
+  });
+  return lock.ok ? lock : { ok: false, holder: lock.holder };
+}
+
+function testBusyDetail(holder, repo) {
+  const whose = repo ? repo.fullName : 'the estate notes';
+  return `another runner instance (${holder.instance || 'unknown'}, pid ${holder.pid || 'unknown'}) is working on ${whose}, so the marker was not written`;
+}
+
 async function runTestJob(config, job) {
   const result = newResult(config);
   result.test = [];
   let failed = null;
   let repo = null;
-  const memoryRoot = memory.layout(config.workspace).memory;
-  const memoryDirectory = () => memory.memoryDir(config.workspace, repo ? { owner: repo.owner, name: repo.name } : null);
+  const memoryRoot = config.layout.memory;
+  const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
   const step = async (name, run) => {
     if (failed) {
@@ -2201,20 +2699,23 @@ async function runTestJob(config, job) {
     });
 
     await step('memory', async () => {
-      const dir = memoryDirectory();
-      const label = path.relative(memoryRoot, dir);
-      const created = makeTrackedDirectories(memoryRoot, dir);
-      const marker = path.join(dir, TEST_MARKER);
+      const lease = await testRepoLease(config, repo);
+      if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
+      let dir;
+      let created;
       try {
+        dir = memoryDirectory();
+        created = makeTrackedDirectories(memoryRoot, dir);
+        const marker = path.join(dir, TEST_MARKER);
         writeTestMarker(marker);
         fs.rmSync(marker);
       } catch (error) {
-        return { ok: false, detail: `could not write and remove ${TEST_MARKER} in memory/${label}: ${error.code || error.message}` };
+        return { ok: false, detail: `could not write and remove ${TEST_MARKER} in memory/${path.relative(memoryRoot, dir || memoryRoot)}: ${error.code || error.message}` };
       } finally {
-        fs.rmSync(marker, { force: true });
-        removeTrackedDirectories(created);
+        if (created) removeTrackedDirectories(created);
+        releaseLock(lease);
       }
-      return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${label} and removed it again` };
+      return { ok: true, detail: `wrote ${TEST_MARKER} in memory/${path.relative(memoryRoot, dir)} and removed it again` };
     });
 
     // Judged on the marker's own put and removal, never on the journal: what
@@ -2223,17 +2724,23 @@ async function runTestJob(config, job) {
     await step('bucket', async () => {
       const settings = bucketSettings(config);
       if (!settings) return { ok: true, detail: 'no bucket configured' };
-      const dir = memoryDirectory();
-      const label = path.relative(memoryRoot, dir);
-      const marker = path.join(dir, TEST_MARKER);
-      const created = makeTrackedDirectories(memoryRoot, dir);
+      const lease = await testRepoLease(config, repo);
+      if (!lease.ok) return { ok: false, detail: testBusyDetail(lease.holder, repo) };
+      let dir;
+      let created;
       let answer;
+      let label;
       try {
+        dir = memoryDirectory();
+        label = path.relative(memoryRoot, dir);
+        created = makeTrackedDirectories(memoryRoot, dir);
+        const marker = path.join(dir, TEST_MARKER);
         writeTestMarker(marker);
         answer = await bucket.probe(settings, label, marker);
-      } finally {
         fs.rmSync(marker, { force: true });
-        removeTrackedDirectories(created);
+      } finally {
+        if (created) removeTrackedDirectories(created);
+        releaseLock(lease);
       }
       if (!answer.ok) return { ok: false, detail: answer.error };
       return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/ and removed it again` };
@@ -2267,6 +2774,10 @@ async function handleJob(config, job) {
   if (job.test === true) return runTestJob(config, job);
 
   const result = newResult(config);
+  // The repository's lease, released in the finally below and again after the
+  // run's cleanup: null outside a pool, and a busy object when another
+  // instance holds the repository's lock past the bound.
+  let lease = null;
 
   try {
     const brief = await fetchBrief(job);
@@ -2274,6 +2785,17 @@ async function handleJob(config, job) {
     log('info', `fetched the brief for handoff ${job.handoff_id}`, { bytes: Buffer.byteLength(brief) });
 
     const repo = job.repo_full_name ? parseRepo(job.repo_full_name) : null;
+    lease = await acquireRepoLease(config, repo);
+    if (lease && lease.busy) {
+      // Another instance is working on the same repository. The honest answer
+      // is no answer at all: nothing is published, nothing is staged and the
+      // memory is left as the other instance is writing it.
+      const subject = repo ? repo.fullName : 'the notes requests that name no repository share';
+      result.summary = `${subject} is being worked on by another runner instance (${lease.busy.instance || 'unknown'}), so this request was not run here: nothing was published, nothing was staged and its memory was left as it was.`;
+      result.evidence.busy_repository = repo ? repo.fullName : memory.ESTATE;
+      result.actions.push(`${subject} was busy on another runner instance, so nothing was run`);
+      return result;
+    }
     const workspace = repo ? await prepareCheckout(config, job, repo) : prepareScratch(config);
     if (repo) {
       result.evidence.repository = repo.fullName;
@@ -2281,6 +2803,21 @@ async function handleJob(config, job) {
       result.actions.push(`checked out ${repo.fullName} at ${workspace.defaultBranch} on ${workspace.branch}`);
     } else {
       result.actions.push('ran without a checkout, because the request named no repository');
+    }
+
+    // The integration's context repository, put beside the checkout before the
+    // agent starts, so the path the platform's brief names is there when the
+    // run reads it. Best effort: a clone or refresh that fails is named in the
+    // evidence and the request goes ahead.
+    const context = await prepareContextRepo(config, job);
+    if (context && context.error) {
+      result.evidence.context_repository = context.error;
+      result.actions.push('the context repository could not be read, so the run went ahead without it');
+      log('warn', `handoff ${job.handoff_id}: the context repository could not be read (${context.error}); the run goes ahead without it`);
+    } else if (context) {
+      result.actions.push(
+        `${context.action} the context repository ${context.fullName} at ${context.defaultBranch} under context/${context.fullName} beside the checkout, as reference material; it is never staged and never pushed`
+      );
     }
 
     writeAgent(config, workspace.dir);
@@ -2317,6 +2854,13 @@ async function handleJob(config, job) {
       } finally {
         if (mem && reclaimed) closeMemory(mem, result);
         else if (mem) fs.rmSync(mem.copy, { recursive: true, force: true });
+        // The repository's lease ends with the save and the home: this is the
+        // brief's span, held until the memory is closed and the agent's home
+        // is the runner's again, and never into the staging and the push.
+        // Cleared here so the backstop below never reads another instance's
+        // fresh lock as a takeover of this one.
+        releaseLock(lease);
+        lease = null;
       }
     }
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
@@ -2415,6 +2959,10 @@ async function handleJob(config, job) {
     result.evidence.error = redact(error.message);
     log('error', `handoff ${job.handoff_id} failed: ${redact(error.message)}`);
   } finally {
+    // The lease is released with the save when the run got that far; this is
+    // the backstop for everything that can stop it earlier, before the
+    // mirror and the report spend their time under it.
+    releaseLock(lease);
     await mirrorMemory(config, result);
     await report(job, result);
     jobSecret = null;
@@ -2445,7 +2993,7 @@ async function mirrorMemory(config, result) {
 async function startMemory(config) {
   identity = config.identity || NO_IDENTITY;
   try {
-    const moved = memory.migrate(config.workspace);
+    const moved = memory.migrate(config.layout);
     if (moved.length > 0) {
       log('info', `moved ${moved.length} existing clone${moved.length === 1 ? '' : 's'} under repos/: ${moved.join(', ')}`);
     }
@@ -2453,12 +3001,12 @@ async function startMemory(config) {
     log('warn', `the clones from the earlier layout could not be moved under repos/ (${redact(error.message)}); they will be cloned again`);
   }
   try {
-    for (const note of memory.recover(config.workspace)) log('info', `memory: ${note}`);
+    for (const note of memory.recover(config.layout)) log('info', `memory: ${note}`);
   } catch (error) {
     log('warn', `memory directories left by a stopped run could not be put in order (${redact(error.message)})`);
   }
   try {
-    for (const gone of memory.clearTestMarkers(config.workspace)) log('info', `memory: removed ${gone}, left by a test job that stopped before it could`);
+    for (const gone of memory.clearTestMarkers(config.layout)) log('info', `memory: removed ${gone}, left by a test job that stopped before it could`);
   } catch (error) {
     log('warn', `a marker left by a stopped test job could not be removed (${redact(error.message)})`);
   }
@@ -2468,19 +3016,21 @@ async function startMemory(config) {
   if (settings) {
     log('info', `the memory is mirrored to s3://${settings.bucket}/${settings.prefix}, and restored from it onto an empty memory directory`);
     try {
-      await bucket.restore(settings);
+      await withStateLock(config, () => bucket.restore(settings), 'the restore');
     } catch (error) {
       log('warn', `memory bucket: the memory could not be restored (${redact(error.message)}); the runner starts without it`);
     }
-    syncMemory(settings);
+    await syncMemory(config);
   }
 }
 
 // Memory that was never mirrored completely (an upgrade, or a bucket added
 // later) is journaled for the bucket once; the next request's mirror uploads it.
-function syncMemory(settings) {
+async function syncMemory(config) {
+  const settings = bucketSettings(config);
+  if (!settings) return;
   try {
-    bucket.firstSync(settings);
+    await withStateLock(config, () => bucket.firstSync(settings), 'the first sync');
   } catch (error) {
     log('warn', `memory bucket: the first sync could not be prepared (${redact(error.message)})`);
   }
@@ -2493,11 +3043,11 @@ async function serveJob(config, job) {
   const settings = bucketSettings(config);
   if (settings) {
     try {
-      await bucket.retryRestore(settings);
+      await withStateLock(config, () => bucket.retryRestore(settings), 'the restore retry');
     } catch (error) {
       log('warn', `memory bucket: the restore could not be retried (${redact(error.message)})`);
     }
-    syncMemory(settings);
+    await syncMemory(config);
   }
   return handleJob(config, job);
 }
@@ -2518,6 +3068,12 @@ async function main() {
   // directories the agent has to walk through are opened explicitly.
   if (identity.mode !== 'none') process.umask(0o077);
   log('info', `sre-agent-opencode fix runner v${config.version} polling ${config.serverUrl}, running ${describeIdentity()}`);
+  log(
+    'info',
+    config.layout.perInstance
+      ? `this runner is instance ${config.instance}: its own work under ${config.layout.instanceDir}, the memory shared under ${config.layout.memory}`
+      : `this runner tells the platform it is instance ${config.instance}`
+  );
   if (identity.mode === 'none') {
     if (identity.degraded) {
       log(
@@ -2578,6 +3134,10 @@ module.exports = {
     applyAgentHomeEnv,
     autoLoadSwitches: AUTOLOAD_SWITCHES,
     loadIdentity,
+    acquireLock,
+    releaseLock,
+    readHeldLock,
+    repoLockPath,
     setIdentity: (value) => {
       identity = value;
     },

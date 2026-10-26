@@ -182,6 +182,10 @@ env_args() {
   env_extra=()
   if [ -n "$BUCKET_V" ]; then env_extra+=("SRE_MEMORY_BUCKET=$BUCKET_V"); fi
   if [ -n "$PREFIX_V" ]; then env_extra+=("SRE_MEMORY_PREFIX=$PREFIX_V"); fi
+  if [ -n "${SPLIT_V:-}" ]; then env_extra+=("SRE_WORKSPACE_PER_INSTANCE=$SPLIT_V"); fi
+  if [ -n "${INSTANCE_V:-}" ]; then env_extra+=("SRE_RUNNER_INSTANCE=$INSTANCE_V"); fi
+  if [ -n "${MEMORY_ROOT_V:-}" ]; then env_extra+=("SRE_MEMORY_ROOT=$MEMORY_ROOT_V"); fi
+  if [ -n "${LOCK_WAIT_V:-}" ]; then env_extra+=("SRE_LOCK_WAIT_SECONDS=$LOCK_WAIT_V"); fi
 }
 
 run_runner() {
@@ -1230,6 +1234,189 @@ stop_fixture
 rm -f "$ctl/aws_fail_on"
 export STUB_OPENCODE_MODE=diagnose
 
+
+echo "--- 24. with the workspace split the memory root follows SRE_MEMORY_ROOT, its three state files sit beside it, and the instance works under instances/ ---"
+reset_aws
+fresh_workspace
+memroot="$work/memroot"
+mkdir -p "$memroot"
+bucket_tree="$ctl/bucket_tree"
+mkdir -p "$bucket_tree/_estate"
+printf '# Estate\n\nrestored: the nightly page goes to the on-call.\n' > "$bucket_tree/_estate/NOTES.md"
+start_fixture splitroot
+queue_one h-splitroot
+SPLIT_V=1 INSTANCE_V=pool-a MEMORY_ROOT_V="$memroot" BUCKET_V="acme-sre-memory" PREFIX_V="team-a/memory" run_driver splitroot
+check "a run under the split with a moved memory root exits 0" test "$rc" -eq 0
+check "the memory was restored into SRE_MEMORY_ROOT" test -f "$memroot/_estate/NOTES.md"
+check "the restore's staging directory sat beside the memory root and is gone" test -z "$(find "$work" -maxdepth 1 -name '.memory-restore-[0-9]*' -print -quit)" -a -z "$(find "$workspace" -name '.memory-restore-[0-9]*' -print -quit)"
+check "the state files live beside the memory root: the sync marker is written" test -e "$work/.memory-first-sync"
+check "the workspace holds no state file of its own" test ! -e "$workspace/.memory-first-sync" -a ! -e "$workspace/.memory-mirror-pending"
+check "the instance keeps its own directories under instances/" test -d "$workspace/instances/pool-a/scratch"
+check "the shared memory never moved into the instance's directories" test ! -e "$workspace/instances/pool-a/memory"
+export STUB_OPENCODE_MEMORY=edit
+: > "$ctl/aws_calls.log"
+start_fixture splitroot-mirror
+queue_one h-splitroot-mirror
+SPLIT_V=1 INSTANCE_V=pool-b MEMORY_ROOT_V="$memroot" BUCKET_V="acme-sre-memory" PREFIX_V="team-a/memory" run_driver splitroot-mirror
+unset STUB_OPENCODE_MEMORY
+check "a second instance mirrors the memory from SRE_MEMORY_ROOT" cmp -s "$ctl/uploaded/acme-sre-memory/team-a/memory/_estate/NOTES.md" "$memroot/_estate/NOTES.md"
+check "the second instance has its own directories and did not touch the first's" test -d "$workspace/instances/pool-b/scratch" -a ! -e "$workspace/instances/pool-b/repos"
+stop_fixture
+unset SPLIT_V INSTANCE_V MEMORY_ROOT_V
+
+echo "--- 25. a _state lock held by another instance holds the restore and the first sync, and the request still lands ---"
+reset_aws
+fresh_workspace
+seed_estate
+mkdir -p "$workspace/locks"
+printf 'beta %s %s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" > "$workspace/locks/_state.lock"
+start_fixture statelock
+queue_one h-statelock
+SPLIT_V=1 INSTANCE_V=pool-a BUCKET_V="acme-sre-memory" LOCK_WAIT_V=0 run_driver statelock
+check "the request still exits 0, a held state lock never fails it" test "$rc" -eq 0
+check "no aws call was made: neither the restore nor the first sync ran" test "$(calls)" -eq 0
+check "no journal and no marker were written while another instance held the state" test ! -e "$workspace/.memory-mirror-pending" -a ! -e "$workspace/.memory-first-sync" -a ! -e "$workspace/.memory-restore-pending"
+check "the log names the held state lock" grep -q 'shared memory state lock is held' "$out"
+check "the other instance's lock file was left exactly as it was" grep -q '^beta ' "$workspace/locks/_state.lock"
+rm -f "$workspace/locks/_state.lock"
+: > "$ctl/aws_calls.log"
+start_fixture statelock-free
+queue_one h-statelock-free
+SPLIT_V=1 INSTANCE_V=pool-a BUCKET_V="acme-sre-memory" run_driver statelock-free
+check "with the state lock free the first sync journals and uploads" test "$(grep -c "^s3${us}cp${us}" "$ctl/aws_calls.log")" -eq 2
+check "the marker is written once the journal empties" test -e "$workspace/.memory-first-sync" -a ! -e "$workspace/.memory-mirror-pending"
+check "and the state lock is released with it" test ! -e "$workspace/locks/_state.lock"
+stop_fixture
+unset SPLIT_V INSTANCE_V LOCK_WAIT_V
+
+echo "--- 26. two instances first-syncing the same volume together end with one journal, one marker and every file in the bucket ---"
+reset_aws
+fresh_workspace
+mkdir -p "$workspace/memory/_estate/scripts" "$workspace/memory/acme/api"
+printf '# Estate\n\nthe nightly page goes to the on-call.\n' > "$workspace/memory/_estate/NOTES.md"
+printf '#!/bin/sh\n# the old helper\n' > "$workspace/memory/_estate/scripts/old.sh"
+printf '# api\n\nan existing note\n' > "$workspace/memory/acme/api/NOTES.md"
+start_fixture sync_together
+split_driver() {
+  local name="$1" instance="$2"
+  # The object itself, not the one-element array the fixture serves a queue
+  # in: this job is handed to serveJob directly, with no poll in between.
+  jq -cn --arg id "h-$name" --arg base "$server_url" --arg token "$handoff_token" \
+    '{handoff_id: $id,
+       subject_id: "11111111-2222-3333-4444-555555555555",
+       repo_full_name: null,
+       brief_url: ($base + "/api/handoffs/" + $id + "/brief"),
+       report_url: ($base + "/api/handoffs/" + $id + "/report"),
+       token: $token}' > "$work/$name.job.json"
+  (cd "$work" && timeout 120 env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$workspace" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_WORKSPACE_PER_INSTANCE=1 SRE_RUNNER_INSTANCE="$instance" SRE_MEMORY_BUCKET=acme-sre-memory \
+    DRIVER_JOB="$work/$name.job.json" DRIVER_OUT="$work/$name.result.json" \
+    node -e '
+      const fs = require("node:fs");
+      const runner = require(process.argv[1]);
+      const config = runner.loadConfig();
+      const job = JSON.parse(fs.readFileSync(process.env.DRIVER_JOB, "utf8"));
+      runner.startMemory(config)
+        .then(() => runner.serveJob(config, job))
+        .then(() => fs.writeFileSync(process.env.DRIVER_OUT, "done"));
+    ' "$runner") > "$work/$name.out" 2>&1
+}
+split_driver sync-a pool-a &
+driver_a=$!
+split_driver sync-b pool-b &
+driver_b=$!
+wait "$driver_a" || rc_a=$?
+wait "$driver_b" || rc_b=$?
+check "both instances completed" test "${rc_a:-0}" -eq 0 -a "${rc_b:-0}" -eq 0
+check "every file of the shared memory reached the bucket" test -s "$ctl/uploaded/acme-sre-memory/memory/_estate/NOTES.md" -a -s "$ctl/uploaded/acme-sre-memory/memory/_estate/scripts/old.sh" -a -s "$ctl/uploaded/acme-sre-memory/memory/acme/api/NOTES.md"
+check "the journal emptied behind them" test ! -e "$workspace/.memory-mirror-pending"
+check "one first-sync marker stands for both" test -e "$workspace/.memory-first-sync"
+check "and no lock file outlives the two requests" test -z "$(find "$workspace/locks" -type f -print -quit)"
+# The locks make the journal and marker writes atomic; the uploads themselves
+# are idempotent, so a file may reach the bucket once per instance and never
+# more often than that.
+per_file_puts="$(grep -c "s3${us}cp${us}.*memory/acme/api/NOTES.md" "$ctl/aws_calls.log")"
+check "no file was put more than once per instance" test "$per_file_puts" -le 2
+stop_fixture
+
+echo "--- 26b. the mirror's journal writes run inside the shared state lock, and a lock that cannot be had is answered honestly ---"
+cat > "$work/unit-mirror.js" <<'EOF2'
+'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawn, spawnSync } = require('node:child_process');
+const bucket = require(path.join(process.argv[2], 'runner', 'bucket.js'));
+const workspace = process.argv[3];
+const log = process.argv[4];
+const emit = (value) => console.log(JSON.stringify(value));
+const count = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean).length : 0);
+const run = async (command, args) => {
+  const result = spawnSync(command, args, { encoding: 'utf8' });
+  return { code: result.status, stdout: result.stdout || '', stderr: result.stderr || '', timedOut: false };
+};
+const settings = (extra = {}) => ({ bucket: 'acme-sre-memory', prefix: 'memory/', workspace, run, log: () => {}, state: {}, ...extra });
+
+(async () => {
+  fs.mkdirSync(path.join(workspace, 'memory/acme/api'), { recursive: true });
+  fs.mkdirSync(path.join(workspace, 'memory/beta/web'), { recursive: true });
+  fs.writeFileSync(path.join(workspace, 'memory/acme/api/NOTES.md'), 'alpha notes\n');
+  fs.writeFileSync(path.join(workspace, 'memory/beta/web/NOTES.md'), 'beta notes\n');
+  fs.rmSync(path.join(workspace, '.memory-first-sync'), { force: true });
+
+  // A real serializing mutex, the promise-chain shape withStateLock gives the
+  // mirror across processes: one load-merge-save at a time.
+  let chain = Promise.resolve();
+  const mutex = (fn) => {
+    const next = chain.then(() => fn());
+    chain = next.catch(() => {});
+    return next;
+  };
+
+  const before = count();
+  const [alpha, beta] = await Promise.all([
+    bucket.mirror(settings({ mutex }), [{ path: 'acme/api/NOTES.md', change: 'modified', bytes: 12 }]),
+    bucket.mirror(settings({ mutex }), [{ path: 'beta/web/NOTES.md', change: 'modified', bytes: 11 }]),
+  ]);
+  emit({ kind: 'combine', alpha, beta, journal: fs.existsSync(path.join(workspace, '.memory-mirror-pending')), calls: count() - before });
+
+  const busyBefore = count();
+  const busy = await bucket.mirror(settings({ mutex: async () => null }), [{ path: 'acme/api/NOTES.md', change: 'modified', bytes: 12 }]);
+  emit({ kind: 'busy', busy, calls: count() - busyBefore, journal: fs.existsSync(path.join(workspace, '.memory-mirror-pending')) });
+
+  // removeStale runs inside a restore: a live foreign pid's half-written state
+  // is theirs to finish, a dead pid's and this process's own are removed.
+  fs.rmSync(path.join(workspace, 'memory'), { recursive: true, force: true });
+  const sleeper = spawn('sleep', ['30'], { stdio: 'ignore' });
+  fs.writeFileSync(path.join(workspace, `.memory-mirror-pending.tmp-${sleeper.pid}`), '{}\n');
+  fs.writeFileSync(path.join(workspace, `.memory-restore-pending.tmp-${sleeper.pid}`), '{}\n');
+  fs.mkdirSync(path.join(workspace, `.memory-restore-987654321`), { recursive: true });
+  fs.writeFileSync(path.join(workspace, `.memory-mirror-pending.tmp-${process.pid}`), '{}\n');
+  fs.writeFileSync(path.join(workspace, '.memory-restore-pending'), '{}\n');
+  const restore = await bucket.restore(settings({ state: {} }));
+  const alive = fs.existsSync(path.join(workspace, `.memory-mirror-pending.tmp-${sleeper.pid}`));
+  const aliveSecond = fs.existsSync(path.join(workspace, `.memory-restore-pending.tmp-${sleeper.pid}`));
+  const dead = fs.existsSync(path.join(workspace, `.memory-restore-987654321`));
+  const own = fs.existsSync(path.join(workspace, `.memory-mirror-pending.tmp-${process.pid}`));
+  sleeper.kill('SIGKILL');
+  emit({ kind: 'stale-cleanup', restore, alive, aliveSecond, dead, own });
+})();
+EOF2
+reset_aws
+fresh_workspace
+mkdir -p "$workspace/memory"
+(cd "$work" && PATH="$work/bin:$PATH" node --max-old-space-size=256 "$work/unit-mirror.js" "$pkg" "$workspace" "$ctl/aws_calls.log") > "$work/unit-mirror.out" 2>&1 || { echo "FAIL the unit mirror driver failed: $(cat "$work/unit-mirror.out")"; fail=1; }
+combine="$(jq -c 'select(.kind == "combine")' "$work/unit-mirror.out")"
+busy="$(jq -c 'select(.kind == "busy")' "$work/unit-mirror.out")"
+stale="$(jq -c 'select(.kind == "stale-cleanup")' "$work/unit-mirror.out")"
+# The fresh load under the lock is the point: the second mirror's boot carries
+# the first's still-pending path as well as its own, so a path may be uploaded
+# more than once (idempotent) and neither save clobbers the other.
+if [ "$(jq -r '.alpha.ok and .beta.ok' <<<"$combine")" = true ] && [ "$(jq -r '.journal' <<<"$combine")" = false ] && [ "$(jq -r '.calls' <<<"$combine")" -ge 2 ]; then echo "ok   two mirrors under one serializing lock upload both paths and leave no journal"; else echo "FAIL combine: $combine"; fail=1; fi
+if [ -s "$ctl/uploaded/acme-sre-memory/memory/acme/api/NOTES.md" ] && [ -s "$ctl/uploaded/acme-sre-memory/memory/beta/web/NOTES.md" ]; then echo "ok   both mirrors' paths reached the bucket"; else echo "FAIL uploads: $(find "$ctl/uploaded" -type f | sort | tr '\n' ' ')"; fail=1; fi
+if jq -e '.busy.ok == false and (.busy.error | test("shared memory state lock"))' <<<"$busy" >/dev/null && [ "$(jq -r '.calls' <<<"$busy")" -eq 0 ]; then echo "ok   a busy state lock stops the mirror with the honest error and makes no aws call"; else echo "FAIL busy: $busy"; fail=1; fi
+if jq -e '.alive and .aliveSecond and (.dead | not) and (.own | not)' <<<"$stale" >/dev/null; then echo "ok   a live neighbour's half-written state is theirs, a dead pid's and this process's own are cleaned"; else echo "FAIL stale cleanup: $stale"; fail=1; fi
 
 echo "--- 11. the entrypoint refuses a bucket it cannot reach, and runs without one ---"
 bash_bin="$(command -v bash)"
