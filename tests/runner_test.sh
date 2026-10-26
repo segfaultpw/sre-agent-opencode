@@ -145,6 +145,13 @@ if [ -e "$work/ctl/fail_push" ] && [ "\${3:-}" = "push" ]; then
   printf 'fatal: could not read from remote repository: git %s (credential offered: %s)\n' "\$*" "\${RUNNER_GIT_PASSWORD:-none}" >&2
   exit 128
 fi
+# A file named fail_context in the control directory makes every call that
+# reaches for the context repository fail, so a case can prove the request is
+# answered and published anyway and the evidence names what could not be read.
+if [ -e "$work/ctl/fail_context" ] && [[ "\$*" == *"/acme/patterns.git"* ]]; then
+  printf 'fatal: could not read from remote repository.\n' >&2
+  exit 128
+fi
 args=()
 for a in "\$@"; do
   # Only a URL is redirected. The commit identity is a github.com address too,
@@ -236,12 +243,14 @@ stop_fixture() {
 queue_none() { rm -f "$queue_file"; }
 
 # One job in the queue. An empty repository argument becomes the null the
-# platform sends for an untargeted request.
+# platform sends for an untargeted request, and an empty context argument the
+# null of an integration with no context repository.
 queue_one() {
-  jq -n --arg id "$1" --arg repo "$2" --arg base "$server_url" --arg token "$handoff_token" \
+  jq -n --arg id "$1" --arg repo "$2" --arg context "${3:-}" --arg base "$server_url" --arg token "$handoff_token" \
     '[{handoff_id: $id,
        subject_id: "11111111-2222-3333-4444-555555555555",
        repo_full_name: (if $repo == "" then null else $repo end),
+       context_repo_full_name: (if $context == "" then null else $context end),
        brief_url: ($base + "/api/handoffs/" + $id + "/brief"),
        report_url: ($base + "/api/handoffs/" + $id + "/report"),
        token: $token}]' > "$queue_file"
@@ -1556,6 +1565,50 @@ queue_none
 run_once polldefault
 body="$(jq -c 'select(.path | endswith("/api/fix-runner/queue")) | .body' "$fixture_log" | tail -n 1)"
 if jq -e '(.instance | type == "string") and (.instance | length >= 1) and (.instance | length <= 100) and (.instance | test("^[A-Za-z0-9._-]+$"))' <<<"$body" >/dev/null; then echo "ok   with nothing configured the poll body carries the hostname as the instance id"; else echo "FAIL poll body: $body"; fail=1; fi
+stop_fixture
+
+echo "--- 54. a job naming the integration's context repository clones it beside the checkout, refreshes it, and stages nothing of it ---"
+start_fixture context
+queue_one h-context acme/app acme/patterns
+export STUB_OPENCODE_MODE=fix
+run_once context
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a request whose integration names a context repository ends in a pull request as usual"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if grep -qF "clone https://github.com/acme/patterns.git $workspace/context/acme/patterns" "$git_log"; then echo "ok   the context repository is cloned once, from its github.com URL, into context/ beside the checkout"; else echo "FAIL clone call: $(grep -F 'acme/patterns' "$git_log")"; fail=1; fi
+if grep -qF 'ls-remote --symref https://github.com/acme/patterns.git HEAD' "$git_log"; then echo "ok   its default branch is asked for the way a checkout's is"; else echo "FAIL no ls-remote for the context repository: $(grep -F 'acme/patterns' "$git_log")"; fail=1; fi
+if [ -f "$workspace/context/acme/patterns/README.md" ]; then echo "ok   the clone lands at context/<owner>/<repo> on the volume, where the brief points the agent"; else echo "FAIL no clone under context: $(find "$workspace/context" -maxdepth 3 2>/dev/null)"; fail=1; fi
+if jq -e '.evidence.changed_files == ["README.md"]' <<<"$report" >/dev/null; then echo "ok   the pull request changes only the checkout's own file, and changed_files names no path of the context repository"; else echo "FAIL changed_files: $report"; fail=1; fi
+if ! "$real_git" --git-dir="$remote" ls-tree -r --name-only refs/heads/sre-agent/h-context | grep -q 'context/'; then echo "ok   nothing from the context repository is in the pushed branch"; else echo "FAIL the branch holds context paths"; fail=1; fi
+if [ "$(cat "$workspace/context/acme/patterns/README.md" 2>/dev/null)" = "the fixture repository" ]; then echo "ok   the clone is intact after the run"; else echo "FAIL the clone changed: $(cat "$workspace/context/acme/patterns/README.md" 2>/dev/null)"; fail=1; fi
+
+# The second request about the same integration refreshes the clone: a fetch
+# and a reset, and no second clone.
+start_fixture context_refresh
+queue_one h-context-refresh acme/app acme/patterns
+run_once context_refresh
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the second request ends in a pull request too"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if ! grep -qF 'clone https://github.com/acme/patterns.git' "$git_log"; then echo "ok   the second request clones nothing again"; else echo "FAIL cloned twice: $(grep -F 'clone https://github.com/acme/patterns' "$git_log")"; fail=1; fi
+if grep -qF -- "--git-dir=$workspace/context/acme/patterns/.git --work-tree=$workspace/context/acme/patterns fetch --prune https://github.com/acme/patterns.git" "$git_log"; then echo "ok   the clone is refreshed by a fetch that names the git directory and the work tree itself"; else echo "FAIL refresh calls: $(grep -F 'patterns' "$git_log")"; fail=1; fi
+if grep -qF -- "--git-dir=$workspace/context/acme/patterns/.git --work-tree=$workspace/context/acme/patterns reset --hard refs/remotes/origin/main" "$git_log"; then echo "ok   the tree is put back to the default branch's remote head"; else echo "FAIL no reset to the remote head: $(grep -F 'patterns' "$git_log")"; fail=1; fi
+
+# A job whose answer carries no context repository, and a v1.5.0-shaped answer
+# with the key absent: no call about one.
+start_fixture context_plain
+queue_one h-context-plain acme/app
+run_once context_plain
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a job without the key is answered as today"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ "$(grep -cF 'acme/patterns' "$git_log")" -eq 0 ]; then echo "ok   a job without the key makes no git call about a context repository"; else echo "FAIL calls about a context repository: $(grep -F 'acme/patterns' "$git_log")"; fail=1; fi
+
+# A context repository that cannot be reached: the request is answered and
+# published anyway, and the evidence names what could not be read.
+start_fixture context_fail
+queue_one h-context-fail acme/app acme/patterns
+touch "$work/ctl/fail_context"
+run_once context_fail
+rm -f "$work/ctl/fail_context"
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a context repository that cannot be read still leaves the fix published"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if jq -e '.evidence.repository == "acme/app" and (.evidence.context_repository | test("acme/patterns") and test("could not be"))' <<<"$report" >/dev/null; then echo "ok   the evidence names the checkout and the context repository that could not be read"; else echo "FAIL evidence: $report"; fail=1; fi
+good_context_evidence="$(jq -c 'select(.path | endswith("/report")) | .body.evidence' "$work/context.requests.jsonl" | tail -n 1)"
+if ! jq -e 'has("context_repository")' <<<"$good_context_evidence" >/dev/null; then echo "ok   a run that read its context repository reports no context_repository error"; else echo "FAIL a successful read reported an error: $good_context_evidence"; fail=1; fi
 stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

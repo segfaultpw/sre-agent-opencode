@@ -6,6 +6,7 @@
 //   <workspace>/memory/<owner>/<repo>/     NOTES.md and scripts/<name>
 //   <workspace>/memory/_estate/            the same, for requests naming no repository
 //   <workspace>/scratch/                   untargeted runs
+//   <workspace>/context/<owner>/<repo>/    the integration's context repository, read-only reference
 //
 // With SRE_WORKSPACE_PER_INSTANCE=1 (memory.split below) the working
 // directories are this instance's own under <workspace>/instances/<id> while
@@ -42,7 +43,10 @@ const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // these cannot be told from the runner's own directory, so it is not migrated
 // and is cloned again under repos/. instances/ and locks/ are the pool layout's:
 // the shared working tree of every instance and the leases on the shared memory.
-const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home', 'instances', 'locks']);
+// context/ holds the integration's context repository, the runner's own clone
+// of a repository the organization chose, so an owner of that name is left
+// where it is rather than moved under repos/.
+const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home', 'instances', 'locks', 'context']);
 // What the runner keeps at the top of the workspace for the bucket mirror: a
 // restore's staging directory, the marker of a restore that has not succeeded
 // and the journal of paths not yet mirrored (runner/bucket.js). None is an owner.
@@ -62,6 +66,7 @@ function layout(workspace) {
     gitdirs: path.join(base, 'gitdirs'),
     memory: path.join(base, 'memory'),
     scratch: path.join(base, 'scratch'),
+    context: path.join(base, 'context'),
   };
 }
 
@@ -82,7 +87,7 @@ function instanceId(env = process.env, hostname = os.hostname()) {
 // byte for byte: one runner, one workspace, no locks.
 //
 //   SRE_WORKSPACE_PER_INSTANCE=1
-//     <workspace>/instances/<id>/repos|gitdirs|scratch|agent-home
+//     <workspace>/instances/<id>/repos|gitdirs|scratch|agent-home|context
 //     the memory root is SRE_MEMORY_ROOT, default <workspace>/memory, and the
 //     bucket mirror's three state files and restore staging sit in its parent,
 //     beside the memory as they always have, on its file system for the rename
@@ -109,6 +114,7 @@ function split(env = process.env) {
       repos: flat.repos,
       gitdirs: flat.gitdirs,
       scratch: flat.scratch,
+      context: flat.context,
       agentHome: null,
       memory: flat.memory,
       stateBase: workspace,
@@ -136,6 +142,7 @@ function split(env = process.env) {
     gitdirs: path.join(instanceDir, 'gitdirs'),
     scratch: path.join(instanceDir, 'scratch'),
     agentHome: path.join(instanceDir, 'agent-home'),
+    context: path.join(instanceDir, 'context'),
     memory,
     stateBase: path.dirname(memory),
     // Beside the memory root, not the workspace: the locks guard the shared

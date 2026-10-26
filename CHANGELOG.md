@@ -2,6 +2,12 @@
 
 Versions follow semantic versioning. The major tag (`v1`) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v1.6.0
+
+The agent can read the organization's own patterns while it works. When the GitHub integration names a context repository, the platform sends its name with each request (`context_repo_full_name`) and the runner clones that repository beside the checkout, at `context/<owner>/<repo>` on the workspace (`instances/<id>/context/...` when runners share a volume as a pool), at its default branch, and refreshes it on every later request. The platform's brief is what tells the agent where the clone is and what it is for; this package guarantees the clone is at that path when the run starts. The tree is the runner's own (files 0644, directories 0755), readable by the agent's account and writable by no other, with the git directory closed as the gitdirs are. It sits outside every request's checkout, so nothing in it is ever staged, gated or pushed: it is reference material the agent reads, never a fix target. The clone and the refresh use the same discipline as every other git call the runner makes: argv only, the token through the credential helper's environment and on no command line. A context repository that cannot be reached, or a refresh that fails, is named in the report's evidence (`context_repository`, one line) and the request is run and published anyway.
+
+Platform versions. The name is one more key in the queue's answer, null when the organization set none and on every test job. A platform older than the release that sends it sends no such key, so nothing is cloned and today's behaviour stands; a runner older than v1.6.0 ignores the key, so the upgrade order is free and a customer changes nothing on upgrade.
+
 ## v1.5.0
 
 The runner you host keeps what it learns, copies it to a bucket you own, proves itself end to end on request, and runs the agent as an account of its own. The CI door and the reusable workflow are untouched.

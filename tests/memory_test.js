@@ -70,12 +70,13 @@ function test(name, fn) {
   }
 }
 
-test('layout names the four directories under the workspace', () => {
+test('layout names the five directories under the workspace', () => {
   assert.deepEqual(memory.layout('/workspace'), {
     repos: '/workspace/repos',
     gitdirs: '/workspace/gitdirs',
     memory: '/workspace/memory',
     scratch: '/workspace/scratch',
+    context: '/workspace/context',
   });
 });
 
@@ -132,6 +133,7 @@ test('split keeps the flat layout for any value other than 1', () => {
     assert.equal(laid.gitdirs, '/workspace/gitdirs');
     assert.equal(laid.scratch, '/workspace/scratch');
     assert.equal(laid.memory, '/workspace/memory');
+    assert.equal(laid.context, '/workspace/context');
     assert.equal(laid.agentHome, null);
     assert.equal(laid.stateBase, '/workspace');
   }
@@ -148,6 +150,7 @@ test('split moves the working directories under the instance and keeps the memor
   assert.equal(laid.gitdirs, '/shared/instances/pool-a/gitdirs');
   assert.equal(laid.scratch, '/shared/instances/pool-a/scratch');
   assert.equal(laid.agentHome, '/shared/instances/pool-a/agent-home');
+  assert.equal(laid.context, '/shared/instances/pool-a/context');
   assert.equal(laid.memory, '/shared/memory');
   assert.equal(laid.stateBase, '/shared');
   assert.equal(laid.locks, '/shared/locks');
@@ -221,10 +224,15 @@ test('migrate never treats the runner own directories as owners', () => {
   put(ws, 'gitdirs/acme/api/.git/HEAD', 'x');
   put(ws, 'memory/acme/api/.git/HEAD', 'x');
   put(ws, 'scratch/acme/.git/HEAD', 'x');
+  // The shape migrate would take for an owner directory: without the reserved
+  // name, a clone under context/ would be moved under repos/ and the runner's
+  // own context directory would become an owner directory.
+  put(ws, 'context/acme/.git/HEAD', 'x');
   assert.deepEqual(memory.migrate(ws), []);
   assert.ok(fs.existsSync(path.join(ws, 'memory/acme/api/.git/HEAD')));
   assert.ok(fs.existsSync(path.join(ws, 'gitdirs/acme/api/.git/HEAD')), 'a git directory is not moved under repos');
   assert.ok(fs.existsSync(path.join(ws, 'agent-home/acme/.git/HEAD')), 'the agent home is not an owner');
+  assert.ok(fs.existsSync(path.join(ws, 'context/acme/.git/HEAD')), 'the context directory is not an owner');
 });
 
 test('migrate never treats the runner own restore and mirror state as an owner', () => {

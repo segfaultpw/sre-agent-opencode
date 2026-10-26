@@ -72,6 +72,11 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'other_write: %s\n' "$(allowed bash -c ": > '$ws/repos/acme/other/planted'")"
     printf 'own_write: %s\n' "$(allowed bash -c ": >> README.md")"
     printf 'home_write: %s\n' "$(allowed bash -c ": >> '$HOME/probe'")"
+    # The integration's context repository: cloned by the runner beside the
+    # checkout as reference material, the agent's to read and never to write.
+    printf 'context_read: %s\n' "$(allowed cat "$ws/context/acme/patterns/README.md")"
+    printf 'context_write: %s\n' "$(allowed bash -c ": >> '$ws/context/acme/patterns/README.md'")"
+    printf 'context_git_list: %s\n' "$(allowed ls "$ws/context/acme/patterns/.git")"
     # What a CI job does: install a tool into the home and find it again on a
     # later run, clone a repository, commit in the clone.
     if command -v sre-fixture-tool >/dev/null 2>&1; then

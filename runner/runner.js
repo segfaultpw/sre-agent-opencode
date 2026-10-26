@@ -1708,6 +1708,124 @@ async function prepareCheckout(config, job, repo) {
   return workspace;
 }
 
+// The integration's context repository (the job's context_repo_full_name, null
+// when the organization set none, on every test job, and on a platform older
+// than the key): the organization's own patterns, cloned beside the checkout
+// under context/<owner>/<repo> so the agent can read them as reference
+// material. The platform's brief is what points the agent at the path; this
+// runner guarantees the clone is there, at exactly that relative location.
+//
+// It sits OUTSIDE the request's checkout, so nothing in it is ever staged,
+// gated or pushed: staging works on the checkout's tree alone. It is never a
+// fix target. Best effort on purpose: a context repository that cannot be
+// reached, or a refresh that fails, names itself in the report's evidence and
+// the request runs anyway, because the fix does not depend on it.
+const CONTEXT_ERROR_MAX = 300;
+
+async function prepareContextRepo(config, job) {
+  const named = typeof job.context_repo_full_name === 'string' ? job.context_repo_full_name.trim() : '';
+  if (!named) return null;
+  const failure = (message) => ({ fullName: named, error: oneLine(redact(message), CONTEXT_ERROR_MAX) });
+  let repo;
+  try {
+    repo = parseRepo(named);
+  } catch (error) {
+    return failure(error.message);
+  }
+  if (!config.githubToken) {
+    return failure(`${repo.fullName} could not be read: this organization set a context repository and the runner has no SRE_GITHUB_TOKEN to reach it with`);
+  }
+  const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
+  const dir = path.join(config.layout.context, repo.owner, repo.name);
+  try {
+    // The default branch is asked for the way a checkout's is, so the clone and
+    // every refresh follow the repository's own head rather than a name baked
+    // in when the clone was made.
+    const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', cleanUrl, 'HEAD'], {
+      env: gitAuthEnv(config.githubToken),
+    });
+    if (symref.code !== 0) {
+      throw new Error(`${repo.fullName} could not be read: ${(symref.stderr || symref.stdout).trim()}`);
+    }
+    const defaultBranch = (/^ref:\s+refs\/heads\/(\S+)/m.exec(symref.stdout) || [])[1];
+    if (!defaultBranch) throw new Error(`${repo.fullName} did not name a default branch`);
+    settleDir(config.layout.context, 0o755);
+    settleDir(path.dirname(dir), 0o755);
+    const lstatOrNull = (target) => {
+      try {
+        return fs.lstatSync(target);
+      } catch {
+        return null;
+      }
+    };
+    // What is already there is a clone this runner made, or it is not
+    // reference material at all: a file, a link or a half-made clone is
+    // removed and cloned again, never adopted.
+    const existing = lstatOrNull(dir);
+    const reusable = Boolean(existing && existing.isDirectory() && lstatOrNull(path.join(dir, '.git')));
+    let action;
+    if (!reusable) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      await git(['clone', cleanUrl, dir], { token: config.githubToken });
+      action = 'cloned';
+    } else {
+      settleDir(dir, 0o755);
+      action = 'refreshed';
+    }
+    // The same reused-clone discipline as the checkout's: the config and
+    // everything git could run from the git directory are rewritten before the
+    // runner's git touches it, whatever an earlier moment left there.
+    resetGitDir(path.join(dir, '.git'), cleanUrl);
+    if (reusable) {
+      // The git directory and the work tree are named, never discovered, the
+      // way the checkout's calls name both.
+      const inContext = [`--git-dir=${path.join(dir, '.git')}`, `--work-tree=${dir}`];
+      await git([...inContext, 'fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir, token: config.githubToken });
+      await git([...inContext, 'reset', '--hard', `refs/remotes/origin/${defaultBranch}`], { cwd: dir });
+    }
+    openContextTree(dir);
+    // The git directory is closed like the gitdirs, whatever umask made the
+    // clone: one from a start without the account split would otherwise stay
+    // open to the agent's account after an upgrade.
+    const closed = await runProcess('chmod', ['-R', 'go-rwx', path.join(dir, '.git')]);
+    if (closed.code !== 0) {
+      throw new Error(`${repo.fullName}: its clone's git directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
+    }
+    return { fullName: repo.fullName, dir, defaultBranch, action };
+  } catch (error) {
+    return failure(error.message);
+  }
+}
+
+// The clone is the runner's own tree: the agent's account reads it and never
+// writes it. The umask gives the runner's files 0600 and its directories 0700,
+// so after the clone and after every refresh each directory below the clone is
+// opened to 0755 and each regular file to 0644. The git directory stays closed,
+// like the gitdirs: the agent needs the patterns, not the plumbing. Links and
+// other non-regular files are left alone and never followed.
+function openContextTree(dir) {
+  if (identity.mode === 'none') return;
+  const stack = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let stat = null;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      continue;
+    }
+    if (stat.isDirectory()) {
+      fs.chmodSync(current, 0o755);
+      for (const name of fs.readdirSync(current)) {
+        if (name === '.git') continue;
+        stack.push(path.join(current, name));
+      }
+    } else if (stat.isFile()) {
+      fs.chmodSync(current, 0o644);
+    }
+  }
+}
+
 function prepareScratch(config) {
   // One fixed directory rather than one per handoff: an untargeted answer has
   // nothing to publish, so the only reason to keep it is for the operator to
@@ -2643,6 +2761,21 @@ async function handleJob(config, job) {
       result.actions.push(`checked out ${repo.fullName} at ${workspace.defaultBranch} on ${workspace.branch}`);
     } else {
       result.actions.push('ran without a checkout, because the request named no repository');
+    }
+
+    // The integration's context repository, put beside the checkout before the
+    // agent starts, so the path the platform's brief names is there when the
+    // run reads it. Best effort: a clone or refresh that fails is named in the
+    // evidence and the request goes ahead.
+    const context = await prepareContextRepo(config, job);
+    if (context && context.error) {
+      result.evidence.context_repository = context.error;
+      result.actions.push('the context repository could not be read, so the run went ahead without it');
+      log('warn', `handoff ${job.handoff_id}: the context repository could not be read (${context.error}); the run goes ahead without it`);
+    } else if (context) {
+      result.actions.push(
+        `${context.action} the context repository ${context.fullName} at ${context.defaultBranch} under context/${context.fullName} beside the checkout, as reference material; it is never staged and never pushed`
+      );
     }
 
     writeAgent(config, workspace.dir);
