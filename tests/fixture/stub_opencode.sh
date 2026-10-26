@@ -24,6 +24,8 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     if [ -n "${SRE_API_KEY+set}" ]; then printf 'sees_SRE_API_KEY: yes\n'; else printf 'sees_SRE_API_KEY: no\n'; fi
     if [ -n "${SRE_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_GITHUB_TOKEN: no\n'; fi
     if [ -n "${SRE_AGENT_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_AGENT_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_AGENT_GITHUB_TOKEN: no\n'; fi
+    if [ -n "${SRE_GITHUB_APP_ID+set}" ]; then printf 'sees_SRE_GITHUB_APP_ID: yes\n'; else printf 'sees_SRE_GITHUB_APP_ID: no\n'; fi
+    if [ -n "${SRE_GITHUB_APP_PRIVATE_KEY+set}" ]; then printf 'sees_SRE_GITHUB_APP_PRIVATE_KEY: yes\n'; else printf 'sees_SRE_GITHUB_APP_PRIVATE_KEY: no\n'; fi
     # grep -c reads the whole environment: with -q it leaves at the first match,
     # the producer upstream can die of SIGPIPE, and pipefail reads that as "no".
     printf 'runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"
@@ -91,7 +93,7 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'path_has_mise_shims: %s\n' "$(case ":$PATH:" in *":$HOME/.local/share/mise/shims:"*) echo yes ;; *) echo no ;; esac)"
     printf 'npm_prefix: %s\n' "${NPM_CONFIG_PREFIX:-}"
     printf 'mise_data_dir: %s\n' "${MISE_DATA_DIR:-}"
-    printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|SRE_AGENT_GITHUB_TOKEN|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
+    printf 'token_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|SRE_AGENT_GITHUB_TOKEN|SRE_GITHUB_APP_[A-Z_]+|SRE_RUNNER_.*|SRE_AGENT_(UID|GID|HOME|USER))$' | LC_ALL=C sort | tr '\n' ' ')"
     printf 'gh_token: %s\n' "$(if [ -z "${GH_TOKEN+set}" ]; then echo absent; elif [ "$GH_TOKEN" = "${STUB_EXPECT_GH_TOKEN:-}" ]; then echo matches; else echo differs; fi)"
     printf 'probe_runner_token_visible: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && env | grep -v '^STUB_' | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"
     printf 'helper_hands_out_runner_token: %s\n' "$(if [ -n "${STUB_RUNNER_TOKEN:-}" ] && printf 'protocol=https\nhost=github.com\n\n' | GIT_TERMINAL_PROMPT=0 "${STUB_PROBE_GIT:?}" credential fill 2>/dev/null | grep -cF -- "$STUB_RUNNER_TOKEN" >/dev/null; then echo yes; else echo no; fi)"

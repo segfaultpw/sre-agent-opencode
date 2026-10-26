@@ -304,6 +304,97 @@ count_path() { jq -c --arg p "$1" 'select(.path | endswith($p))' "$fixture_log" 
 auth_for() { jq -r --arg p "$1" 'select(.path | endswith($p)) | .authorization' "$fixture_log" | tail -n 1; }
 branch_exists() { "$real_git" --git-dir="$remote" rev-parse --verify --quiet "refs/heads/$1" >/dev/null 2>&1; }
 
+# App mode. The App's private key is generated here (a PEM of its own, with the
+# line breaks a PEM has), the GitHub API fixture answers for it, and the runner
+# is driven in process with the API base pointed at the fixture, which is the
+# one seam the runner offers for it (no environment variable exists for the
+# base, in the runner or in production).
+app_id="123456"
+app_pem_file="$work/app.pem"
+node -e 'process.stdout.write(require("node:crypto").generateKeyPairSync("rsa", {modulusLength: 2048}).privateKey.export({type: "pkcs8", format: "pem"}))' > "$app_pem_file"
+app_pem="$(cat "$app_pem_file")"
+app_runner_token="ghs_runner-app-mode-fixture-token"
+app_agent_token="ghs_agent-app-mode-fixture-token"
+github_log=""
+github_url=""
+github_pid=""
+
+start_github() {
+  local label="$1" install_status="${2:-200}"
+  stop_github
+  github_log="$work/$label.github.jsonl"
+  : > "$github_log"
+  rm -f "$work/github.port"
+  GITHUB_FIXTURE_LOG="$github_log" GITHUB_FIXTURE_PORT_FILE="$work/github.port" \
+    GITHUB_FIXTURE_APP_ID="$app_id" GITHUB_FIXTURE_INSTALL_STATUS="$install_status" \
+    node "$here/fixture/github_app_server.js" &
+  github_pid=$!
+  fixture_pids+=("$github_pid")
+  local waited=0
+  while [ ! -s "$work/github.port" ] && [ "$waited" -lt 200 ]; do
+    sleep 0.05
+    waited=$((waited + 1))
+  done
+  if [ ! -s "$work/github.port" ]; then echo "FAIL the GitHub fixture did not start"; exit 1; fi
+  github_url="http://127.0.0.1:$(cat "$work/github.port")"
+}
+
+stop_github() {
+  if [ -n "$github_pid" ]; then
+    kill "$github_pid" 2>/dev/null || true
+    wait "$github_pid" 2>/dev/null || true
+    github_pid=""
+  fi
+}
+
+# One request through the runner in App mode: the same environment run_once
+# gives, with the two App variables in place of the token, and the runner
+# loaded in this shell's node so the test can point its GitHub API base at the
+# fixture before the first request.
+run_app_once() {
+  : > "$git_log"
+  : > "$gh_log"
+  : > "$opencode_log"
+  out="$work/$1.out"
+  rc=0
+  timeout 120 env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" \
+    SRE_API_KEY="$runner_api_key" \
+    SRE_MODEL="$model" \
+    SRE_WORKSPACE="$workspace" \
+    SRE_GITHUB_APP_ID="$app_id" \
+    SRE_GITHUB_APP_PRIVATE_KEY="$app_pem" \
+    SRE_RUN_TIMEOUT_SECONDS="$run_timeout" \
+    node -e '
+      const runner = require(process.argv[1]);
+      const jobs = JSON.parse(require("node:fs").readFileSync(process.argv[2], "utf8"));
+      runner.internals.setGithubApiBase(process.argv[3]);
+      const config = runner.loadConfig();
+      runner.serveJob(config, jobs[0]).then(
+        () => process.exit(0),
+        (error) => { console.error(error.message); process.exit(1); }
+      );
+    ' "$runner" "$queue_file" "$github_url" > "$out" 2>&1 || rc=$?
+  report="$(jq -c 'select(.path | endswith("/report")) | .body' "$fixture_log" | tail -n 1)"
+}
+
+gh_count() { jq -c --arg p "$1" 'select(.path == $p)' "$github_log" | grep -c '' || true; }
+
+# The stubs' token logs accumulate across the whole suite on purpose (case 49
+# reads them whole), so an App case reads only what it added: it notes where
+# each log stood before it ran and reads from there.
+mark_authed=0
+mark_urltokens=0
+mark_ghenv=0
+mark_logs() {
+  mark_authed=$(grep -c '' "$work/git_authed.log" 2>/dev/null || echo 0)
+  mark_urltokens=$(grep -c '' "$work/git_urltokens.log" 2>/dev/null || echo 0)
+  mark_ghenv=$(grep -c '' "$work/gh_env_token.log" 2>/dev/null || echo 0)
+}
+since_authed() { tail -n "+$((mark_authed + 1))" "$work/git_authed.log" 2>/dev/null || true; }
+since_urltokens() { tail -n "+$((mark_urltokens + 1))" "$work/git_urltokens.log" 2>/dev/null || true; }
+since_ghenv() { tail -n "+$((mark_ghenv + 1))" "$work/gh_env_token.log" 2>/dev/null || true; }
+
 echo "--- 1. an empty queue exits cleanly and reports nothing ---"
 queue_none
 start_fixture empty
@@ -1622,11 +1713,152 @@ good_context_evidence="$(jq -c 'select(.path | endswith("/report")) | .body.evid
 if ! jq -e 'has("context_repository")' <<<"$good_context_evidence" >/dev/null; then echo "ok   a run that read its context repository reports no context_repository error"; else echo "FAIL a successful read reported an error: $good_context_evidence"; fail=1; fi
 stop_fixture
 
+echo "--- 55. App mode: the runner mints its own token, the agent a read-only one, and the App variables never reach the agent ---"
+start_fixture appmode
+start_github appmode
+queue_one h-app acme/app
+export STUB_OPENCODE_MODE=fix STUB_EXPECT_GH_TOKEN="$app_agent_token"
+mark_logs
+run_app_once appmode
+if [ "$rc" -eq 0 ]; then echo "ok   an App-mode job exits 0"; else echo "FAIL an App-mode job exited $rc: $(cat "$out")"; fail=1; fi
+if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the pull request is opened with a minted installation token"; else echo "FAIL report: $report"; fail=1; fi
+if [ "$(gh_count /repos/acme/app/installation)" -eq 1 ]; then echo "ok   the installation is looked up once"; else echo "FAIL installation lookups: $(gh_count /repos/acme/app/installation)"; fail=1; fi
+if [ "$(gh_count /app/installations/501/access_tokens)" -eq 2 ]; then echo "ok   two mints: the runner's and the agent's, no more"; else echo "FAIL mints: $(gh_count /app/installations/501/access_tokens)"; fail=1; fi
+agent_mint_body="$(jq -c 'select(.path == "/app/installations/501/access_tokens") | select(.body.permissions != null) | .body' "$github_log" | tail -n 1)"
+if [ "$(jq -c '.permissions' <<<"$agent_mint_body")" = '{"contents":"read"}' ] && [ "$(jq -c '.repositories' <<<"$agent_mint_body")" = '["app"]' ]; then echo "ok   the agent's mint is read-only and scoped to the repository"; else echo "FAIL agent mint body: $agent_mint_body"; fail=1; fi
+runner_mint_body="$(jq -c 'select(.path == "/app/installations/501/access_tokens") | select(.body.permissions == null) | .body' "$github_log" | tail -n 1)"
+if [ "$runner_mint_body" = "null" ]; then echo "ok   the runner's mint asks for the installation's own permissions (no body)"; else echo "FAIL runner mint body: $runner_mint_body"; fail=1; fi
+if [ -s "$work/git_urltokens.log" ] && ! grep -qvx "$app_runner_token" <(since_urltokens); then echo "ok   git's credential helper hands github.com the runner's minted token"; else echo "FAIL git helper tokens: $(since_urltokens | sort -u | cut -c1-30 | tr '\n' ' ')"; fail=1; fi
+if [ -s "$work/gh_env_token.log" ] && ! grep -qvx "$app_runner_token" <(since_ghenv); then echo "ok   gh is given the runner's minted token in GH_TOKEN"; else echo "FAIL gh's GH_TOKEN: $(since_ghenv | sort -u | cut -c1-30 | tr '\n' ' ')"; fail=1; fi
+if grep -qx "gh_token: matches" "$opencode_log"; then echo "ok   the agent's GH_TOKEN is its own read-only mint, not the runner's"; else echo "FAIL gh_token: $(grep gh_token "$opencode_log")"; fail=1; fi
+if grep -qx "sees_SRE_GITHUB_APP_ID: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_APP_PRIVATE_KEY: no" "$opencode_log"; then echo "ok   neither App variable is in the agent's environment"; else echo "FAIL the agent saw an App variable: $(grep sees_SRE_GITHUB_APP "$opencode_log")"; fail=1; fi
+if grep -qx "sees_SRE_GITHUB_TOKEN: no" "$opencode_log" && grep -qx "sees_SRE_API_KEY: no" "$opencode_log"; then echo "ok   the PAT-era variables are stripped as before"; else echo "FAIL scrub: $(grep sees_ "$opencode_log")"; fail=1; fi
+if ! grep -qF -e "$app_runner_token" -e "$app_agent_token" -e "$app_pem" "$work/git_argv.log" "$work/gh_argv.log"; then echo "ok   no minted token and no PEM is on any command line"; else echo "FAIL a credential is on a command line"; fail=1; fi
+if [ -z "$(since_authed | grep -vxE 'clone|fetch|ls-remote|push' || true)" ] && grep -qx push <(since_authed); then echo "ok   the credential reaches only clone, fetch, ls-remote and push, the push included"; else echo "FAIL authed calls: $(sort -u <(since_authed) | tr '\n' ' ')"; fail=1; fi
+if ! grep -qE '^(clone|ls-remote|fetch|push)$' <(tail -n "+$((mark_authed + 1))" "$work/git_plain.log" 2>/dev/null || true); then echo "ok   no call that reaches GitHub went without the credential helper"; else echo "FAIL plain calls: $(sort -u "$work/git_plain.log" | tr '\n' ' ')"; fail=1; fi
+if grep -qx "bash_fence: deny" "$opencode_log"; then echo "ok   the fences reach the agent in App mode unchanged"; else echo "FAIL fences: $(cat "$opencode_log")"; fail=1; fi
+if ! grep -qF -e "$app_runner_token" -e "$app_agent_token" -e "$app_pem" "$out"; then echo "ok   neither minted token nor the PEM is in any log line"; else echo "FAIL a credential was logged"; fail=1; fi
+if branch_exists sre-agent/h-app; then echo "ok   the branch is pushed with the minted token"; else echo "FAIL sre-agent/h-app was not pushed"; fail=1; fi
+stop_github
+stop_fixture
+
+echo "--- 55b. App mode: a request naming no repository is served by the first installation, and the log names it ---"
+start_fixture app-estate
+start_github app-estate
+queue_one h-app-estate ""
+export STUB_OPENCODE_MODE=diagnose
+run_app_once app-estate
+if [ "$rc" -eq 0 ]; then echo "ok   an untargeted App-mode job exits 0"; else echo "FAIL an untargeted App-mode job exited $rc: $(cat "$out")"; fail=1; fi
+if [ "$(gh_count /app/installations)" -eq 1 ]; then echo "ok   the installations are listed once"; else echo "FAIL installations lists: $(gh_count /app/installations)"; fail=1; fi
+if [ "$(gh_count /app/installations/501/access_tokens)" -eq 1 ]; then echo "ok   one mint only: the agent's, since nothing is cloned or pushed"; else echo "FAIL mints: $(gh_count /app/installations/501/access_tokens)"; fail=1; fi
+if jq -c 'select(.path == "/app/installations/501/access_tokens") | .body' "$github_log" | grep -q '"permissions":{"contents":"read"}'; then echo "ok   the estate's agent token is the read-only mint"; else echo "FAIL mint bodies: $(cat "$github_log")"; fail=1; fi
+if jq -c 'select(.path == "/app/installations/501/access_tokens") | .body' "$github_log" | grep -q 'repositories'; then echo "FAIL an untargeted mint named a repository"; fail=1; else echo "ok   the estate's mint names no repository"; fi
+if grep -q "installation 501" "$out" && grep -qi "estate" "$out"; then echo "ok   the log names the installation that serves the estate"; else echo "FAIL installation log line missing: $(grep -i installation "$out" || true)"; fail=1; fi
+if grep -qx "gh_token: matches" "$opencode_log"; then echo "ok   the agent holds its own minted token"; else echo "FAIL gh_token: $(grep gh_token "$opencode_log" || true)"; fail=1; fi
+if [ ! -s "$git_log" ]; then echo "ok   an untargeted App-mode job still never calls git"; else echo "FAIL git was called: $(cat "$git_log")"; fail=1; fi
+if [ "$(jq -r 'has("pr_url")' <<<"$report")" = "false" ]; then echo "ok   the report carries no pr_url"; else echo "FAIL report: $report"; fail=1; fi
+stop_github
+stop_fixture
+
+echo "--- 55c. App mode: a mint failure ends the request with evidence, and nothing is published ---"
+start_fixture app-fail
+start_github app-fail 404
+queue_one h-app-fail acme/app
+export STUB_OPENCODE_MODE=fix
+run_app_once app-fail
+if [ "$rc" -eq 0 ]; then echo "ok   a failed mint is reported, not a crash"; else echo "FAIL a failed mint exited $rc: $(cat "$out")"; fail=1; fi
+if jq -e '.evidence.error | test("404")' <<<"$report" >/dev/null; then echo "ok   the evidence names the status the API answered"; else echo "FAIL evidence: $report"; fail=1; fi
+if [ "$(jq -r 'has("pr_url")' <<<"$report")" = "false" ] && ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ]; then echo "ok   nothing was pushed and no pull request was opened"; else echo "FAIL something was published"; fail=1; fi
+if ! branch_exists sre-agent/h-app-fail; then echo "ok   no branch reaches the repository"; else echo "FAIL sre-agent/h-app-fail exists"; fail=1; fi
+stop_github
+stop_fixture
+
+echo "--- 56. exactly one auth mode: both set, or App with a configured agent token, refuses to start ---"
+start_fixture modes
+queue_none
+for case in both agent-token half-key half-id; do
+  rc=0
+  out="$work/mode-$case.out"
+  extra=()
+  case "$case" in
+    both) extra=(SRE_GITHUB_TOKEN="$github_token" SRE_GITHUB_APP_ID="$app_id" SRE_GITHUB_APP_PRIVATE_KEY="$app_pem") ;;
+    agent-token) extra=(SRE_AGENT_GITHUB_TOKEN="$agent_token" SRE_GITHUB_APP_ID="$app_id" SRE_GITHUB_APP_PRIVATE_KEY="$app_pem") ;;
+    half-key) extra=(SRE_GITHUB_APP_ID="$app_id") ;;
+    half-id) extra=(SRE_GITHUB_APP_PRIVATE_KEY="$app_pem") ;;
+  esac
+  timeout 120 env SRE_ONCE=1 SRE_SERVER_URL="$server_url" SRE_API_KEY="$runner_api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$workspace" SRE_RUN_TIMEOUT_SECONDS="$run_timeout" "${extra[@]}" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then echo "ok   mode $case: refuses to start"; else echo "FAIL mode $case started"; fail=1; fi
+  if [ "$(jq -s 'length' "$fixture_log")" -eq 0 ]; then echo "ok   mode $case: nothing was polled"; else echo "FAIL mode $case polled the queue"; fail=1; fi
+  case "$case" in
+    both) want="exactly one" ;;
+    agent-token) want="SRE_AGENT_GITHUB_TOKEN" ;;
+    half-key|half-id) want="SRE_GITHUB_APP_ID" ;;
+  esac
+  if grep -qF "$want" "$out"; then echo "ok   mode $case: the refusal names what to set"; else echo "FAIL mode $case sentence: $(cat "$out")"; fail=1; fi
+  if ! grep -qF -e "$app_pem" -e "$github_token" -e "$agent_token" "$out"; then echo "ok   mode $case: no credential is printed"; else echo "FAIL mode $case printed a credential"; fail=1; fi
+done
+stop_fixture
+
+echo "--- 57. with no GitHub credential at all, a targeted request is refused honestly and an untargeted one still answers ---"
+start_fixture no-auth
+queue_one h-no-auth acme/app
+export STUB_OPENCODE_MODE=fix
+runner_github_token=""
+run_once no-auth
+runner_github_token="$github_token"
+if [ "$rc" -eq 0 ]; then echo "ok   a start with no credential still answers"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if jq -e '.evidence.error | test("SRE_GITHUB_TOKEN") and test("SRE_GITHUB_APP_ID")' <<<"$report" >/dev/null; then echo "ok   the refusal names both ways to give it a credential"; else echo "FAIL evidence: $report"; fail=1; fi
+if [ "$(jq -r 'has("pr_url")' <<<"$report")" = "false" ] && ! grep -q ' push ' "$git_log"; then echo "ok   nothing was pushed"; else echo "FAIL something was published"; fail=1; fi
+export STUB_OPENCODE_MODE=diagnose
+runner_github_token=""
+# A fresh platform: the queue serves one job per process, and the job's brief
+# and report URLs must name the fixture that is up now.
+start_fixture no-auth-estate
+queue_one h-no-auth-estate ""
+run_once no-auth-estate
+runner_github_token="$github_token"
+if [ "$rc" -eq 0 ] && jq -e '.summary | test("checkout service")' <<<"$report" >/dev/null; then echo "ok   an untargeted request needs no GitHub credential and is answered"; else echo "FAIL report: $report out: $(tail -n 3 "$out")"; fail=1; fi
+if [ "$(jq -r '.evidence.agent_exit_code' <<<"$report")" = "0" ]; then echo "ok   the agent ran"; else echo "FAIL the agent did not run: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 58. App mode: SRE_RUN_TIMEOUT_SECONDS above 3300 refuses, because the agent's token lives an hour ---"
+start_fixture app-timeout
+queue_none
+for bound in 3300 3301; do
+  rc=0
+  out="$work/app-timeout-$bound.out"
+  timeout 120 env SRE_ONCE=1 SRE_SERVER_URL="$server_url" SRE_API_KEY="$runner_api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$workspace" SRE_RUN_TIMEOUT_SECONDS="$bound" \
+    SRE_GITHUB_APP_ID="$app_id" SRE_GITHUB_APP_PRIVATE_KEY="$app_pem" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  if [ "$bound" = "3300" ]; then
+    if [ "$rc" -eq 0 ]; then echo "ok   3300 seconds is inside the bound and starts"; else echo "FAIL 3300 refused: $(cat "$out")"; fail=1; fi
+  else
+    if [ "$rc" -ne 0 ]; then echo "ok   3301 seconds refuses to start"; else echo "FAIL 3301 started"; fail=1; fi
+    if grep -qF 'SRE_RUN_TIMEOUT_SECONDS' "$out" && grep -qF '3300' "$out"; then echo "ok   the refusal names the bound"; else echo "FAIL sentence: $(cat "$out")"; fail=1; fi
+  fi
+done
+stop_fixture
+
+echo "--- 59. the App's private key keeps the line breaks a PEM has, and only surrounding whitespace goes ---"
+pem_wrapped="$(printf '\r\n  %s  \n\n' "$app_pem")"
+pem_loaded="$(cd "$work" && env SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+  SRE_GITHUB_APP_ID="$app_id" SRE_GITHUB_APP_PRIVATE_KEY="$pem_wrapped" node -e '
+    const runner = require(process.argv[1]);
+    const config = runner.loadConfig();
+    console.log(config.githubApp ? JSON.stringify(config.githubApp.privateKey) : "no app");
+  ' "$runner" 2>&1 || true)"
+if [ "$pem_loaded" = "$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.stringify(fs.readFileSync(process.argv[1], "utf8").trim()))' "$app_pem_file")" ]; then echo "ok   the PEM is trimmed of surrounding whitespace and keeps its internal line breaks"; else echo "FAIL the PEM changed shape: ${pem_loaded:0:80}"; fail=1; fi
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
-for token_name in github_token agent_token; do
+for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"
   if ! grep -qF -e "$token" "$work/git_argv.log" "$work/gh_argv.log"; then echo "ok   ${token_name}: not in the argument vector of any of $(grep -c '' "$work/git_argv.log") git arguments or $(grep -c '' "$work/gh_argv.log") gh arguments"; else echo "FAIL ${token_name} is on a command line"; fail=1; fi
 done
+if ! grep -qF -e "$app_pem" "$work/git_argv.log" "$work/gh_argv.log"; then echo "ok   the App's private key is on no command line"; else echo "FAIL the PEM is on a command line"; fail=1; fi
+
 if [ "$(sort -u "$work/git_authed.log" | tr '\n' ' ')" = "clone fetch ls-remote push " ]; then echo "ok   over the whole run the credential went to clone, fetch, ls-remote and push and to no other call"; else echo "FAIL: $(sort -u "$work/git_authed.log" | tr '\n' ' ')"; fail=1; fi
 
 echo "--- 16. validated_fixed is never sent, on any path through the loop ---"

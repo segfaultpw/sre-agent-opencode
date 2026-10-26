@@ -87,7 +87,7 @@ run_runner() {
   out="$work/$label.out"
   rc=0
   (cd "$work" && timeout 60 env SRE_ONCE=1 SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
-    SRE_WORKSPACE="$work/ws" SRE_GITHUB_TOKEN="$github_token" OPENROUTER_API_KEY="$provider_key" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_WORKSPACE="$work/ws" SRE_GITHUB_TOKEN="${runner_github_token-$github_token}" OPENROUTER_API_KEY="$provider_key" SRE_RUN_TIMEOUT_SECONDS=60 \
     "$@" node "$runner") > "$out" 2>&1 || rc=$?
 }
 
@@ -115,7 +115,7 @@ check "the agent's repository token is trimmed" test "$(jq -r '.agentGithubToken
 check "the provider key the agent inherits is trimmed" test "$(jq -r '.provider' <<<"$loaded")" = "$provider_key"
 
 echo "--- 2. a line break inside a secret is refused at start, and the value is never printed ---"
-for name in SRE_API_KEY SRE_GITHUB_TOKEN SRE_AGENT_GITHUB_TOKEN OPENROUTER_API_KEY ANTHROPIC_API_KEY; do
+for name in SRE_API_KEY SRE_GITHUB_TOKEN SRE_AGENT_GITHUB_TOKEN SRE_GITHUB_APP_ID OPENROUTER_API_KEY ANTHROPIC_API_KEY; do
   first="before-$(printf '%s' "$name" | tr -c 'A-Za-z' 'x')-break"
   second="after-$(printf '%s' "$name" | tr -c 'A-Za-z' 'x')-break"
   queue_one "h-inner-$name"
@@ -128,6 +128,37 @@ done
 queue_one h-inner-cr
 run_runner inner_cr "SRE_API_KEY=first-half"$'\r'"second-half"
 check "a carriage return inside a secret is refused too" test "$rc" -ne 0 -a "$(grep -cF 'SRE_API_KEY has a line break inside its value' "$work/inner_cr.out")" -eq 1
+
+echo "--- 2b. the App's private key is the one secret allowed line breaks inside ---"
+app_pem_file="$work/app.pem"
+node -e 'process.stdout.write(require("node:crypto").generateKeyPairSync("rsa", {modulusLength: 2048}).privateKey.export({type: "pkcs8", format: "pem"}))' > "$app_pem_file"
+app_pem="$(cat "$app_pem_file")"
+pem_wrapped="$(printf '\n  %s  \n' "$app_pem")"
+rm -f "$queue_file"
+runner_github_token=""
+run_runner pem "SRE_GITHUB_APP_ID= 123456 " "SRE_GITHUB_APP_PRIVATE_KEY=$pem_wrapped"
+runner_github_token="$github_token"
+check "a PEM with line breaks inside starts in App mode" test "$rc" -eq 0
+check "the trim log names the App variables, never a value" grep -qF 'removed the whitespace around SRE_GITHUB_APP_ID, SRE_GITHUB_APP_PRIVATE_KEY' "$out"
+check "and carries no PEM and no line of it" test -z "$(grep -F -e "$app_pem" -e 'PRIVATE KEY' "$out" || true)"
+pem_loaded="$(cd "$work" && env SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+  SRE_GITHUB_APP_ID=" 123456 " SRE_GITHUB_APP_PRIVATE_KEY="$pem_wrapped" node -e '
+    const runner = require(process.argv[1]);
+    const config = runner.loadConfig();
+    console.log(JSON.stringify({ appId: config.githubApp && config.githubApp.appId, key: config.githubApp && config.githubApp.privateKey }));
+  ' "$runner")"
+check "the App id is trimmed to the number" test "$(jq -r '.appId' <<<"$pem_loaded")" = "123456"
+check "the PEM keeps its internal line breaks" test "$(jq -r '.key' <<<"$pem_loaded")" = "$app_pem"
+
+echo "--- 2c. a key that cannot sign refuses the start, naming the variable and never the value ---"
+rm -f "$queue_file"
+runner_github_token=""
+run_runner pem-bad "SRE_GITHUB_APP_ID=123456" "SRE_GITHUB_APP_PRIVATE_KEY=not a pem at all"
+runner_github_token="$github_token"
+check "an unusable key refuses to start" test "$rc" -ne 0
+check "the refusal names SRE_GITHUB_APP_PRIVATE_KEY" grep -qF 'SRE_GITHUB_APP_PRIVATE_KEY' "$out"
+check "and prints no part of the value" test -z "$(grep -F "not a pem" "$out" || true)"
+check "and nothing was polled" test "$(jq -s 'length' "$fixture_log")" -eq 0
 
 echo "--- 3. a secret that is only whitespace counts as not set ---"
 queue_one h-blank

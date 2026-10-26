@@ -81,9 +81,11 @@ runner="$work/pkg/runner/runner.js"
 fixture_dir="$work/pkg/tests/fixture"
 survivors=()
 fixture_pid=""
+github_pid=""
 # shellcheck disable=SC2329 # the EXIT trap below runs it
 cleanup() {
   if [ -n "$fixture_pid" ]; then kill "$fixture_pid" 2>/dev/null || true; fi
+  if [ -n "$github_pid" ]; then kill "$github_pid" 2>/dev/null || true; fi
   for pid in "${survivors[@]}"; do kill "$pid" 2>/dev/null || true; done
   rm -rf "$work"
 }
@@ -172,6 +174,35 @@ stop_fixture() {
     kill "$fixture_pid" 2>/dev/null || true
     wait "$fixture_pid" 2>/dev/null || true
     fixture_pid=""
+  fi
+}
+
+# App mode: the runner mints its tokens from a local stand-in for the GitHub
+# API, pointed at through the runner's own seam (the API base the in-process
+# harness sets; no environment variable exists for it).
+app_id="123456"
+app_pem_file="$work/app.pem"
+node -e 'process.stdout.write(require("node:crypto").generateKeyPairSync("rsa", {modulusLength: 2048}).privateKey.export({type: "pkcs8", format: "pem"}))' > "$app_pem_file"
+app_pem="$(cat "$app_pem_file")"
+app_runner_token="ghs_runner-app-mode-fixture-token"
+app_agent_token="ghs_agent-app-mode-fixture-token"
+
+start_github() {
+  stop_github
+  rm -f "$work/github.port"
+  GITHUB_FIXTURE_LOG="$work/github.jsonl" GITHUB_FIXTURE_PORT_FILE="$work/github.port" \
+    GITHUB_FIXTURE_APP_ID="$app_id" node "$fixture_dir/github_app_server.js" &
+  github_pid=$!
+  local waited=0
+  while [ ! -s "$work/github.port" ] && [ "$waited" -lt 200 ]; do sleep 0.05; waited=$((waited + 1)); done
+  if [ ! -s "$work/github.port" ]; then echo "FAIL the GitHub fixture did not start"; exit 1; fi
+}
+
+stop_github() {
+  if [ -n "$github_pid" ]; then
+    kill "$github_pid" 2>/dev/null || true
+    wait "$github_pid" 2>/dev/null || true
+    github_pid=""
   fi
 }
 
@@ -339,6 +370,46 @@ prove() {
   if grep -qx 'token_env: ' "$probe3"; then echo "ok   $label: the variable that names the agent token is not in its environment"; else echo "FAIL $label: $(grep token_env "$probe3")"; fail=1; fi
   if ! grep -qF -e "$github_token" -e "$agent_token" "$work/$label.out" "$work/requests.jsonl"; then echo "ok   $label: neither token is in a log line or a report"; else echo "FAIL $label: a token was logged or reported"; fail=1; fi
   extra_runner_env=()
+
+  echo "--- $label: in App mode the agent holds a minted read-only token, and no App credential ---"
+  local probe4="$work/$label.probe4" survivor4="$work/$label.survivor4" out4="$work/$label.app.out" rc4=0
+  : > "$probe4"; : > "$survivor4"; chmod 666 "$probe4" "$survivor4"
+  rm -rf "$work/markers"; mkdir -p "$work/markers"; chmod 777 "$work/markers"
+  start_fixture
+  start_github
+  queue_job "h-$label-4" acme/app acme/patterns
+  timeout 120 "${prefix[@]}" env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_GITHUB_APP_ID="$app_id" SRE_GITHUB_APP_PRIVATE_KEY="$app_pem" \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    HOME="$runner_home" \
+    STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe4" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor4" \
+    STUB_PROBE_GIT="$real_git" STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" \
+    STUB_EXPECT_GH_TOKEN="$app_agent_token" STUB_RUNNER_TOKEN="$app_runner_token" \
+    node -e '
+      const runner = require(process.argv[1]);
+      const jobs = JSON.parse(require("node:fs").readFileSync(process.argv[2], "utf8"));
+      const base = "http://127.0.0.1:" + require("node:fs").readFileSync(process.argv[3], "utf8").trim();
+      runner.internals.setGithubApiBase(base);
+      const config = runner.loadConfig();
+      runner.serveJob(config, jobs[0]).then(
+        () => process.exit(0),
+        (error) => { console.error(error.message); process.exit(1); }
+      );
+    ' "$runner" "$work/queue.json" "$work/github.port" > "$out4" 2>&1 || rc4=$?
+  stop_github
+  stop_fixture
+  survivors+=("$(cat "$survivor4" 2>/dev/null || true)")
+  local report4
+  report4="$(jq -c 'select(.path | endswith("/h-'"$label"'-4/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
+  if [ "$rc4" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report4")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: an App-mode request ends in a pull request"; else echo "FAIL $label: App run rc=$rc4 report=$report4 out=$(tail -n 5 "$out4")"; fail=1; fi
+  if grep -qx "id: $agent_uid:$agent_uid" "$probe4"; then echo "ok   $label: the agent still runs as its own account in App mode"; else echo "FAIL $label: $(cat "$probe4")"; fail=1; fi
+  if grep -qx 'token_env: ' "$probe4"; then echo "ok   $label: no App variable, no token variable and no account variable is in its environment"; else echo "FAIL $label: $(grep token_env "$probe4")"; fail=1; fi
+  if grep -qx 'gh_token: matches' "$probe4" && grep -qx 'credential_helper: ok' "$probe4"; then echo "ok   $label: GH_TOKEN and the helper carry the agent's own minted token"; else echo "FAIL $label: $(grep -E 'gh_token|credential_helper' "$probe4")"; fail=1; fi
+  if grep -qx 'probe_runner_token_visible: no' "$probe4" && grep -qx 'helper_hands_out_runner_token: no' "$probe4"; then echo "ok   $label: the runner's minted token is nowhere in the agent's environment or helper"; else echo "FAIL $label: $(grep -E 'runner_token' "$probe4")"; fail=1; fi
+  if ! grep -qF -e "$app_pem" -e "$app_runner_token" -e "$app_agent_token" "$out4"; then echo "ok   $label: neither minted token nor the PEM is in a log line"; else echo "FAIL $label: a credential was logged"; fail=1; fi
 }
 
 # The root runner carries extra groups, so a child that kept them is caught.
