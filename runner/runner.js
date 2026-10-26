@@ -860,6 +860,22 @@ function resetGitDir(gitDir, cleanUrl) {
   ownByRunner(configPath);
 }
 
+function safeEntries(dir) {
+  try {
+    return fs.readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+function statOrNull(target) {
+  try {
+    return fs.lstatSync(target);
+  } catch {
+    return null;
+  }
+}
+
 function ownByRunner(target) {
   if (identity.mode === 'root') fs.lchownSync(target, identity.runner.uid, identity.runner.gid);
 }
@@ -1585,6 +1601,26 @@ async function settleWorkspace(config) {
       fs.chmodSync(gitDir, 0o700);
     }
   }
+  // The context clones: the parents walk through like the ones above a
+  // checkout (0711, never listable), each clone is re-owned, and the git
+  // directory inside each is re-closed like a gitdir, so a clone left by an
+  // earlier release or a refresh that died part way cannot sit open.
+  settleDir(lay.context, 0o711);
+  for (const owner of safeEntries(lay.context)) {
+    const ownerDir = path.join(lay.context, owner);
+    const ownerStat = statOrNull(ownerDir);
+    if (!ownerStat || !ownerStat.isDirectory()) continue;
+    settleDir(ownerDir, 0o711);
+    for (const name of safeEntries(ownerDir)) {
+      const clone = path.join(ownerDir, name);
+      const stat = statOrNull(clone);
+      if (!stat || !stat.isDirectory()) continue;
+      ownByRunner(clone);
+      const gitDir = path.join(clone, '.git');
+      const gitStat = statOrNull(gitDir);
+      if (gitStat && gitStat.isDirectory()) fs.chmodSync(gitDir, 0o700);
+    }
+  }
   settleDir(lay.memory, 0o700);
   settleDir(lay.scratch, 0o700);
   await chownTree(lay.memory, 'runner');
@@ -1749,8 +1785,8 @@ async function prepareContextRepo(config, job) {
     }
     const defaultBranch = (/^ref:\s+refs\/heads\/(\S+)/m.exec(symref.stdout) || [])[1];
     if (!defaultBranch) throw new Error(`${repo.fullName} did not name a default branch`);
-    settleDir(config.layout.context, 0o755);
-    settleDir(path.dirname(dir), 0o755);
+    settleDir(config.layout.context, 0o711);
+    settleDir(path.dirname(dir), 0o711);
     const lstatOrNull = (target) => {
       try {
         return fs.lstatSync(target);
@@ -1783,16 +1819,22 @@ async function prepareContextRepo(config, job) {
       await git([...inContext, 'fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir, token: config.githubToken });
       await git([...inContext, 'reset', '--hard', `refs/remotes/origin/${defaultBranch}`], { cwd: dir });
     }
-    openContextTree(dir);
     // The git directory is closed like the gitdirs, whatever umask made the
     // clone: one from a start without the account split would otherwise stay
-    // open to the agent's account after an upgrade.
+    // open to the agent's account after an upgrade. Closed BEFORE the tree is
+    // opened: a chmod that cannot finish must not leave the readable half of a
+    // clone behind.
     const closed = await runProcess('chmod', ['-R', 'go-rwx', path.join(dir, '.git')]);
     if (closed.code !== 0) {
       throw new Error(`${repo.fullName}: its clone's git directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
     }
+    openContextTree(dir);
     return { fullName: repo.fullName, dir, defaultBranch, action };
   } catch (error) {
+    // Nothing a later request would adopt: a half-made clone is removed, so
+    // the next one starts clean and reports honestly rather than refreshing a
+    // tree whose shape nobody guaranteed.
+    fs.rmSync(dir, { recursive: true, force: true });
     return failure(error.message);
   }
 }

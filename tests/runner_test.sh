@@ -1590,8 +1590,8 @@ if ! grep -qF 'clone https://github.com/acme/patterns.git' "$git_log"; then echo
 if grep -qF -- "--git-dir=$workspace/context/acme/patterns/.git --work-tree=$workspace/context/acme/patterns fetch --prune https://github.com/acme/patterns.git" "$git_log"; then echo "ok   the clone is refreshed by a fetch that names the git directory and the work tree itself"; else echo "FAIL refresh calls: $(grep -F 'patterns' "$git_log")"; fail=1; fi
 if grep -qF -- "--git-dir=$workspace/context/acme/patterns/.git --work-tree=$workspace/context/acme/patterns reset --hard refs/remotes/origin/main" "$git_log"; then echo "ok   the tree is put back to the default branch's remote head"; else echo "FAIL no reset to the remote head: $(grep -F 'patterns' "$git_log")"; fail=1; fi
 
-# A job whose answer carries no context repository, and a v1.5.0-shaped answer
-# with the key absent: no call about one.
+# A job whose answer carries no context repository, and a fix job's null key
+# (the shape an older platform sends for every request): no call about one.
 start_fixture context_plain
 queue_one h-context-plain acme/app
 run_once context_plain
