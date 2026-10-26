@@ -53,9 +53,11 @@ jobs:
       - run: node --check runner/conventional_title.js
       - run: node --check runner/memory.js
       - run: node --check runner/bucket.js
+      - run: node --check runner/github_app.js
       - run: node tests/memory_test.js
       - run: node tests/bundle_test.js
       - run: node tests/agent_home_test.js
+      - run: node tests/github_app_test.js
       - run: bash tests/runner_test.sh
       - run: bash tests/bucket_test.sh
       - run: bash tests/secret_trim_test.sh
@@ -161,6 +163,7 @@ jobs:
             node --check /opt/sre-agent-opencode/runner/conventional_title.js
             node --check /opt/sre-agent-opencode/runner/memory.js
             node --check /opt/sre-agent-opencode/runner/bucket.js
+            node --check /opt/sre-agent-opencode/runner/github_app.js
             # Every file the runner reads out of the package at run time. A
             # build context rule that excluded one of these would produce an
             # image that builds and then fails its first job.

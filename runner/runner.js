@@ -22,8 +22,14 @@ const { spawn } = require('node:child_process');
 const { conventionalTitle } = require('./conventional_title.js');
 const memory = require('./memory.js');
 const bucket = require('./bucket.js');
+const githubApp = require('./github_app.js');
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
+
+// Where the GitHub API is. Production talks to the one API there is, and no
+// environment variable exists for this: the tests that need a stand-in hand it
+// to the config they build (runner.internals.setGithubApiBase).
+let githubApiBase = githubApp.DEFAULT_API_BASE;
 
 // The platform holds an empty queue open for up to 25 seconds. The request
 // bound is longer than that so a held-open poll is never mistaken for a hung
@@ -35,6 +41,10 @@ const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 60_000;
 const REPORT_ATTEMPTS = 3;
 const HTTP_TIMEOUT_MS = 30_000;
+// App mode's ceiling on SRE_RUN_TIMEOUT_SECONDS. The agent's installation
+// token is minted once per run and lives an hour, so a run must end with five
+// minutes of its token to spare.
+const APP_MODE_MAX_RUN_SECONDS = 3300;
 // How long to wait between polls while an operator has this runner switched
 // off in SRE Agent, and the code the queue says so with.
 const DISABLED_POLL_MS = 60_000;
@@ -263,7 +273,15 @@ const PROVIDER_KEY_VARIABLES = [
   'CEREBRAS_API_KEY', 'MOONSHOT_API_KEY', 'DEEPINFRA_API_KEY', 'HF_TOKEN', 'ZHIPU_API_KEY',
   'MINIMAX_API_KEY', 'NVIDIA_API_KEY', 'OPENCODE_API_KEY', 'AI_GATEWAY_API_KEY',
 ];
-const SECRET_VARIABLES = ['SRE_API_KEY', 'SRE_GITHUB_TOKEN', 'SRE_AGENT_GITHUB_TOKEN', ...PROVIDER_KEY_VARIABLES];
+const SECRET_VARIABLES = [
+  'SRE_API_KEY', 'SRE_GITHUB_TOKEN', 'SRE_AGENT_GITHUB_TOKEN',
+  'SRE_GITHUB_APP_ID', 'SRE_GITHUB_APP_PRIVATE_KEY', ...PROVIDER_KEY_VARIABLES,
+];
+// The App's private key is the one secret that is many lines by design: a PEM
+// signs the JWT and never travels in a header, a command line or an argument,
+// so it keeps its internal line breaks and is trimmed of surrounding
+// whitespace alone.
+const NEWLINE_EXEMPT_VARIABLES = ['SRE_GITHUB_APP_PRIVATE_KEY'];
 
 // A key pasted from a terminal or written with echo arrives with a trailing
 // newline, which an Authorization header refuses and a credential helper sends
@@ -279,7 +297,7 @@ function trimSecrets(env) {
     const value = env[name];
     if (typeof value !== 'string') continue;
     const trimmed = value.trim();
-    if (/[\r\n]/.test(trimmed)) {
+    if (/[\r\n]/.test(trimmed) && !NEWLINE_EXEMPT_VARIABLES.includes(name)) {
       throw fatal(`${name} has a line break inside its value, so it cannot be one secret; set it again as a single line (the value is not printed)`);
     }
     if (trimmed === value) continue;
@@ -300,6 +318,48 @@ function loadConfig() {
   const timeoutSeconds = Number.parseInt(process.env.SRE_RUN_TIMEOUT_SECONDS || '1800', 10);
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
     throw fatal('SRE_RUN_TIMEOUT_SECONDS must be a positive whole number of seconds');
+  }
+
+  // Exactly one GitHub authentication mode: a token (SRE_GITHUB_TOKEN) or a
+  // GitHub App (SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together).
+  // An App half configured, or a token beside the App, is a refusal rather
+  // than a guess about which credential was meant.
+  const appIdRaw = process.env.SRE_GITHUB_APP_ID;
+  const appKey = process.env.SRE_GITHUB_APP_PRIVATE_KEY || '';
+  const patToken = process.env.SRE_GITHUB_TOKEN || '';
+  const appNamed = Boolean(appIdRaw || appKey);
+  const appId = appIdRaw && /^[0-9]+$/.test(appIdRaw) ? Number.parseInt(appIdRaw, 10) : null;
+  const appMode = appId !== null && appKey !== '';
+  if (patToken && appNamed) {
+    throw fatal(
+      'exactly one GitHub authentication mode can be set: SRE_GITHUB_TOKEN alone, or SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together (a GitHub App); unset the one you do not want'
+    );
+  }
+  if (appNamed && !appMode) {
+    throw fatal(
+      'SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY select App mode together: the id is the App\'s numeric id and the key its PEM; set both, or SRE_GITHUB_TOKEN alone for a static token'
+    );
+  }
+  if (appMode && process.env.SRE_AGENT_GITHUB_TOKEN) {
+    throw fatal(
+      'SRE_AGENT_GITHUB_TOKEN cannot be set in App mode: the agent\'s token is minted from the App for each run, read-only on the request\'s repository, so there is nothing to configure; unset SRE_AGENT_GITHUB_TOKEN'
+    );
+  }
+  let githubAuthProvider = null;
+  if (appMode) {
+    if (timeoutSeconds > APP_MODE_MAX_RUN_SECONDS) {
+      throw fatal(
+        `SRE_RUN_TIMEOUT_SECONDS is ${timeoutSeconds} seconds and App mode allows at most ${APP_MODE_MAX_RUN_SECONDS}: the agent's installation token is minted once per run and lives an hour, so the run must not be able to outlive it`
+      );
+    }
+    try {
+      githubApp.buildGitHubJwt(appId, appKey, Date.now());
+    } catch {
+      throw fatal(
+        'SRE_GITHUB_APP_PRIVATE_KEY cannot sign the App\'s JWT: paste the PEM exactly as GitHub offers it, lines and all (the value is not printed)'
+      );
+    }
+    githubAuthProvider = githubApp.createProvider({ appId, privateKey: appKey, baseUrl: githubApiBase, log });
   }
 
   // Validated here, before the first poll, so a bucket the mirror could never
@@ -331,7 +391,7 @@ function loadConfig() {
     identity.agent = { ...identity.agent, home: layout.agentHome };
   }
 
-  return {
+  const config = {
     serverUrl: process.env.SRE_SERVER_URL.replace(/\/+$/, ''),
     apiKey: process.env.SRE_API_KEY,
     model: process.env.SRE_MODEL,
@@ -346,10 +406,14 @@ function loadConfig() {
     lockStaleMs: Math.max(LOCK_STALE_MS, timeoutSeconds * 1000 + LOCK_STALE_MARGIN_MS),
     // {bucket, prefix}; bucket is '' when the operator configured none.
     memoryBucket,
-    githubToken: process.env.SRE_GITHUB_TOKEN || '',
+    githubToken: patToken,
     // Optional: a token for the agent alone, so that it can be read-only while the
-    // runner's own token pushes. Unset, the agent is given the runner's.
+    // runner's own token pushes. Unset, the agent is given the runner's; in App
+    // mode it is refused outright, because the agent's token is minted.
     agentGithubToken: process.env.SRE_AGENT_GITHUB_TOKEN || '',
+    // App mode's token provider, null in token mode. Its mints replace both
+    // tokens above: the runner's per call, the agent's once per run.
+    githubApp: githubAuthProvider,
     runTimeoutMs: timeoutSeconds * 1000,
     runTimeoutSeconds: timeoutSeconds,
     version: readPackageFile('VERSION').trim(),
@@ -361,6 +425,19 @@ function loadConfig() {
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
   };
+  registerConfigSecrets(config);
+  return config;
+}
+
+// Every secret a loaded config holds joins the redaction list here, in the
+// process that loaded it, so no later line has to remember to: the poll key,
+// the static tokens, and the App's private key. The tokens App mode mints join
+// as they are minted, at their call sites below.
+function registerConfigSecrets(config) {
+  constantSecrets.push(config.apiKey);
+  if (config.githubToken) constantSecrets.push(config.githubToken);
+  if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
+  if (config.githubApp) constantSecrets.push(config.githubApp.privateKey);
 }
 
 function httpRequest(target, options = {}) {
@@ -649,6 +726,34 @@ function gitAuthEnv(token) {
     GIT_CONFIG_VALUE_4: GIT_CREDENTIAL_HELPER,
     RUNNER_GIT_PASSWORD: token,
   };
+}
+
+// The credential one request's own git and gh calls carry. A static token is
+// one value; in App mode the installation token for the repository's owner is
+// minted here (and re-minted by the provider as it nears its expiry), and a
+// minted token joins the redaction list the moment the process holds it.
+async function runnerGitToken(config, repo) {
+  if (!config.githubApp) return config.githubToken;
+  const token = await config.githubApp.runnerToken(repo ? repo.owner : null, repo ? repo.name : null);
+  constantSecrets.push(token);
+  return token;
+}
+
+// The agent's own credential: the static agent token, the runner's, or in App
+// mode a mint of its own, read-only on the request's repository (or the first
+// installation's, for a request that names none), asked for once at spawn
+// time and never refreshed, which is why App mode caps the run below its hour.
+async function agentGitToken(config, repo) {
+  if (!config.githubApp) return config.agentGithubToken || config.githubToken;
+  const token = await config.githubApp.agentToken(repo ? repo.owner : null, repo ? repo.name : null);
+  constantSecrets.push(token);
+  return token;
+}
+
+// Whether any GitHub credential is configured at all. A request that needs
+// one is refused with what to set, never with a mint error.
+function hasGithubCredential(config) {
+  return Boolean(config.githubToken || config.githubApp);
 }
 
 function gitSubcommand(args) {
@@ -1633,9 +1738,14 @@ async function settleWorkspace(config) {
 // token is on no command line and never written into .git/config where a later
 // run, or the operator, would find it.
 async function prepareCheckout(config, job, repo) {
-  if (!config.githubToken) {
-    throw new Error('this request names a repository and the runner has no SRE_GITHUB_TOKEN to reach it with');
+  if (!hasGithubCredential(config)) {
+    throw new Error(
+      'this request names a repository and the runner has no GitHub credential to reach it with: set SRE_GITHUB_TOKEN, or SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together (a GitHub App)'
+    );
   }
+  // Minted once here (a static token passes straight through) and carried by
+  // every call below through its environment, never an argument.
+  const token = await runnerGitToken(config, repo);
   const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
   const lay = config.layout;
   const dir = path.join(lay.repos, repo.owner, repo.name);
@@ -1643,7 +1753,7 @@ async function prepareCheckout(config, job, repo) {
   const workspace = { dir, gitdir, repo, branch: null, defaultBranch: null, cleanUrl, baseSha: null };
 
   const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', cleanUrl, 'HEAD'], {
-    env: gitAuthEnv(config.githubToken),
+    env: gitAuthEnv(token),
   });
   if (symref.code !== 0) {
     throw new Error(`${repo.fullName} could not be reached: ${redact(symref.stderr).trim()}`);
@@ -1681,7 +1791,7 @@ async function prepareCheckout(config, job, repo) {
   settleDir(lay.gitdirs, 0o700);
   settleDir(path.dirname(gitdir), 0o700);
   if (!lstatOrNull(gitdir)) {
-    await git(['clone', `--separate-git-dir=${gitdir}`, cleanUrl, dir], { token: config.githubToken });
+    await git(['clone', `--separate-git-dir=${gitdir}`, cleanUrl, dir], { token });
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
   } else {
@@ -1691,7 +1801,7 @@ async function prepareCheckout(config, job, repo) {
     await chownTree(dir, 'runner');
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
-    await gitIn(workspace, ['fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], config.githubToken);
+    await gitIn(workspace, ['fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], token);
   }
   resetGitDir(gitdir, cleanUrl);
 
@@ -1768,17 +1878,22 @@ async function prepareContextRepo(config, job) {
   } catch (error) {
     return failure(error.message);
   }
-  if (!config.githubToken) {
-    return failure(`${repo.fullName} could not be read: this organization set a context repository and the runner has no SRE_GITHUB_TOKEN to reach it with`);
+  if (!hasGithubCredential(config)) {
+    return failure(
+      `${repo.fullName} could not be read: this organization set a context repository and the runner has no GitHub credential to reach it with (set SRE_GITHUB_TOKEN, or SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together for a GitHub App)`
+    );
   }
   const cleanUrl = `https://github.com/${repo.owner}/${repo.name}.git`;
   const dir = path.join(config.layout.context, repo.owner, repo.name);
   try {
+    // Minted inside the best-effort span: a mint that fails here is one more
+    // reason the context repository could not be read, and the request runs.
+    const token = await runnerGitToken(config, repo);
     // The default branch is asked for the way a checkout's is, so the clone and
     // every refresh follow the repository's own head rather than a name baked
     // in when the clone was made.
     const symref = await runProcess('git', [...GIT_HARDENING, 'ls-remote', '--symref', cleanUrl, 'HEAD'], {
-      env: gitAuthEnv(config.githubToken),
+      env: gitAuthEnv(token),
     });
     if (symref.code !== 0) {
       throw new Error(`${repo.fullName} could not be read: ${(symref.stderr || symref.stdout).trim()}`);
@@ -1802,7 +1917,7 @@ async function prepareContextRepo(config, job) {
     let action;
     if (!reusable) {
       fs.rmSync(dir, { recursive: true, force: true });
-      await git(['clone', cleanUrl, dir], { token: config.githubToken });
+      await git(['clone', cleanUrl, dir], { token });
       action = 'cloned';
     } else {
       settleDir(dir, 0o755);
@@ -1816,7 +1931,7 @@ async function prepareContextRepo(config, job) {
       // The git directory and the work tree are named, never discovered, the
       // way the checkout's calls name both.
       const inContext = [`--git-dir=${path.join(dir, '.git')}`, `--work-tree=${dir}`];
-      await git([...inContext, 'fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir, token: config.githubToken });
+      await git([...inContext, 'fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], { cwd: dir, token });
       await git([...inContext, 'reset', '--hard', `refs/remotes/origin/${defaultBranch}`], { cwd: dir });
     }
     // The git directory is closed like the gitdirs, whatever umask made the
@@ -2143,14 +2258,18 @@ async function runAgent(config, workspace, prompt, options = {}) {
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;
   delete env.GITHUB_TOKEN;
+  delete env.SRE_GITHUB_APP_ID;
+  delete env.SRE_GITHUB_APP_PRIVATE_KEY;
   // The agent does get a token, as GH_TOKEN: it clones private repositories as a
   // CI job does, and its git credential helper reads the variable. It is
   // SRE_AGENT_GITHUB_TOKEN when the operator set one (a token that can only
-  // read, so the agent cannot push) and the runner's own otherwise. It does not
-  // get the poll key, the AWS variables or anything of the runner's environment,
-  // and the fences deny git push.
+  // read, so the agent cannot push) and the runner's own otherwise; in App mode
+  // it is a token of its own, minted read-only on this run's repository just
+  // above, so the agent never holds the installation's write permissions. It
+  // does not get the poll key, the AWS variables, the App's id or key, or
+  // anything of the runner's environment, and the fences deny git push.
   delete env.SRE_AGENT_GITHUB_TOKEN;
-  const agentToken = config.agentGithubToken || config.githubToken;
+  const agentToken = await agentGitToken(config, options.repo || null);
   if (agentToken) env.GH_TOKEN = agentToken;
   // The agent's shell would otherwise read the task role's credentials from
   // the container credentials endpoint (or the instance's from its metadata
@@ -2343,7 +2462,11 @@ async function publish(config, workspace, message, brief, result) {
     '-m',
     title,
   ]);
-  await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], config.githubToken);
+  // The push and the pull request carry the runner's credential for this
+  // repository: the static token, or the installation token minted for its
+  // owner (the provider re-mints it here if the cached one is near expiry).
+  const runnerToken = await runnerGitToken(config, repo);
+  await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], runnerToken);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
   const bodyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-')), 'body.md');
@@ -2353,7 +2476,7 @@ async function publish(config, workspace, message, brief, result) {
     ...gitEnv(),
     GIT_DIR: gitdir,
     GIT_WORK_TREE: dir,
-    GH_TOKEN: config.githubToken,
+    GH_TOKEN: runnerToken,
     GH_PROMPT_DISABLED: '1',
   };
   const base = [
@@ -2688,7 +2811,7 @@ async function runTestJob(config, job) {
       const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
       try {
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home });
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
@@ -2841,7 +2964,7 @@ async function handleJob(config, job) {
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home });
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -3054,10 +3177,11 @@ async function serveJob(config, job) {
 
 async function main() {
   const config = loadConfig();
-  constantSecrets.push(config.apiKey);
-  if (config.githubToken) constantSecrets.push(config.githubToken);
-  if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
   logLevel = LEVELS[(process.env.SRE_LOG_LEVEL || 'info').toLowerCase()] || LEVELS.info;
+
+  if (config.githubApp) {
+    log('info', `GitHub authentication: a GitHub App (id ${config.githubApp.appId}); installation tokens are minted per request, the agent's read-only`);
+  }
 
   if (config.trimmed.length > 0) {
     log('info', `removed the whitespace around ${config.trimmed.join(', ')}; a value pasted from a terminal or written with echo carries a line break at the end`);
@@ -3140,6 +3264,10 @@ module.exports = {
     repoLockPath,
     setIdentity: (value) => {
       identity = value;
+    },
+    // The one seam for the GitHub API's base URL, for the tests' stand-in.
+    setGithubApiBase: (value) => {
+      githubApiBase = value;
     },
   },
 };
