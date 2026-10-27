@@ -2554,15 +2554,19 @@ function jobTitle(job, handoffId) {
 
 // The pull request body is read by gh, which runs as the runner's account, so
 // the directory that holds it is the runner's: a root runner (the container
-// model) makes a 0700 directory that is root's and gh could not enter it.
+// model) makes a 0700 directory that is root's and gh could not enter it. The
+// file is written while the directory is still root's and handed over before
+// it, so no process of the runner's account owns the directory while root
+// writes into it (a link planted as body.md would be written through), and 'wx'
+// refuses a name that already exists.
 function writePullRequestBody(text) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-'));
   try {
-    ownByRunner(dir);
     fs.chmodSync(dir, 0o700);
     const file = path.join(dir, 'body.md');
-    fs.writeFileSync(file, text, { mode: 0o600 });
+    fs.writeFileSync(file, text, { mode: 0o600, flag: 'wx' });
     ownByRunner(file);
+    ownByRunner(dir);
     return { dir, file };
   } catch (error) {
     fs.rmSync(dir, { recursive: true, force: true });
