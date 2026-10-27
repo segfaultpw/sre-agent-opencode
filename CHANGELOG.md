@@ -2,6 +2,14 @@
 
 Versions follow semantic versioning. The major tag (`v1`) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v1.8.0
+
+opencode's own logs reach the operator's log group, redacted and bounded.
+
+The server log opencode's errors point at. When opencode answers "Unexpected server error. Check server logs for details.", that log sat in a file inside the agent's home, where nobody looked. The runner now points each run's opencode at `OPENCODE_LOG_PATH`, a file under `opencode-logs/` on its own workspace (never inside the agent's home), and when the process ends, however it ended (a failure, a kill at the timeout, a clean finish), it forwards the file's tail to its own output with the `opencode:` prefix: filter the runner's log group on `opencode:` and the lines are there, also for the test job's model step. Every forwarded line goes through the same redaction as every other line the runner writes (the poll key, the GitHub tokens, the App's private key, minted tokens, the handoff token and the provider keys), and the bounds hold a chatty debug level: at most the last 2 MiB of the file, at most the last 200 non-empty lines, each cut at 2,000 characters with a `...[truncated]` marker, while a line that is not valid UTF-8 is dropped whole and counted in one line. The file is the runner's to name and the agent's account's to fill for the length of its run and nothing else: the directory is the runner's own (walked through, never listed, under the account split), the file is made by the runner before the process starts, and a link, a FIFO or a directory where the file belongs is refused with one line and never followed or read. The file is removed once forwarded (a crash's leftover is swept after a day), and a failed run, a killed run and a failed model step name how many lines were forwarded in the report's evidence (`opencode_log_lines`). A new knob `SRE_OPENCODE_LOG_LEVEL` passes through as `OPENCODE_LOG_LEVEL` when you want the server log's detail; unset, opencode keeps its own default, and the knob never reaches the agent as the runner's own variable. An opencode that ignores `OPENCODE_LOG_PATH` changes nothing: no line is forwarded and no error follows.
+
+What a customer must change on upgrade: nothing. The log path rides the environment of the process the runner starts, the file lives and dies inside the runner's workspace, and the wire contract with the platform does not change; `opencode_log_lines` is a new evidence key a platform that knows nothing of it ignores.
+
 ## v1.7.0
 
 The runner can authenticate to GitHub with a GitHub App instead of a static token, and the agent gets a token of its own that can only read.

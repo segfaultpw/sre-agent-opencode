@@ -1852,6 +1852,116 @@ pem_loaded="$(cd "$work" && env SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_k
   ' "$runner" 2>&1 || true)"
 if [ "$pem_loaded" = "$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.stringify(fs.readFileSync(process.argv[1], "utf8").trim()))' "$app_pem_file")" ]; then echo "ok   the PEM is trimmed of surrounding whitespace and keeps its internal line breaks"; else echo "FAIL the PEM changed shape: ${pem_loaded:0:80}"; fail=1; fi
 
+echo "--- 60. opencode's own log is pointed under the runner's workspace and its tail is forwarded once ---"
+start_fixture olog
+queue_one h-olog acme/app
+export STUB_OPENCODE_MODE=fix
+run_once olog
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the run with opencode's log forwarded still ends in a pull request"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if grep -qx "opencode_log_path: $workspace/opencode-logs/h-olog.log" "$opencode_log"; then echo "ok   opencode is pointed at opencode-logs/<handoff id>.log under the runner's workspace"; else echo "FAIL log path: $(grep opencode_log_path "$opencode_log")"; fail=1; fi
+if grep -qx 'sees_SRE_OPENCODE_LOG_LEVEL: no' "$opencode_log" && grep -qx 'opencode_log_level: missing' "$opencode_log"; then echo "ok   without the knob, no log level variable reaches the agent"; else echo "FAIL level probes: $(grep -E 'log_level|OPENCODE_LOG' "$opencode_log")"; fail=1; fi
+if [ "$(grep -c 'opencode: stub server log: opencode started in' "$out")" -eq 1 ]; then echo "ok   the log's line is forwarded once, with the opencode: prefix"; else echo "FAIL forwarded lines: $(grep -c 'opencode: stub server log:' "$out")"; fail=1; fi
+if [ ! -e "$workspace/opencode-logs/h-olog.log" ]; then echo "ok   the log file is removed once forwarded"; else echo "FAIL $workspace/opencode-logs/h-olog.log was left behind"; fail=1; fi
+stop_fixture
+
+echo "--- 61. SRE_OPENCODE_LOG_LEVEL passes through as OPENCODE_LOG_LEVEL and never as itself ---"
+start_fixture olog-level
+queue_one h-olog-level ""
+export STUB_OPENCODE_MODE=diagnose
+export SRE_OPENCODE_LOG_LEVEL=debug
+run_once olog-level
+unset SRE_OPENCODE_LOG_LEVEL
+if [ "$rc" -eq 0 ]; then echo "ok   a run with the level knob exits 0"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if grep -qx 'opencode_log_level: debug' "$opencode_log"; then echo "ok   the knob's value reaches opencode as OPENCODE_LOG_LEVEL"; else echo "FAIL level: $(grep opencode_log_level "$opencode_log")"; fail=1; fi
+if grep -qx 'sees_SRE_OPENCODE_LOG_LEVEL: no' "$opencode_log"; then echo "ok   the runner's own variable never reaches the agent"; else echo "FAIL the agent saw SRE_OPENCODE_LOG_LEVEL"; fail=1; fi
+if [ "$(grep -c 'opencode: stub server log:' "$out")" -eq 1 ]; then echo "ok   an untargeted run forwards the tail too"; else echo "FAIL forwarded lines: $(grep -c 'opencode: stub server log:' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 62. a failing run forwards the tail and the report's evidence names the count ---"
+start_fixture olog-fail
+queue_one h-olog-fail acme/app
+export STUB_OPENCODE_MODE=provider_error
+run_once olog-fail
+if [ "$(grep -c 'opencode: stub server log:' "$out")" -eq 1 ]; then echo "ok   a failing run forwards opencode's log too"; else echo "FAIL forwarded lines: $(grep -c 'opencode: stub server log:' "$out")"; fail=1; fi
+if [ "$(jq -r '.evidence.opencode_log_lines' <<<"$report")" = "1" ]; then echo "ok   the report's evidence names how many lines were forwarded"; else echo "FAIL evidence: $report"; fail=1; fi
+if [ ! -e "$workspace/opencode-logs/h-olog-fail.log" ]; then echo "ok   the failed run's log file is removed as well"; else echo "FAIL the failed run left its log behind"; fail=1; fi
+stop_fixture
+
+echo "--- 63. a log line carrying the provider key is forwarded redacted ---"
+start_fixture olog-secret
+queue_one h-olog-secret acme/app
+export STUB_OPENCODE_MODE=fix
+provider_key_value="$(printf 'sk-or-v1-%064d' 4)"
+export OPENROUTER_API_KEY="$provider_key_value" STUB_OPENCODE_LOG_SECRET="$provider_key_value"
+run_once olog-secret
+unset OPENROUTER_API_KEY STUB_OPENCODE_LOG_SECRET
+if grep -q 'opencode: stub server log holds the provider key \[redacted\]' "$out"; then echo "ok   the provider key in opencode's log is forwarded as [redacted]"; else echo "FAIL redaction: $(grep 'provider key' "$out" | head -n 2)"; fail=1; fi
+if ! grep -qF "$provider_key_value" "$out"; then echo "ok   the provider key itself appears in no line the runner wrote"; else echo "FAIL the provider key was logged"; fail=1; fi
+stop_fixture
+
+echo "--- 64. more than 200 lines forward only the last 200, and a long line is cut at 2,000 characters ---"
+start_fixture olog-bound
+queue_one h-olog-bound acme/app
+export STUB_OPENCODE_MODE=fix
+export STUB_OPENCODE_LOG_LINES=250 STUB_OPENCODE_LOG_LONG=1
+run_once olog-bound
+unset STUB_OPENCODE_LOG_LINES STUB_OPENCODE_LOG_LONG
+if grep -q 'opencode: stub server log line 52 of 250' "$out" && ! grep -q 'opencode: stub server log line 51 of 250' "$out"; then echo "ok   a log of 252 lines forwards exactly its last 200"; else echo "FAIL bounds: line 51 $(grep -c 'line 51 of 250' "$out"), line 52 $(grep -c 'line 52 of 250' "$out")"; fail=1; fi
+if [ "$(grep -c 'opencode: stub server log line [0-9]* of 250' "$out")" -eq 199 ]; then echo "ok   199 numbered lines survive the window beside the long one"; else echo "FAIL numbered lines forwarded: $(grep -c 'opencode: stub server log line [0-9]* of 250' "$out")"; fail=1; fi
+if grep -qE 'x{2000}\.\.\.\[truncated\]' "$out" && ! grep -qE 'x{2001}' "$out"; then echo "ok   a 5,000 character line is cut at 2,000 with the truncated marker"; else echo "FAIL truncation: $(grep -oE 'x{1995,}[.]{3}[^ ]*' "$out" | head -n 1 | wc -c)"; fail=1; fi
+stop_fixture
+
+echo "--- 65. a line that is not valid UTF-8 is dropped and counted, not forwarded mangled ---"
+start_fixture olog-bad
+queue_one h-olog-bad acme/app
+export STUB_OPENCODE_MODE=fix
+export STUB_OPENCODE_LOG_BADUTF8=1
+run_once olog-bad
+unset STUB_OPENCODE_LOG_BADUTF8
+if grep -q 'opencode: stub good line alpha' "$out" && grep -q 'opencode: stub good line beta' "$out"; then echo "ok   the readable lines around it are forwarded"; else echo "FAIL good lines: $(grep 'stub good' "$out")"; fail=1; fi
+if grep -q 'opencode: 1 unreadable line dropped' "$out"; then echo "ok   the unreadable line is counted in one line"; else echo "FAIL drop count: $(grep -i 'unreadable' "$out")"; fail=1; fi
+if ! LC_ALL=C grep -q $'\xff\xfe' "$out"; then echo "ok   the invalid bytes reach no line the runner wrote"; else echo "FAIL invalid bytes were forwarded"; fail=1; fi
+stop_fixture
+
+echo "--- 66. a FIFO where the log belongs is refused with one line, and the run continues ---"
+start_fixture olog-fifo
+queue_one h-olog-fifo acme/app
+export STUB_OPENCODE_MODE=fix
+mkdir -p "$workspace/opencode-logs"
+rm -f "$workspace/opencode-logs/h-olog-fifo.log"
+mkfifo "$workspace/opencode-logs/h-olog-fifo.log"
+run_once olog-fifo
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a run whose log path is a FIFO still ends in a pull request"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if [ "$(grep -c 'opencode: .*not a regular file' "$out")" -eq 1 ]; then echo "ok   the FIFO is refused with exactly one log line"; else echo "FAIL refusal lines: $(grep 'regular file' "$out")"; fail=1; fi
+if [ "$(grep -c ' opencode: ' "$out")" -eq 1 ]; then echo "ok   nothing of the FIFO was read or forwarded"; else echo "FAIL opencode lines: $(grep ' opencode: ' "$out")"; fail=1; fi
+if [ ! -e "$workspace/opencode-logs/h-olog-fifo.log" ]; then echo "ok   the FIFO is removed with the run's scratch"; else echo "FAIL the FIFO was left behind"; fail=1; fi
+stop_fixture
+
+echo "--- 67. a log file older than a day is swept, and a fresh one is kept ---"
+start_fixture olog-sweep
+queue_one h-olog-sweep acme/app
+export STUB_OPENCODE_MODE=fix
+mkdir -p "$workspace/opencode-logs"
+: > "$workspace/opencode-logs/stale-from-a-crash.log"
+touch -d '2 days ago' "$workspace/opencode-logs/stale-from-a-crash.log"
+: > "$workspace/opencode-logs/fresh-fine.log"
+run_once olog-sweep
+if [ ! -e "$workspace/opencode-logs/stale-from-a-crash.log" ]; then echo "ok   a log older than a day, left by a crash, is swept at the start"; else echo "FAIL the stale log survived"; fail=1; fi
+if [ -e "$workspace/opencode-logs/fresh-fine.log" ]; then echo "ok   a fresh file is left alone by the sweep"; else echo "FAIL the sweep removed a fresh file"; fail=1; fi
+rm -f "$workspace/opencode-logs/fresh-fine.log"
+stop_fixture
+
+echo "--- 68. the test job's model step forwards opencode's log and names the count on failure ---"
+start_fixture olog-test
+queue_test_job h-olog-test ""
+export STUB_OPENCODE_MODE=provider_error
+run_once olog-test
+if grep -qx "opencode_log_path: $workspace/opencode-logs/h-olog-test.log" "$opencode_log"; then echo "ok   the model call is pointed at opencode-logs/<test id>.log"; else echo "FAIL log path: $(grep opencode_log_path "$opencode_log")"; fail=1; fi
+if [ "$(grep -c 'opencode: stub server log:' "$out")" -eq 1 ]; then echo "ok   the model step's opencode log is forwarded"; else echo "FAIL forwarded lines: $(grep -c 'opencode: stub server log:' "$out")"; fail=1; fi
+if [ "$(jq -r '.evidence.opencode_log_lines' <<<"$report")" = "1" ]; then echo "ok   a failed model step names the forwarded line count in evidence"; else echo "FAIL evidence: $report"; fail=1; fi
+if [ ! -e "$workspace/opencode-logs/h-olog-test.log" ]; then echo "ok   the test job's log file is removed too"; else echo "FAIL the test job left its log behind"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

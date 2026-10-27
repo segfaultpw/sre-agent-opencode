@@ -39,6 +39,9 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
     printf 'provider_key: [%s]\n' "${OPENROUTER_API_KEY-unset}"
+    printf 'opencode_log_path: %s\n' "${OPENCODE_LOG_PATH:-missing}"
+    printf 'opencode_log_level: %s\n' "${OPENCODE_LOG_LEVEL:-missing}"
+    if [ -n "${SRE_OPENCODE_LOG_LEVEL+set}" ]; then printf 'sees_SRE_OPENCODE_LOG_LEVEL: yes\n'; else printf 'sees_SRE_OPENCODE_LOG_LEVEL: no\n'; fi
     printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
       printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
@@ -46,6 +49,36 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
       printf 'memory_files: absent\n'
     fi
   } >> "$STUB_OPENCODE_LOG"
+fi
+
+# The runner points opencode's own log at a file under its workspace; a real
+# binary writes its server log there, and the stub writes recognizable lines
+# so the runner's forwarding is provable end to end. A path that is a FIFO or
+# a directory is left alone: the runner refuses to read it, and opening a
+# FIFO to write would never return.
+if [ -n "${OPENCODE_LOG_PATH:-}" ] && [ ! -p "${OPENCODE_LOG_PATH}" ] && [ ! -d "${OPENCODE_LOG_PATH}" ]; then
+  {
+    printf 'stub server log: opencode started in %s\n' "$PWD"
+    if [ -n "${STUB_OPENCODE_LOG_LINES:-}" ]; then
+      number=1
+      while [ "$number" -le "$STUB_OPENCODE_LOG_LINES" ]; do
+        printf 'stub server log line %s of %s\n' "$number" "$STUB_OPENCODE_LOG_LINES"
+        number=$((number + 1))
+      done
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_LONG:-}" ]; then
+      head -c 5000 /dev/zero | tr '\0' 'x'
+      printf '\n'
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_SECRET:-}" ]; then
+      printf 'stub server log holds the provider key %s\n' "$STUB_OPENCODE_LOG_SECRET"
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_BADUTF8:-}" ]; then
+      printf 'stub good line alpha\n'
+      printf 'stub bad line has \xff\xfe invalid bytes and a tail of text that goes on\n'
+      printf 'stub good line beta\n'
+    fi
+  } >> "$OPENCODE_LOG_PATH"
 fi
 
 # What the agent can reach from where it runs, for tests/uid_split_test.sh: the

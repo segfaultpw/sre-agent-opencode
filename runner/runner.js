@@ -320,6 +320,15 @@ function loadConfig() {
     throw fatal('SRE_RUN_TIMEOUT_SECONDS must be a positive whole number of seconds');
   }
 
+  // The level opencode itself logs at: the runner's knob for it, read once
+  // here and handed to the process the runner starts as OPENCODE_LOG_LEVEL.
+  // Unset (the default) leaves opencode at its own default level.
+  const opencodeLogLevelRaw = process.env.SRE_OPENCODE_LOG_LEVEL;
+  const opencodeLogLevel = typeof opencodeLogLevelRaw === 'string' ? opencodeLogLevelRaw.trim() : '';
+  if (/[\r\n]/.test(opencodeLogLevel)) {
+    throw fatal('SRE_OPENCODE_LOG_LEVEL has a line break inside its value, so it cannot be one level; set it again as a single line (the value is not printed)');
+  }
+
   // Exactly one GitHub authentication mode: a token (SRE_GITHUB_TOKEN) or a
   // GitHub App (SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together).
   // An App half configured, or a token beside the App, is a refusal rather
@@ -421,6 +430,9 @@ function loadConfig() {
     // Only the exact value 1 opts in. The module's agent_aws_access variable
     // sets it, and a typo must leave the agent without the task role.
     agentAwsAccess: process.env.SRE_AGENT_AWS_ACCESS === '1',
+    // '' when SRE_OPENCODE_LOG_LEVEL is unset or empty: opencode keeps its own
+    // default level, and the variable never reaches the agent as itself.
+    opencodeLogLevel,
     identity,
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
@@ -438,6 +450,12 @@ function registerConfigSecrets(config) {
   if (config.githubToken) constantSecrets.push(config.githubToken);
   if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
   if (config.githubApp) constantSecrets.push(config.githubApp.privateKey);
+  // The provider keys are the agent's own to use, and opencode's log can quote
+  // them back: whatever the runner prints goes through redact(), so they join
+  // the list like every other secret the process holds.
+  for (const name of PROVIDER_KEY_VARIABLES) {
+    if (process.env[name]) constantSecrets.push(process.env[name]);
+  }
 }
 
 function httpRequest(target, options = {}) {
@@ -2237,6 +2255,171 @@ function splitMemorySummary(message, hadBlock) {
   return { message, summary: '' };
 }
 
+// opencode's own log, the "server logs" its errors point at. The runner points
+// the process at a file of its own under the workspace (never inside the
+// agent's home, whose account must not be able to write what is forwarded),
+// and when the process ends it forwards the file's tail to its own output with
+// the `opencode:` prefix, so the operator's log group holds what the sentence
+// asks for. Every line goes through log(), so through redact(), and the bounds
+// hold whatever a chatty debug level produces: at most the last 2 MiB of the
+// file, at most the last 200 non-empty lines, each cut at 2,000 characters.
+const OPENCODE_LOG_DIRNAME = 'opencode-logs';
+const OPENCODE_LOG_MAX_LINES = 200;
+const OPENCODE_LOG_MAX_CHARS = 2000;
+const OPENCODE_LOG_TAIL_BYTES = 2 * 1024 * 1024;
+const OPENCODE_LOG_STALE_MS = 24 * 60 * 60 * 1000;
+const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
+function opencodeLogPath(config, id) {
+  if (typeof id !== 'string' || !RUN_ID.test(id)) return null;
+  return path.join(config.layout.workspace, OPENCODE_LOG_DIRNAME, `${id}.log`);
+}
+
+// The directory is the runner's alone, made when a run first needs it and
+// swept of last day's leftovers, which only a crash can leave: a file that
+// ends with its run is removed the moment it has been forwarded. The run's
+// file is made here too: the agent's account fills it for the length of the
+// run (opencode runs as the agent) and can neither list the directory, nor
+// create or replace anything in it, so it cannot choose the path, plant a
+// link in its place or leave a file for another run.
+function openOpencodeLog(config, id) {
+  const file = opencodeLogPath(config, id);
+  if (!file) return null;
+  const dir = path.dirname(file);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    if (!fs.lstatSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`);
+    ownByRunner(dir);
+    // 0711 under the account split, the mode of every directory the agent
+    // walks through: it reaches its own log file and nothing else in here.
+    // One account, one mode: 0700, closed like the runner's other state.
+    fs.chmodSync(dir, identity.mode === 'none' ? 0o700 : 0o711);
+    sweepOpencodeLogs(dir);
+    try {
+      fs.closeSync(fs.openSync(file, 'wx', 0o600));
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    if (identity.mode !== 'none' && identity.agent) fs.lchownSync(file, identity.agent.uid, identity.agent.gid);
+  } catch (error) {
+    log('warn', `opencode's log could not be prepared (${redact(error.message)}); the run goes ahead without it`);
+    return null;
+  }
+  return file;
+}
+
+function sweepOpencodeLogs(dir) {
+  for (const name of fs.readdirSync(dir)) {
+    const entry = path.join(dir, name);
+    let stat;
+    try {
+      stat = fs.lstatSync(entry);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || Date.now() - stat.mtimeMs <= OPENCODE_LOG_STALE_MS) continue;
+    fs.rmSync(entry, { force: true });
+  }
+}
+
+// Reads the file's tail and logs it, then removes the file: the log group
+// holds the lines, and nothing on the volume grows with the runs. A missing
+// file is not an error (an opencode that ignores the knob, or a run that never
+// reached it) and forwards nothing. Returns the number of lines forwarded, or
+// null when there was nothing to forward or the path was refused.
+function forwardOencodeLog(file, options = {}) {
+  const maxLines = options.lines || OPENCODE_LOG_MAX_LINES;
+  const maxChars = options.chars || OPENCODE_LOG_MAX_CHARS;
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch {
+    return null;
+  }
+  // A link, a FIFO or a directory where the log belongs is never followed and
+  // never read: the agent's account cannot make the runner read a file of its
+  // choosing. A non-directory at the path goes with the run's scratch.
+  if (!stat.isFile()) {
+    log('warn', `opencode: ${path.basename(file)} is not a regular file, so it was not read`);
+    if (!stat.isDirectory()) fs.rmSync(file, { force: true });
+    return null;
+  }
+  // The file was the agent's for the length of its run; the run is over, so it
+  // is the runner's again before anything is read from it.
+  if (identity.mode !== 'none' && identity.agent) {
+    try {
+      fs.lchownSync(file, identity.runner.uid, identity.runner.gid);
+    } catch {
+      // Without it the read below fails closed; the sweep takes the file.
+    }
+  }
+  const size = stat.size;
+  const length = Math.min(size, OPENCODE_LOG_TAIL_BYTES);
+  const buffer = Buffer.alloc(length);
+  let read = 0;
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    // What was opened is what was measured: a swap between the two stats
+    // fails closed rather than reading something else.
+    if (!fs.fstatSync(fd).isFile()) throw new Error('not a regular file');
+    const start = Math.max(0, size - OPENCODE_LOG_TAIL_BYTES);
+    while (read < length) {
+      const got = fs.readSync(fd, buffer, read, length - read, start + read);
+      if (got <= 0) break;
+      read += got;
+    }
+  } catch (error) {
+    log('warn', `opencode: the log could not be read (${redact(error.message)})`);
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  let forwarded = 0;
+  let dropped = 0;
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const lines = [];
+  let begin = 0;
+  for (let at = 0; at <= read; at += 1) {
+    if (at !== read && buffer[at] !== 0x0a) continue;
+    let end = at;
+    if (end > begin && buffer[end - 1] === 0x0d) end -= 1;
+    if (end > begin) lines.push(buffer.subarray(begin, end));
+    begin = at + 1;
+  }
+  for (const raw of lines.slice(-maxLines)) {
+    let line = null;
+    // A NUL byte or a sequence that is not UTF-8 is dropped whole, never
+    // forwarded mangled: counted in one line instead.
+    if (!raw.includes(0)) {
+      try {
+        line = decoder.decode(raw);
+      } catch {
+        line = null;
+      }
+    }
+    if (line === null) {
+      dropped += 1;
+      continue;
+    }
+    log('info', `opencode: ${boundedLine(line, maxChars)}`);
+    forwarded += 1;
+  }
+  if (dropped > 0) log('warn', `opencode: ${dropped} unreadable line${dropped === 1 ? '' : 's'} dropped`);
+  fs.rmSync(file, { force: true });
+  return forwarded;
+}
+
+// One line at most `maxChars` long, cut at a character boundary and marked,
+// so a page of debug output cannot become a page of log group.
+function boundedLine(line, maxChars) {
+  if (line.length <= maxChars) return line;
+  let cut = line.slice(0, maxChars);
+  // A surrogate pair cut in half is not a character any output can show.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  return `${cut}...[truncated]`;
+}
+
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
 // fences handed over the way fix.yml hands them over. The runner's own
 // credentials are stripped from the child's environment: the agent has a
@@ -2276,6 +2459,17 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // service variables) and reach anything the role holds. The runner's own
   // process keeps them; only the module's agent_aws_access opts the agent in.
   delete env.SRE_AGENT_AWS_ACCESS;
+  // opencode's own log is the runner's business: the knob never reaches the
+  // agent as the runner's variable, and an inherited OPENCODE_LOG_* value from
+  // the runner's own environment never survives either. What the process gets
+  // is what this run chose: the runner's file, and the level it was given.
+  delete env.SRE_OPENCODE_LOG_LEVEL;
+  delete env.OPENCODE_LOG_PATH;
+  delete env.OPENCODE_LOG_LEVEL;
+  if (options.opencodeLog) {
+    env.OPENCODE_LOG_PATH = options.opencodeLog;
+    if (config.opencodeLogLevel) env.OPENCODE_LOG_LEVEL = config.opencodeLogLevel;
+  }
   // Where the memory is mirrored to is the runner's business: the agent edits a
   // copy in its checkout and has no use for the bucket.
   for (const name of Object.keys(env)) {
@@ -2321,6 +2515,11 @@ async function runAgent(config, workspace, prompt, options = {}) {
     home: options.home,
     timeoutMs: options.timeoutMs || config.runTimeoutMs,
   });
+  // Once, right after the process ends, whatever ended it: the tail of
+  // opencode's own log goes to the operator's log group and the file goes.
+  // null when this run kept no log (or the path was refused), which the
+  // failure paths below can name in their evidence.
+  const opencodeLogLines = options.opencodeLog ? forwardOencodeLog(options.opencodeLog) : null;
 
   const texts = [];
   const errors = [];
@@ -2350,6 +2549,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
     stderr: result.stderr,
+    opencodeLogLines,
   };
 }
 
@@ -2809,16 +3009,25 @@ async function runTestJob(config, job) {
       let agent;
       let quiet = true;
       const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
+      // opencode's own log for this test job, the one its "check server logs"
+      // errors point at: the step the bug report named is the one that needs
+      // it most, and the model call keeps every scrubbing and bound a fix has.
+      const opencodeLog = openOpencodeLog(config, job.handoff_id);
       try {
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo });
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, opencodeLog });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
-      if (!quiet) return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
-      return modelVerdict(agent, timeoutMs);
+      if (!quiet) {
+        if (agent && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+        return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
+      }
+      const verdict = modelVerdict(agent, timeoutMs);
+      if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+      return verdict;
     });
 
     await step('memory', async () => {
@@ -2960,11 +3169,14 @@ async function handleJob(config, job) {
     // Made while the tree is still the runner's: the bundle needs the runner's
     // git directory, and nothing of the agent's.
     const bundle = repo ? await makeBaseBundle(workspace) : null;
+    // opencode's own log for this run, under the runner's workspace: made
+    // before the agent starts, forwarded and removed when the run ends.
+    const opencodeLog = openOpencodeLog(config, job.handoff_id);
     try {
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo });
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, opencodeLog });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -3004,6 +3216,9 @@ async function handleJob(config, job) {
     if (agent.timedOut) {
       result.summary = `The agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds) and nothing was published.`;
       result.evidence.timed_out = true;
+      // The killed run's log was forwarded too; the count says how much of it
+      // the log group holds, the file itself is already gone.
+      if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       if (agent.abandoned) {
         // Reported rather than hidden: the operator is the only one who can
         // go and look, and a process still holding the pipes after a kill is
@@ -3031,6 +3246,9 @@ async function handleJob(config, job) {
       // The tail rather than the whole stream: a failed run's last words are
       // what names the cause, and the platform caps an entry at a kilobyte.
       if (agent.stderr.trim()) result.evidence.agent_stderr = redact(agent.stderr).trim().slice(-1000);
+      // opencode's own log is where its error sentence points: the count of
+      // forwarded lines tells the operator how much of it the log group holds.
+      if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       return result;
     }
     if (isDecline(agent.finalMessage)) {
