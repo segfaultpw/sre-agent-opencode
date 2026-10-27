@@ -100,7 +100,10 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'other_home_list: %s\n' "$(allowed ls "$HOME/../other")"
     printf 'other_home_write: %s\n' "$(allowed bash -c ": >> '$HOME/../other/planted'")"
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
-    printf 'runner_environ: %s\n' "$(if cat "/proc/$PPID/environ" >/dev/null 2>&1; then echo readable; else echo denied; fi)"
+    # The runner's pid, named by the shim: this process's own parent is the
+    # shim, an account like this one, so what must stay unreadable is the
+    # runner behind it.
+    printf 'runner_environ: %s\n' "$(if cat "/proc/${STUB_RUNNER_PID:-$PPID}/environ" >/dev/null 2>&1; then echo readable; else echo denied; fi)"
     printf 'memory_list: %s\n' "$(allowed ls "$ws/memory")"
     printf 'memory_write: %s\n' "$(allowed bash -c ": >> '$ws/memory/acme/app/NOTES.md'")"
     printf 'other_read: %s\n' "$(allowed ls "$ws/repos/acme/other")"

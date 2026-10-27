@@ -196,7 +196,14 @@ printf '%s\n' "$pr_url"
 EOF
 chmod +x "$work/bin/gh"
 
-install -m 755 "$here/fixture/stub_opencode.sh" "$work/bin/opencode"
+# The PATH binary is a node shim rather than the bash stub itself: bash resets
+# a PWD that does not match its working directory before any script line runs,
+# so only the first process of the spawn can record the PWD the runner handed
+# opencode, and opencode reads that variable before the working directory to
+# find the run's project.
+install -m 755 "$here/fixture/opencode_shim.js" "$work/bin/opencode"
+install -m 755 "$here/fixture/stub_opencode.sh" "$work/bin/opencode.sh"
+export STUB_OPENCODE_BIN="$work/bin/opencode.sh"
 
 export PATH="$work/bin:$PATH"
 mkdir -p "$work/ctl"
@@ -289,7 +296,11 @@ run_once() {
   # A wall clock around every case, because the failure this bound catches is
   # a pass that never returns: the one shape where the platform is told the
   # runner never answered while it is sitting there alive.
+  # The image's entrypoint is a bash script, so the runner carries the
+  # container's own PWD; this hands it one that names no workspace, the
+  # starting point opencode must not resolve a run's project from.
   timeout 120 env SRE_ONCE=1 \
+    PWD="$work" \
     SRE_SERVER_URL="$server_url" \
     SRE_API_KEY="$runner_api_key" \
     SRE_MODEL="$model" \
@@ -488,6 +499,7 @@ if [ "$(jq -r 'has("pr_url")' <<<"$report")" = "false" ]; then echo "ok   the re
 if [ "$(jq -r 'has("memory")' <<<"$report")" = "false" ]; then echo "ok   an untargeted run that changed no memory reports no memory key"; else echo "FAIL report: $report"; fail=1; fi
 if jq -e '.summary | test("acme/checkout")' <<<"$report" >/dev/null; then echo "ok   the diagnosis is reported as the summary"; else echo "FAIL summary: $report"; fail=1; fi
 if grep -qx "cwd: $workspace/scratch" "$opencode_log"; then echo "ok   an untargeted job runs in a scratch workspace with no checkout"; else echo "FAIL cwd: $(cat "$opencode_log")"; fail=1; fi
+if grep -qx "inherited_pwd: $workspace/scratch" "$opencode_log"; then echo "ok   the spawned opencode inherits a PWD that matches its working directory"; else echo "FAIL inherited PWD: $(grep inherited_pwd "$opencode_log")"; fail=1; fi
 stop_fixture
 
 echo "--- 6. a decline reports the reason and pushes nothing ---"
@@ -1433,7 +1445,7 @@ chmod +x "$work/env_shim/env"
 : > "$work/probe.log"
 for _ in 1 2 3; do
   PATH="$work/env_shim:$PATH" STUB_OPENCODE_LOG="$work/probe.log" STUB_RUNNER_TOKEN="$probe_token" STUB_OPENCODE_MODE=silent \
-    bash "$work/bin/opencode" < /dev/null > /dev/null 2>&1 || true
+    "$work/bin/opencode" < /dev/null > /dev/null 2>&1 || true
 done
 if [ "$(grep -cx 'runner_token_visible: yes' "$work/probe.log")" -eq 3 ]; then echo "ok   a token the environment holds is seen as visible, three times out of three"; else echo "FAIL probe log: $(grep runner_token_visible "$work/probe.log")"; fail=1; fi
 if ! grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh" >/dev/null; then echo "ok   no pipeline in the stub ends with grep -q"; else echo "FAIL $(grep -nE '\| *grep -[a-zA-Z]*q' "$pkg/tests/fixture/stub_opencode.sh")"; fail=1; fi
@@ -1859,6 +1871,7 @@ export STUB_OPENCODE_MODE=fix
 run_once olog
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the run with opencode's log forwarded still ends in a pull request"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
 if grep -qx "opencode_log_path: $workspace/opencode-logs/h-olog.log" "$opencode_log"; then echo "ok   opencode is pointed at opencode-logs/<handoff id>.log under the runner's workspace"; else echo "FAIL log path: $(grep opencode_log_path "$opencode_log")"; fail=1; fi
+if grep -qx "inherited_pwd: $workspace/repos/acme/app" "$opencode_log"; then echo "ok   the run's PWD names the checkout, so opencode roots its project there"; else echo "FAIL inherited PWD: $(grep inherited_pwd "$opencode_log")"; fail=1; fi
 if grep -qx 'sees_SRE_OPENCODE_LOG_LEVEL: no' "$opencode_log" && grep -qx 'opencode_log_level: missing' "$opencode_log"; then echo "ok   without the knob, no log level variable reaches the agent"; else echo "FAIL level probes: $(grep -E 'log_level|OPENCODE_LOG' "$opencode_log")"; fail=1; fi
 if [ "$(grep -c 'opencode: stub server log: opencode started in' "$out")" -eq 1 ]; then echo "ok   the log's line is forwarded once, with the opencode: prefix"; else echo "FAIL forwarded lines: $(grep -c 'opencode: stub server log:' "$out")"; fail=1; fi
 if [ ! -e "$workspace/opencode-logs/h-olog.log" ]; then echo "ok   the log file is removed once forwarded"; else echo "FAIL $workspace/opencode-logs/h-olog.log was left behind"; fail=1; fi

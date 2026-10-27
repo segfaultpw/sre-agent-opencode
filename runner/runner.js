@@ -542,6 +542,12 @@ function runProcess(command, args, options = {}) {
   const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null } = options;
   const launched = launch(command, args, requestedEnv, as, home);
   const env = launched.env;
+  // A shell hands every command a PWD that matches its working directory; a
+  // spawn does not, so a child can see the runner's own PWD (the image's
+  // WORKDIR) while standing in the checkout. opencode resolves the run's
+  // project from PWD before the working directory, so that mismatch rooted
+  // every run at /workspace instead of the repository.
+  if (cwd) env.PWD = cwd;
   return new Promise((resolve) => {
     // Its own process group: opencode starts a local server of its own, and a
     // timeout that killed only the parent would leave that child holding the
