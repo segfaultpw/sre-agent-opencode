@@ -108,8 +108,9 @@ jobs:
             "$IMAGE:$TAG-arm64"
           docker buildx imagetools inspect "$IMAGE:$TAG"
 
-      # The moving major is what an operator following "the current v1" pulls,
-      # so a prerelease leaves it where it is, exactly as the git tag does.
+      # The moving major is what an operator following "the current major"
+      # pulls (v2 since 2.0.0), so a prerelease leaves it where it is, exactly
+      # as the git tag does.
       - name: Move the moving major image tag
         if: needs.check.outputs.prerelease != 'true'
         env:
