@@ -152,7 +152,13 @@ id -u >> "\$(cat "$work/ctl/gh_uid_log")"
 if [ -s "$work/ctl/gh_home_log" ]; then printf '%s\n' "\$HOME" >> "\$(cat "$work/ctl/gh_home_log")"; fi
 printf '%s\n' "https://github.com/acme/app/pull/7"
 EOF
-install -m 755 "$fixture_dir/stub_opencode.sh" "$work/bin/opencode"
+# The PATH binary is a node shim that records the PWD the runner handed
+# opencode and hands everything to the bash stub, for the same reason as in
+# tests/runner_test.sh: bash resets a PWD that does not match its working
+# directory before any script line runs.
+install -m 755 "$fixture_dir/opencode_shim.js" "$work/bin/opencode"
+install -m 755 "$fixture_dir/stub_opencode.sh" "$work/bin/opencode.sh"
+export STUB_OPENCODE_BIN="$work/bin/opencode.sh"
 chmod 755 "$work/bin/git" "$work/bin/gh"
 
 export PATH="$work/bin:$PATH"
@@ -293,6 +299,8 @@ prove() {
   survivors+=("$(cat "$survivor" 2>/dev/null || true)")
 
   if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: the request ends in a pull request"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if grep -q 'opencode: timestamp=.*stub server log: opencode started in' "$out"; then echo "ok   $label: the structured server log opencode wrote on its stderr is forwarded"; else echo "FAIL $label: no forwarded opencode line: $(grep -m 2 'opencode' "$out" || true)"; fail=1; fi
+  if [ ! -e "$ws/opencode-logs" ]; then echo "ok   $label: no opencode-logs directory is ever created in the workspace"; else echo "FAIL $label: $ws/opencode-logs was left behind"; fail=1; fi
   if grep -qx "id: $agent_uid:$agent_uid" "$probe"; then echo "ok   $label: the agent runs as its own uid and gid"; else echo "FAIL $label: $(cat "$probe")"; fail=1; fi
   if grep -qx 'groups: ' "$probe"; then echo "ok   $label: its supplementary groups are cleared"; else echo "FAIL $label: $(grep groups "$probe")"; fail=1; fi
   if grep -qx 'cap_eff: 0000000000000000' "$probe"; then echo "ok   $label: it holds no capability"; else echo "FAIL $label: $(grep cap_eff "$probe")"; fail=1; fi

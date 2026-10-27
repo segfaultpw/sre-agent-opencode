@@ -2,6 +2,18 @@
 
 Versions follow semantic versioning. The major tag (`v1`) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v1.8.0
+
+opencode's own logs reach the operator's log group, redacted and bounded.
+
+The server log opencode's errors point at. When opencode answers "Unexpected server error. Check server logs for details.", that log stayed on the machine where nobody looked. The runner now starts each run's opencode with `OPENCODE_PRINT_LOGS=1`, the variable the binary reads: its structured server log is one `timestamp=... level=... run=... message=...` line per event, written on the process's stderr (the binary reads no `OPENCODE_LOG_PATH`, so no file is involved). When the process ends, however it ended (a failure, a kill at the timeout, a clean finish), the runner forwards the tail of those lines from the captured stderr to its own output with the `opencode:` prefix: filter the runner's log group on `opencode:` and the lines are there, also for the test job's model step. Every forwarded line goes through the same redaction as every other line the runner writes (the poll key, the GitHub tokens, the App's private key, minted tokens, the handoff token and the provider keys), applied to the whole line before the line is cut, so a secret straddling the bound cannot survive as half of itself, and the bounds hold a chatty level: at most the last 200 lines, each cut at 2,000 characters with a `...[truncated]` marker, while a line that is not valid UTF-8 or holds a NUL byte is dropped whole and counted in one line, and one summary line names how many lines a bound dropped. A failed run, a killed run and a failed model step name how many lines were forwarded in the report's evidence (`opencode_log_lines`). A new knob `SRE_OPENCODE_LOG_LEVEL` passes through as `OPENCODE_LOG_LEVEL` when you want the server log's detail; unset, opencode keeps its own default, and the knob never reaches the agent as the runner's own variable.
+
+Every process the runner starts now carries a PWD that matches its working directory.
+
+The image's entrypoint is a bash script, so the runner itself carried the container's PWD (`/workspace`), and every process it started inherited that value while standing somewhere else. opencode resolves a run's project from PWD before the working directory, so each run opened a second instance rooted at the container's workspace and ran its session against that directory's project rather than the repository's checkout; on an account-split layout the workspace's permissions refuse that boot, and every run ended at the model step with `Unexpected server error`. The runner now hands each child process a PWD naming the directory it runs in, the way a shell does, so opencode roots its project where the run actually happens: the checkout for a request that names a repository, the scratch workspace for one that names none.
+
+What a customer must change on upgrade: nothing. The print switch and the level ride the environment of the process the runner starts, the lines live and die inside the runner's own output, and the wire contract with the platform does not change; `opencode_log_lines` is a new evidence key a platform that knows nothing of it ignores.
+
 ## v1.7.0
 
 The runner can authenticate to GitHub with a GitHub App instead of a static token, and the agent gets a token of its own that can only read.

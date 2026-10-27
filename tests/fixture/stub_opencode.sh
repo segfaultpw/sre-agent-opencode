@@ -39,6 +39,10 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
     printf 'provider_key: [%s]\n' "${OPENROUTER_API_KEY-unset}"
+    printf 'opencode_print_logs: %s\n' "${OPENCODE_PRINT_LOGS:-missing}"
+    printf 'opencode_log_level: %s\n' "${OPENCODE_LOG_LEVEL:-missing}"
+    if [ -n "${OPENCODE_LOG_PATH+set}" ]; then printf 'sees_OPENCODE_LOG_PATH: yes\n'; else printf 'sees_OPENCODE_LOG_PATH: no\n'; fi
+    if [ -n "${SRE_OPENCODE_LOG_LEVEL+set}" ]; then printf 'sees_SRE_OPENCODE_LOG_LEVEL: yes\n'; else printf 'sees_SRE_OPENCODE_LOG_LEVEL: no\n'; fi
     printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
       printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
@@ -46,6 +50,47 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
       printf 'memory_files: absent\n'
     fi
   } >> "$STUB_OPENCODE_LOG"
+fi
+
+# The runner starts opencode with OPENCODE_PRINT_LOGS=1, and the real binary
+# answers by writing its structured server log, one
+# `timestamp=... level=... run=... message=...` line per event, on its stderr.
+# The stub writes the same shape there so the runner's forwarding is provable
+# end to end, and the STUB_OPENCODE_LOG_* variables shape what one case needs.
+if [ "${OPENCODE_PRINT_LOGS:-}" = "1" ]; then
+  {
+    printf 'timestamp=2026-10-27T00:00:00.000Z level=INFO run=stub message="stub server log: opencode started in %s"\n' "$PWD"
+    if [ -n "${STUB_OPENCODE_LOG_LINES:-}" ]; then
+      number=1
+      while [ "$number" -le "$STUB_OPENCODE_LOG_LINES" ]; do
+        printf 'timestamp=2026-10-27T00:00:01.000Z level=INFO run=stub message="stub server log line %s of %s"\n' "$number" "$STUB_OPENCODE_LOG_LINES"
+        number=$((number + 1))
+      done
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_LONG:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:02.000Z level=INFO run=stub message="'
+      head -c 5000 /dev/zero | tr '\0' 'x'
+      printf '"\n'
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_SECRET:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:03.000Z level=INFO run=stub message="stub server log holds the provider key %s"\n' "$STUB_OPENCODE_LOG_SECRET"
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_SECRET_LATE:-}" ]; then
+      # The key starts before the 2,000 character bound and ends past it, so a
+      # runner that truncated before it redacted would forward the key's head.
+      printf 'timestamp=2026-10-27T00:00:04.000Z level=INFO run=stub message="'
+      head -c 1926 /dev/zero | tr '\0' 'y'
+      printf '%s"\n' "$STUB_OPENCODE_LOG_SECRET_LATE"
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_BADUTF8:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:05.000Z level=INFO run=stub message="stub good line alpha"\n'
+      printf 'timestamp=2026-10-27T00:00:06.000Z level=INFO run=stub message="stub bad line has \xff\xfe invalid bytes and a tail of text that goes on"\n'
+      printf 'timestamp=2026-10-27T00:00:07.000Z level=INFO run=stub message="stub good line beta"\n'
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_NUL:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:08.000Z level=INFO run=stub message="stub nul line has a \0 byte inside"\n'
+    fi
+  } >&2
 fi
 
 # What the agent can reach from where it runs, for tests/uid_split_test.sh: the
@@ -67,7 +112,10 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
     printf 'other_home_list: %s\n' "$(allowed ls "$HOME/../other")"
     printf 'other_home_write: %s\n' "$(allowed bash -c ": >> '$HOME/../other/planted'")"
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
-    printf 'runner_environ: %s\n' "$(if cat "/proc/$PPID/environ" >/dev/null 2>&1; then echo readable; else echo denied; fi)"
+    # The runner's pid, named by the shim: this process's own parent is the
+    # shim, an account like this one, so what must stay unreadable is the
+    # runner behind it.
+    printf 'runner_environ: %s\n' "$(if cat "/proc/${STUB_RUNNER_PID:-$PPID}/environ" >/dev/null 2>&1; then echo readable; else echo denied; fi)"
     printf 'memory_list: %s\n' "$(allowed ls "$ws/memory")"
     printf 'memory_write: %s\n' "$(allowed bash -c ": >> '$ws/memory/acme/app/NOTES.md'")"
     printf 'other_read: %s\n' "$(allowed ls "$ws/repos/acme/other")"

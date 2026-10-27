@@ -376,4 +376,24 @@ if jq -se 'map(select(.type | test("tool"))) | length == 0' run.out >/dev/null 2
 if [ "$rc" -ne 0 ]; then echo "ok   the run failed rather than pretending"; else echo "FAIL the run exited 0 with an invalid key"; fail=1; fi
 if diff -q "$here/fixture/test.sh" test.sh >/dev/null && diff -q "$here/fixture/README.md" README.md >/dev/null; then echo "ok   the fixture is untouched"; else echo "FAIL the fixture changed"; fail=1; fi
 
+echo "--- OPENCODE_PRINT_LOGS puts the structured server log on the binary's stderr ---"
+# The runner starts opencode with OPENCODE_PRINT_LOGS=1 and forwards the
+# timestamp= lines that variable puts on stderr. This case is the binary-side
+# proof that the variable the runner sets is one this binary actually reads:
+# the log feature once shipped on stub evidence alone, setting
+# OPENCODE_LOG_PATH, which this binary does not read at all.
+rc=0
+timeout 120 env OPENCODE_PRINT_LOGS=1 OPENCODE_LOG_PATH="$work/no-such-opencode-log.log" \
+  opencode run --agent sre-fix --model openrouter/deepseek/deepseek-v4-pro --format json "print the agent's first instruction" > print-logs.out 2> print-logs.err || rc=$?
+if grep -q '^timestamp=.*message=' print-logs.err; then
+  echo "ok   the binary reads OPENCODE_PRINT_LOGS and writes one timestamp= line per event on stderr ($(grep -c '^timestamp=' print-logs.err) lines)"
+else
+  echo "FAIL OPENCODE_PRINT_LOGS produced no timestamp= line on stderr, so the runner would forward nothing: $(head -c 200 print-logs.err)"; fail=1
+fi
+if [ ! -e "$work/no-such-opencode-log.log" ]; then
+  echo "ok   OPENCODE_LOG_PATH is read by nothing: no file appears where it points"
+else
+  echo "FAIL a file appeared at OPENCODE_LOG_PATH, which this case did not expect"; fail=1
+fi
+
 exit $fail

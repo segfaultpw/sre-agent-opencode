@@ -320,6 +320,15 @@ function loadConfig() {
     throw fatal('SRE_RUN_TIMEOUT_SECONDS must be a positive whole number of seconds');
   }
 
+  // The level opencode itself logs at: the runner's knob for it, read once
+  // here and handed to the process the runner starts as OPENCODE_LOG_LEVEL.
+  // Unset (the default) leaves opencode at its own default level.
+  const opencodeLogLevelRaw = process.env.SRE_OPENCODE_LOG_LEVEL;
+  const opencodeLogLevel = typeof opencodeLogLevelRaw === 'string' ? opencodeLogLevelRaw.trim() : '';
+  if (/[\r\n]/.test(opencodeLogLevel)) {
+    throw fatal('SRE_OPENCODE_LOG_LEVEL has a line break inside its value, so it cannot be one level; set it again as a single line (the value is not printed)');
+  }
+
   // Exactly one GitHub authentication mode: a token (SRE_GITHUB_TOKEN) or a
   // GitHub App (SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together).
   // An App half configured, or a token beside the App, is a refusal rather
@@ -421,6 +430,9 @@ function loadConfig() {
     // Only the exact value 1 opts in. The module's agent_aws_access variable
     // sets it, and a typo must leave the agent without the task role.
     agentAwsAccess: process.env.SRE_AGENT_AWS_ACCESS === '1',
+    // '' when SRE_OPENCODE_LOG_LEVEL is unset or empty: opencode keeps its own
+    // default level, and the variable never reaches the agent as itself.
+    opencodeLogLevel,
     identity,
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
@@ -438,6 +450,12 @@ function registerConfigSecrets(config) {
   if (config.githubToken) constantSecrets.push(config.githubToken);
   if (config.agentGithubToken) constantSecrets.push(config.agentGithubToken);
   if (config.githubApp) constantSecrets.push(config.githubApp.privateKey);
+  // The provider keys are the agent's own to use, and opencode's log can quote
+  // them back: whatever the runner prints goes through redact(), so they join
+  // the list like every other secret the process holds.
+  for (const name of PROVIDER_KEY_VARIABLES) {
+    if (process.env[name]) constantSecrets.push(process.env[name]);
+  }
 }
 
 function httpRequest(target, options = {}) {
@@ -524,6 +542,12 @@ function runProcess(command, args, options = {}) {
   const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null } = options;
   const launched = launch(command, args, requestedEnv, as, home);
   const env = launched.env;
+  // A shell hands every command a PWD that matches its working directory; a
+  // spawn does not, so a child can see the runner's own PWD (the image's
+  // WORKDIR) while standing in the checkout. opencode resolves the run's
+  // project from PWD before the working directory, so that mismatch rooted
+  // every run at /workspace instead of the repository.
+  if (cwd) env.PWD = cwd;
   return new Promise((resolve) => {
     // Its own process group: opencode starts a local server of its own, and a
     // timeout that killed only the parent would leave that child holding the
@@ -2237,6 +2261,69 @@ function splitMemorySummary(message, hadBlock) {
   return { message, summary: '' };
 }
 
+// opencode's own log, the "server logs" its errors point at. The pinned
+// binary does not read OPENCODE_LOG_PATH (zero occurrences in it; its file
+// logger is hardwired), so a file of the runner's naming would forward
+// nothing. What it does read is OPENCODE_PRINT_LOGS: set to 1, it prints its
+// structured server log, one `timestamp=... level=... run=... message=...`
+// line per event, on stderr. The runner sets that variable for the process it
+// starts (runAgent) and, once that process has ended, however it ended,
+// forwards the tail of those lines from the captured stderr to its own output
+// with the `opencode:` prefix, so the operator's log group holds what the
+// sentence asks for. Every line goes through log(), so through redact(), and
+// the bounds hold whatever a chatty level produces: at most the last 200
+// lines, each cut at 2,000 characters.
+const OPENCODE_LOG_MAX_LINES = 200;
+const OPENCODE_LOG_MAX_CHARS = 2000;
+
+// Only the `timestamp=` lines are the structured server log; whatever else the
+// process wrote to stderr (pretty error text) keeps the treatment it already
+// has. Called once per run, after the process ended. Returns the number of
+// lines forwarded, or null when the process printed no structured line at all
+// (which the failure paths leave out of their evidence).
+function forwardOpencodeLog(stderrText, options = {}) {
+  const maxLines = options.lines || OPENCODE_LOG_MAX_LINES;
+  const maxChars = options.chars || OPENCODE_LOG_MAX_CHARS;
+  if (typeof stderrText !== 'string' || stderrText === '') return null;
+  const structured = [];
+  let unreadable = 0;
+  for (const piece of stderrText.split('\n')) {
+    const line = piece.endsWith('\r') ? piece.slice(0, -1) : piece;
+    if (!line.startsWith('timestamp=')) continue;
+    // A NUL byte, or a byte sequence that was not UTF-8 (the stream decoder
+    // has already replaced those with U+FFFD, which none of the binary's own
+    // structured lines contains) drops the line whole, never forwards it
+    // mangled: it is counted in one line instead.
+    if (line.includes('\0') || line.includes('�')) {
+      unreadable += 1;
+      continue;
+    }
+    structured.push(line);
+  }
+  if (structured.length === 0 && unreadable === 0) return null;
+  const overflow = Math.max(0, structured.length - maxLines);
+  for (const line of structured.slice(-maxLines)) {
+    // Redaction before the bound: a secret cut in half by a truncation is no
+    // longer a string redact() can find, so the whole line is redacted first
+    // and the cut falls where it falls. log() redacts again, which changes
+    // nothing (redaction is idempotent).
+    log('info', `opencode: ${boundedLine(redact(line), maxChars)}`);
+  }
+  if (unreadable > 0) log('warn', `opencode: ${unreadable} unreadable line${unreadable === 1 ? '' : 's'} dropped`);
+  if (overflow > 0) log('info', `opencode: ${overflow} earlier line${overflow === 1 ? '' : 's'} dropped, keeping the last ${structured.length - overflow}`);
+  return structured.length - overflow;
+}
+
+// One line at most `maxChars` long, cut at a character boundary and marked,
+// so a page of debug output cannot become a page of log group.
+function boundedLine(line, maxChars) {
+  if (line.length <= maxChars) return line;
+  let cut = line.slice(0, maxChars);
+  // A surrogate pair cut in half is not a character any output can show.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  return `${cut}...[truncated]`;
+}
+
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
 // fences handed over the way fix.yml hands them over. The runner's own
 // credentials are stripped from the child's environment: the agent has a
@@ -2276,6 +2363,18 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // service variables) and reach anything the role holds. The runner's own
   // process keeps them; only the module's agent_aws_access opts the agent in.
   delete env.SRE_AGENT_AWS_ACCESS;
+  // opencode's own log is the runner's business: the knob never reaches the
+  // agent as the runner's variable, and an inherited OPENCODE_LOG_* value
+  // from the runner's own environment never survives either. What the process
+  // gets is what this run chose: its structured server log printed to stderr
+  // (the print switch is the variable the pinned binary reads; it reads no
+  // OPENCODE_LOG_PATH), and the level it was given.
+  delete env.SRE_OPENCODE_LOG_LEVEL;
+  delete env.OPENCODE_LOG_PATH;
+  delete env.OPENCODE_LOG_LEVEL;
+  delete env.OPENCODE_PRINT_LOGS;
+  env.OPENCODE_PRINT_LOGS = '1';
+  if (config.opencodeLogLevel) env.OPENCODE_LOG_LEVEL = config.opencodeLogLevel;
   // Where the memory is mirrored to is the runner's business: the agent edits a
   // copy in its checkout and has no use for the bucket.
   for (const name of Object.keys(env)) {
@@ -2321,6 +2420,11 @@ async function runAgent(config, workspace, prompt, options = {}) {
     home: options.home,
     timeoutMs: options.timeoutMs || config.runTimeoutMs,
   });
+  // Once, right after the process ends, whatever ended it: the tail of the
+  // structured server log opencode printed on stderr goes to the operator's
+  // log group. null when the process printed no structured line, which the
+  // failure paths below can leave out of their evidence.
+  const opencodeLogLines = forwardOpencodeLog(result.stderr);
 
   const texts = [];
   const errors = [];
@@ -2350,6 +2454,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
     stderr: result.stderr,
+    opencodeLogLines,
   };
 }
 
@@ -2817,8 +2922,13 @@ async function runTestJob(config, job) {
       }
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
-      if (!quiet) return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
-      return modelVerdict(agent, timeoutMs);
+      if (!quiet) {
+        if (agent && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+        return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
+      }
+      const verdict = modelVerdict(agent, timeoutMs);
+      if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+      return verdict;
     });
 
     await step('memory', async () => {
@@ -3004,6 +3114,9 @@ async function handleJob(config, job) {
     if (agent.timedOut) {
       result.summary = `The agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds) and nothing was published.`;
       result.evidence.timed_out = true;
+      // The killed run's structured stderr tail was forwarded too; the count
+      // says how much of it the log group holds.
+      if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       if (agent.abandoned) {
         // Reported rather than hidden: the operator is the only one who can
         // go and look, and a process still holding the pipes after a kill is
@@ -3031,6 +3144,9 @@ async function handleJob(config, job) {
       // The tail rather than the whole stream: a failed run's last words are
       // what names the cause, and the platform caps an entry at a kilobyte.
       if (agent.stderr.trim()) result.evidence.agent_stderr = redact(agent.stderr).trim().slice(-1000);
+      // opencode's own log is where its error sentence points: the count of
+      // forwarded lines tells the operator how much of it the log group holds.
+      if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       return result;
     }
     if (isDecline(agent.finalMessage)) {
