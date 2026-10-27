@@ -2,6 +2,18 @@
 
 Versions follow semantic versioning. The major tag (`v1`) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v1.9.0
+
+The pull request step works under the account split, and a pull request carries the request's title.
+
+The pull request body is the runner's own file. A root runner (the container model) wrote the body of each pull request into a `sre-agent-pr-*` temporary directory that it owned and closed to everyone else, and then ran `gh` as the runner's account, which could not enter it: every request that got as far as publishing ended with `the pull request could not be opened: open /tmp/sre-agent-pr-XXXX/body.md: permission denied`, after the branch had been pushed. The runner now makes the directory and the file the runner account's (0700 and 0600), the way the base bundle's directory already was, and removes them as soon as `gh` returns. An unprivileged runner and a runner without an account split were never affected.
+
+The title comes from the platform. The commit subject and the pull request title were the first line of the agent's final message, so a model that opens with a closing remark put that remark in the subject (`fix: The change is complete, validated, and scoped. Here's the summary.`). The queue's job now carries an optional `title` key, a Conventional Commits header the platform derives from the request's own summary; when it is a non-empty string the runner normalises it with the same rules as every other title and uses it for both the commit subject and the pull request title. A job without the key (an older platform), with a `null` or blank one, or with one that is not a string, is titled from the agent's first line as before. The brief is never read for a title. The agent's own message is still the pull request body.
+
+A seventh step in the test job. The test job's steps are now `collected`, `cloned`, `model`, `memory`, `bucket`, `pull_request` and `reported`. `pull_request` writes a pull request body exactly as a fix does and reads it back as the runner's account, so "Run a test job" proves the step that failed above. It needs an SRE Agent release that knows the step name: a platform that does not drops it from what it shows.
+
+What a customer must change on upgrade: nothing. The wire contract only grows (an optional job key and one more test step), and the title key is ignored by a runner older than this release.
+
 ## v1.8.0
 
 opencode's own logs reach the operator's log group, redacted and bounded.

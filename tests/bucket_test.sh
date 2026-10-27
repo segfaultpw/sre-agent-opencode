@@ -1109,7 +1109,7 @@ run_driver test_bucket
 estate_marker="$workspace/memory/_estate/.runner-test"
 marker_key=s3://acme-sre-memory/fleet/_estate/.runner-test
 check "the job exits 0 and is reported as not_validated" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
-check_jq "every step passed, the bucket step among them" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check_jq "every step passed, the bucket step among them" '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' "$report"
 check_jq "the bucket step names the bucket and the prefix" '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/")' "$report"
 check "the marker was put under the prefix, in the estate's directory and outside scripts/" test "$(grep -cxF "$(argline s3 cp "$estate_marker" "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
 check "and removed from the bucket" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
@@ -1129,7 +1129,7 @@ start_fixture test_bucket_denied
 queue_test_job h-test-bucket-denied ""
 run_driver test_bucket_denied
 check "the job is still reported, as not_validated" test "$rc" -eq 0 -a "$(jq -r '.outcome' <<<"$report")" = "not_validated"
-check_jq "the steps before the bucket pass, the bucket fails with the aws error, reported is ok" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("AccessDenied")) and (.test.steps[4].detail | length) <= 300' "$report"
+check_jq "the steps before the bucket pass, the bucket fails with the aws error, reported is ok" '(.test.steps | map(.ok) == [true, true, true, true, false, false, true]) and (.test.steps[4].detail | contains("AccessDenied")) and (.test.steps[4].detail | length) <= 300' "$report"
 check_jq "the summary is one sentence naming the step" '(.summary | contains("the bucket step")) and (.summary | test("\n") | not)' "$report"
 check "nothing was uploaded" test ! -e "$ctl/uploaded"
 check "no marker file is left on the volume" test -z "$(find "$workspace/memory" -name '.runner-test' -print -quit 2>/dev/null)"
@@ -1143,7 +1143,7 @@ printf 's3%srm' ' ' > "$ctl/aws_fail_on"
 start_fixture test_bucket_norm
 queue_test_job h-test-bucket-norm ""
 run_driver test_bucket_norm
-check_jq "the bucket step fails and says the marker could not be removed, with the aws error" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("removed")) and (.test.steps[4].detail | contains("AccessDenied"))' "$report"
+check_jq "the bucket step fails and says the marker could not be removed, with the aws error" '(.test.steps | map(.ok) == [true, true, true, true, false, false, true]) and (.test.steps[4].detail | contains("removed")) and (.test.steps[4].detail | contains("AccessDenied"))' "$report"
 check "the marker object is in the bucket, as the step said" test -f "$ctl/uploaded/acme-sre-memory/fleet/_estate/.runner-test"
 check "no marker file is left on the volume" test -z "$(find "$workspace/memory" -name '.runner-test' -print -quit 2>/dev/null)"
 stop_fixture
@@ -1151,7 +1151,7 @@ rm -f "$ctl/aws_fail_on"
 start_fixture test_bucket_norm_again
 queue_test_job h-test-bucket-norm-again ""
 run_driver test_bucket_norm_again
-check_jq "the next test job passes" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check_jq "the next test job passes" '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' "$report"
 check "and the marker object is gone" test ! -e "$ctl/uploaded/acme-sre-memory/fleet/_estate/.runner-test"
 stop_fixture
 
@@ -1170,7 +1170,7 @@ printf '{"version":1,"paths":{"acme/api/NOTES.md":"added","acme/app/NOTES.md":"a
 start_fixture test_bucket_backlog
 queue_test_job h-test-bucket-backlog ""
 run_driver test_bucket_backlog
-check_jq "a journaled path whose file is gone does not fail the bucket step" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check_jq "a journaled path whose file is gone does not fail the bucket step" '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' "$report"
 check "the marker was put and removed" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
 check "the backlog's files that exist were carried to the bucket" test -f "$ctl/uploaded/acme-sre-memory/fleet/acme/app/NOTES.md" -a -f "$ctl/uploaded/acme-sre-memory/fleet/acme/web/NOTES.md" -a -f "$ctl/uploaded/acme-sre-memory/fleet/acme/api/NOTES.md"
 check "the marker's two calls came before the report and the backlog's three after it" test "$(sed -n 1,2p "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "1 " -a "$(sed -n 3,5p "$ctl/aws_seen.log" | sort -u | tr '\n' ' ')" = "2 "
@@ -1191,7 +1191,7 @@ start_fixture test_bucket_cut
 queue_test_job h-test-bucket-cut ""
 run_driver test_bucket_cut
 driver_deadline_ms=""
-check_jq "the bucket step passes although the mirror's deadline is shorter than the backlog" '.test.steps | map(.ok) == [true, true, true, true, true, true]' "$report"
+check_jq "the bucket step passes although the mirror's deadline is shorter than the backlog" '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' "$report"
 check "the marker was put and removed" test "$(grep -cxF "$(argline s3 rm "$marker_key" --only-show-errors)" "$ctl/aws_calls.log")" -eq 1
 check "what the deadline cut still waits in the journal" test -s "$workspace/.memory-mirror-pending"
 stop_fixture
@@ -1228,7 +1228,7 @@ export STUB_OPENCODE_MODE=oneline
 BUCKET_V="acme-sre-memory"
 PREFIX_V=""
 run_driver test_bucket_restore
-check_jq "the bucket step fails and says the restore has not succeeded" '(.test.steps | map(.ok) == [true, true, true, true, false, true]) and (.test.steps[4].detail | contains("restore"))' "$report"
+check_jq "the bucket step fails and says the restore has not succeeded" '(.test.steps | map(.ok) == [true, true, true, true, false, false, true]) and (.test.steps[4].detail | contains("restore"))' "$report"
 check "no marker was put into a bucket whose restore is pending" test -z "$(grep -v -- '--recursive' "$ctl/aws_calls.log" || true)"
 stop_fixture
 rm -f "$ctl/aws_fail_on"
