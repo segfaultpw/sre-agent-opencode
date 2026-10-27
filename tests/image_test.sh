@@ -87,17 +87,6 @@ for pinned in OPENCODE KUBECTL AWSCLI GH; do
   check "$dockerfile" "ARG ${pinned}_VERSION=" "${pinned} is pinned to a version rather than to whatever is current"
 done
 
-# The stamp on a pull request says which fences answered the request, so the
-# binary in the image and the binary the reusable workflow's action installs
-# have to be the same release.
-dockerfile_opencode="$(sed -n 's/^ARG OPENCODE_VERSION=\(.*\)$/\1/p' "$dockerfile")"
-action_opencode="$(sed -n 's#.*anomalyco/opencode/github@v\([0-9.]*\).*#\1#p' "$pkg/.github/workflows/fix.yml" | head -n 1)"
-if [ -n "$dockerfile_opencode" ] && [ "$dockerfile_opencode" = "$action_opencode" ]; then
-  echo "ok   the image pins the opencode release the reusable workflow is pinned at (${dockerfile_opencode})"
-else
-  echo "FAIL the image pins opencode '${dockerfile_opencode}' and fix.yml pins '${action_opencode}'"; fail=1
-fi
-
 # The x64 baseline build is a decision, not an accident: opencode's installer
 # picks the AVX2 build from the build machine's /proc/cpuinfo, which is not the
 # machine that will run the image.
@@ -464,9 +453,7 @@ if [ "$rc" -eq 0 ] && grep -qx 'setup ran' "$STUB_LOG"; then echo "ok   write by
 echo "--- the workflows build the image on both architectures ---"
 # Every runs-on in this repository's own workflows reads the organization's
 # runner switch, so a month's Actions minutes running out moves the job to
-# another provider without a commit. fix.yml is deliberately not checked: it
-# runs in a customer's repository, where these variables do not exist, and its
-# runner input defaults to a label GitHub itself provides.
+# another provider without a commit.
 while IFS= read -r line; do
   case "$line" in
     *vars.RUNNER_* | *matrix.runner*) ;;

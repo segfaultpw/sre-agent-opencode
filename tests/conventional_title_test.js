@@ -1,7 +1,7 @@
 'use strict';
 // Unit tests for runner/conventional_title.js, run by tests/conventional_title_test.sh
-// with the same fixture table scripts/conventional_title.sh is run against, so
-// the two implementations cannot drift apart without a case failing.
+// over the fixture table, which SRE Agent runs a byte for byte copy of against
+// its own implementation, so the two cannot drift apart without a case failing.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -10,10 +10,9 @@ const { conventionalTitle, DEFAULT_FALLBACK, MAX_TITLE } = require('../runner/co
 const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixture', 'conventional_titles.json'), 'utf8'));
 let failed = 0;
 
-// Pieces that are hard for one engine or another: the whitespace and line
-// breaks each defines differently, a byte order mark, keys, combining marks,
-// joiners and emoji. The fuzz below and the jq comparison in
-// conventional_title_test.sh both draw from them.
+// Pieces that are hard to normalise: whitespace and line breaks that read
+// differently in different engines, a byte order mark, keys, combining marks,
+// joiners and emoji. The fuzz below draws from them.
 const PIECES = [
   '[', ']', '(', ')', '!', ':', ' ', '\t', '\n', '\r\n', '\r', '\u000b', '\u000c', '\u0085', '\u2028', '\u2029',
   '\u00a0', '\u3000', '\ufeff', 'fix', 'feat', 'Chore', 'NUM-12', 'num-12', 'NUM-123', 'OPS-1', 'SHA-256',
@@ -40,16 +39,6 @@ function generated(count, seed, maxPieces) {
     inputs.push(text);
   }
   return inputs;
-}
-
-// `--fuzz N` prints N generated inputs with this module's title for each, as
-// JSON lines, for the shell test to run through the jq filter.
-const fuzzAt = process.argv.indexOf('--fuzz');
-if (fuzzAt !== -1) {
-  for (const input of generated(Number(process.argv[fuzzAt + 1]), 4242, 60)) {
-    process.stdout.write(`${JSON.stringify({ input, title: conventionalTitle(input, undefined, { cardKey: 'NUM-12' }) })}\n`);
-  }
-  process.exit(0);
 }
 
 function check(label, fn) {

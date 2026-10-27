@@ -2,6 +2,14 @@
 
 Versions follow semantic versioning. The major tag (`v1`) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v1.10.0
+
+The GitHub Actions door is gone; the runner on your own machine is the one external door.
+
+The reusable workflow, its example caller, the bulk installer and their scripts are deleted from this package. Upstream removed the opencode GitHub Action and froze its release tags (anomalyco/opencode#59032), so a run of the workflow could no longer install a pinned opencode and the door was unfixable; SRE Agent retires its side of the door in the same release. Anyone still running the caller workflow in their repositories moves to the self-hosted runner: the Terraform module, the container image or the systemd install, all in the README. The self-hosted runner itself is unchanged: same queue, same fences, same pull requests.
+
+What a customer must change on upgrade: if a repository still holds `.github/workflows/opencode.yml`, delete it and register a self-hosted runner instead. The runner image and the Terraform module are unchanged apart from the version.
+
 ## v1.9.0
 
 The pull request step works under the account split, and a pull request carries the request's title.

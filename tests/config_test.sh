@@ -69,8 +69,9 @@ expect '.permission.bash["*rm -f *"]' deny
 expect '.permission.bash["*rm --recursive*"]' deny
 expect '.permission.bash["*rm --force*"]' deny
 expect '.permission.bash["*sudo *"]' deny
-# The ninth, and on the CI door it is a privilege escalation rather than a
-# convenience: fix.yml puts GITHUB_TOKEN in the agent's environment, so
+# The ninth, and on the runner it is a privilege escalation rather than a
+# convenience: the agent's GH_TOKEN is the runner's repository token (or the
+# read-only one in SRE_AGENT_GITHUB_TOKEN) unless the runner deleted it, so
 # "gh pr merge" and "gh api -X PUT" walk around the git push deny and the
 # protected paths gate both, and the agent could merge its own pull request.
 #
@@ -82,9 +83,7 @@ expect '.permission.bash["*sudo *"]' deny
 # environment-variable prefix, and the env wrapper. "sudo gh" is covered by
 # the sudo deny, and a backslash form is covered by the path one, since the
 # matcher replaces a backslash with a slash in the resource as well as in the
-# pattern. On the runner door this is the second line, the first being that
-# the runner deletes GH_TOKEN and GITHUB_TOKEN from the environment it starts
-# the agent in.
+# pattern.
 expect '.permission.bash["gh *"]' deny
 expect ".permission.bash[\"*'gh' *\"]" deny
 expect '.permission.bash["*\"gh\" *"]' deny

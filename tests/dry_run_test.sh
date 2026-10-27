@@ -30,12 +30,13 @@ sed "s/{{SRE_AGENT_OPENCODE_VERSION}}/v${version}/g" "$pkg/agents/sre-fix.md" > 
 export HOME="$work/home"
 export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share" XDG_CACHE_HOME="$HOME/.cache" XDG_STATE_HOME="$HOME/.local/state"
 export OPENCODE_DISABLE_AUTOUPDATE=1
-# The provider and the model are the example's, and the key travels the way
-# fix.yml sends it, through the provider's own variable, so the path is proven
-# where a customer who copied the example would hit it. The key is well formed
-# and wrong: OpenRouter answers a malformed token with "Missing Authentication
-# header", which reads as if no key had been sent. It is assembled at run time
-# because a key-shaped literal in the repository trips GitHub's push protection.
+# The provider and the model are the documented defaults, and the key travels
+# the way the runner sends it, through the provider's own variable, so the
+# path is proven where a customer following the README would hit it. The key
+# is well formed and wrong: OpenRouter answers a malformed token with "Missing
+# Authentication header", which reads as if no key had been sent. It is
+# assembled at run time because a key-shaped literal in the repository trips
+# GitHub's push protection.
 OPENCODE_CONFIG_CONTENT="$(jq -c . "$pkg/config/opencode.json")"
 export OPENCODE_CONFIG_CONTENT
 OPENROUTER_API_KEY="$(printf 'sk-or-v1-%064d' 0)"

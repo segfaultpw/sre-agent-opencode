@@ -78,10 +78,9 @@ const KILL_GRACE_MS = 5_000;
 // means never reporting at all.
 const ABANDON_GRACE_MS = 2_000;
 
-// The same shapes the CI door uses, so a pull request from either door carries
-// the same two lines: scripts/decline_comment.sh and fix.yml's marking step
-// read the marker with this expression and append each line only when the body
-// does not already carry it.
+// The shapes SRE Agent reads off a pull request: the marker line this runner
+// appends to every body, matched with this expression so a line is only ever
+// appended when the body does not already carry it.
 const MARKER_PATTERN = /<!-- sre-agent:remediation:[^>]*-->/;
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -2325,7 +2324,7 @@ function boundedLine(line, maxChars) {
 }
 
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
-// fences handed over the way fix.yml hands them over. The runner's own
+// fences handed over as opencode's configuration. The runner's own
 // credentials are stripped from the child's environment: the agent has a
 // shell, so anything left there is reachable, and it needs none of them.
 async function runAgent(config, workspace, prompt, options = {}) {
