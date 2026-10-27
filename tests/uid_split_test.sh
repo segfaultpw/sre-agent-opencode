@@ -150,6 +150,20 @@ cat > "$work/bin/gh" <<EOF
 #!/usr/bin/env bash
 id -u >> "\$(cat "$work/ctl/gh_uid_log")"
 if [ -s "$work/ctl/gh_home_log" ]; then printf '%s\n' "\$HOME" >> "\$(cat "$work/ctl/gh_home_log")"; fi
+# Like the real gh, it opens the file it is given as --body-file as the account
+# it runs as and fails with gh's own sentence when it cannot; what it read is
+# recorded, so the test judges the body and not only the call.
+body=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "--body-file" ]; then body="\$2"; fi
+  shift
+done
+if [ -z "\$body" ]; then echo "no --body-file was given" >&2; exit 1; fi
+if ! content="\$(cat -- "\$body" 2>/dev/null)"; then
+  echo "open \$body: permission denied" >&2
+  exit 1
+fi
+if [ -s "$work/ctl/gh_body_log" ]; then printf '%s\n' "\$content" > "\$(cat "$work/ctl/gh_body_log")"; fi
 printf '%s\n' "https://github.com/acme/app/pull/7"
 EOF
 # The PATH binary is a node shim that records the PWD the runner handed
@@ -231,7 +245,7 @@ prove() {
   local prefix=("$@")
   local extra_runner_env=()
   local ws="$work/$label-ws" probe="$work/$label.probe" survivor="$work/$label.survivor"
-  local uidlog="$work/$label.git-uids" ghuidlog="$work/$label.gh-uids" out="$work/$label.out"
+  local uidlog="$work/$label.git-uids" ghuidlog="$work/$label.gh-uids" ghbodylog="$work/$label.gh-body" out="$work/$label.out"
   local runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent"
   echo "--- $label ---"
   mkdir -p "$ws/memory/acme/app" "$ws/repos/acme/other" "$runner_home" "$agent_home"
@@ -244,8 +258,9 @@ prove() {
   # The agent's home is left to the runner: it is created root-owned here, and
   # the runner has to make it the agent's and close it to everyone else.
   local githomelog="$work/$label.git-homes" ghhomelog="$work/$label.gh-homes" credlog="$work/$label.git-creds"
-  : > "$probe"; : > "$uidlog"; : > "$ghuidlog"; : > "$survivor"; : > "$githomelog"; : > "$ghhomelog"; : > "$credlog"
-  chmod 666 "$probe" "$uidlog" "$ghuidlog" "$survivor" "$githomelog" "$ghhomelog" "$credlog"
+  : > "$probe"; : > "$uidlog"; : > "$ghuidlog"; : > "$ghbodylog"; : > "$survivor"; : > "$githomelog"; : > "$ghhomelog"; : > "$credlog"
+  chmod 666 "$probe" "$uidlog" "$ghuidlog" "$ghbodylog" "$survivor" "$githomelog" "$ghhomelog" "$credlog"
+  printf '%s' "$ghbodylog" > "$work/ctl/gh_body_log"
   printf '%s' "$uidlog" > "$work/ctl/git_uid_log"
   printf '%s' "$ghuidlog" > "$work/ctl/gh_uid_log"
   printf '%s' "$githomelog" > "$work/ctl/git_home_log"
@@ -326,6 +341,7 @@ prove() {
   if grep -qx 'aws_env: ' "$probe"; then echo "ok   $label: no AWS variable reaches the agent"; else echo "FAIL $label: $(grep aws_env "$probe" || true)"; fail=1; fi
   if [ -s "$uidlog" ] && ! grep -qvx "$owner" "$uidlog"; then echo "ok   $label: every git call ran as the runner's account ($(wc -l < "$uidlog") calls)"; else echo "FAIL $label: git uids: $(sort -u "$uidlog" | tr '\n' ' ')"; fail=1; fi
   if [ -s "$ghuidlog" ] && ! grep -qvx "$owner" "$ghuidlog"; then echo "ok   $label: gh ran as the runner's account"; else echo "FAIL $label: gh uids: $(sort -u "$ghuidlog" | tr '\n' ' ')"; fail=1; fi
+  if grep -qF -- '<!-- sre-agent-opencode:v' "$ghbodylog" && grep -qF -- 'sre-agent:remediation:99999999-8888-7777-6666-555555555555' "$ghbodylog"; then echo "ok   $label: gh opened and read the pull request body as the runner's account, and it is the agent's message with the markers"; else echo "FAIL $label: gh could not read the body, or it is not the body: $(cat "$ghbodylog")"; fail=1; fi
   if [ "$(stat -c %u "$ws/repos/acme/app")" = "$owner" ] && [ "$(stat -c %u "$ws/repos/acme/app/README.md")" = "$owner" ] && [ ! -e "$ws/repos/acme/app/.git" ]; then echo "ok   $label: the checkout is the runner's again once the run ends, and the .git the agent planted is gone"; else echo "FAIL $label: $(stat -c '%u %n' "$ws/repos/acme/app" "$ws/repos/acme/app/README.md"; ls -a "$ws/repos/acme/app")"; fail=1; fi
   if [ "$(stat -c '%a %u' "$ws/memory")" = "700 $owner" ] && [ "$(stat -c '%a %u' "$ws/memory/acme/app/NOTES.md")" = "600 $owner" ]; then echo "ok   $label: memory is 0700 and the files are 0600, all the runner's"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/memory" "$ws/memory/acme/app/NOTES.md")"; fail=1; fi
   if [ "$(tail -n 1 "$ws/memory/acme/app/NOTES.md")" = "the pool ceiling is 40 on the primary" ]; then echo "ok   $label: the agent's note reached memory through the copy"; else echo "FAIL $label: $(cat "$ws/memory/acme/app/NOTES.md")"; fail=1; fi
@@ -525,7 +541,8 @@ prove_test_job() {
   local report
   report="$(jq -c 'select(.path | endswith("/'"$id"'/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
   survivors+=("$(cat "$survivor" 2>/dev/null || true)")
-  if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null; then echo "ok   $label: all six steps pass"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' <<<"$report" >/dev/null; then echo "ok   $label: all seven steps pass"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out")"; fail=1; return; fi
+  if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "pull_request", "reported"]' <<<"$report" >/dev/null && jq -e '.test.steps[] | select(.name == "pull_request") | .ok and (.detail | test("read it back as the runner"))' <<<"$report" >/dev/null; then echo "ok   $label: the pull_request step wrote a body as publish() does and the runner's account read it back"; else echo "FAIL $label: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
   if grep -qx "id: $agent_uid:$agent_uid" "$probe" && grep -qx 'groups: ' "$probe" && grep -qx 'cap_eff: 0000000000000000' "$probe"; then echo "ok   $label: the model is asked as the agent's uid and gid, with no group and no capability"; else echo "FAIL $label: $(grep -E '^(id|groups|cap_eff):' "$probe")"; fail=1; fi
   if grep -qx 'token_env: ' "$probe" && grep -qx 'aws_env: ' "$probe"; then echo "ok   $label: it holds no poll key, no runner variable and no AWS variable"; else echo "FAIL $label: $(grep -E 'token_env|aws_env' "$probe")"; fail=1; fi
   if grep -qx "home: $agent_home/_estate" "$probe" && grep -qx 'home_autoload: ' "$probe"; then echo "ok   $label: the model is asked from the estate's home, which holds nothing opencode would load on its own"; else echo "FAIL $label: $(grep -E 'home' "$probe")"; fail=1; fi

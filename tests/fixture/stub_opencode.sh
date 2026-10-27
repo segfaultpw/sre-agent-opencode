@@ -298,6 +298,12 @@ case "$mode" in
     printf 'a line the fix added\n' >> README.md
     emit "$(printf '[numaris] Feat(sso)!: allow the new IdP\n\nAdded the IdP to the allow list and ran bash test.sh.')"
     ;;
+  closing)
+    # What a model writes when it opens with a closing remark: the sentence a
+    # title must not be taken from when the platform sent one.
+    printf 'a line the fix added\n' >> README.md
+    emit "The change is complete, validated, and scoped. Here's the summary."
+    ;;
   untitled)
     printf 'a line the fix added\n' >> README.md
     emit "<!-- nothing to say -->"

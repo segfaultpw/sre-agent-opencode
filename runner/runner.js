@@ -2524,7 +2524,8 @@ async function stageAndGate(workspace, memoryBlobs) {
 
 // The pull request title and the commit message are one line, a Conventional
 // Commits header, because a repository that checks its titles refuses anything
-// else and a squash merge keeps this line. It is the first line of the agent's
+// else and a squash merge keeps this line. This is the derivation for a job that
+// carries no title (an older platform): the first line of the agent's
 // final message with markdown decoration taken off; the shared normaliser
 // drops tags, keeps a valid header, and otherwise types the line as a fix.
 // It is handed no card key, because neither the queue's job nor the brief
@@ -2539,6 +2540,40 @@ function pullRequestTitle(message, handoffId) {
   return conventionalTitle(cleaned, `apply the requested fix (${handoffId})`);
 }
 
+// The title the platform put on the job: the Conventional Commits header it
+// derives from the request's own summary. It wins over the agent's closing
+// words, which are not a title (a model that ends on "Here is the summary" put
+// that sentence in the subject of the commit). An older platform sends no key,
+// and a null or blank one is the same as none, so the agent's line stands then.
+// The title is never read from the brief: that is text the agent can also see.
+function jobTitle(job, handoffId) {
+  const raw = job && typeof job.title === 'string' ? job.title : '';
+  if (!raw.trim()) return null;
+  return conventionalTitle(raw, `apply the requested fix (${handoffId})`);
+}
+
+// The pull request body is read by gh, which runs as the runner's account, so
+// the directory that holds it is the runner's: a root runner (the container
+// model) makes a 0700 directory that is root's and gh could not enter it. The
+// file is written while the directory is still root's and handed over before
+// it, so no process of the runner's account owns the directory while root
+// writes into it (a link planted as body.md would be written through), and 'wx'
+// refuses a name that already exists.
+function writePullRequestBody(text) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-'));
+  try {
+    fs.chmodSync(dir, 0o700);
+    const file = path.join(dir, 'body.md');
+    fs.writeFileSync(file, text, { mode: 0o600, flag: 'wx' });
+    ownByRunner(file);
+    ownByRunner(dir);
+    return { dir, file };
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function pullRequestBody(message, brief, version) {
   const marker = (MARKER_PATTERN.exec(brief) || [])[0] || '';
   const stamp = `<!-- sre-agent-opencode:v${version} -->`;
@@ -2550,9 +2585,9 @@ function pullRequestBody(message, brief, version) {
 
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
-async function publish(config, workspace, message, brief, result) {
+async function publish(config, workspace, message, brief, result, providedTitle = null) {
   const { dir, gitdir, repo, branch, defaultBranch, cleanUrl } = workspace;
-  const title = pullRequestTitle(message, path.basename(branch));
+  const title = providedTitle || pullRequestTitle(message, path.basename(branch));
 
   // The identity is set on the command rather than in the repository, because
   // a service account has no git identity of its own and "empty ident name"
@@ -2574,8 +2609,8 @@ async function publish(config, workspace, message, brief, result) {
   await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], runnerToken);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
-  const bodyPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-pr-')), 'body.md');
-  fs.writeFileSync(bodyPath, pullRequestBody(message, brief, config.version));
+  const body = writePullRequestBody(pullRequestBody(message, brief, config.version));
+  const bodyPath = body.file;
 
   const ghEnv = {
     ...gitEnv(),
@@ -2599,15 +2634,19 @@ async function publish(config, workspace, message, brief, result) {
     bodyPath,
   ];
 
-  let created = await runProcess('gh', [...base, '--draft'], { cwd: dir, env: ghEnv });
-  if (created.code !== 0) {
-    // Draft pull requests need a plan that supports them. The branch is
-    // already pushed by this point, so refusing to open the pull request at
-    // all would leave the work stranded where nobody looks for it.
-    log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
-    created = await runProcess('gh', base, { cwd: dir, env: ghEnv });
+  let created;
+  try {
+    created = await runProcess('gh', [...base, '--draft'], { cwd: dir, env: ghEnv });
+    if (created.code !== 0) {
+      // Draft pull requests need a plan that supports them. The branch is
+      // already pushed by this point, so refusing to open the pull request at
+      // all would leave the work stranded where nobody looks for it.
+      log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
+      created = await runProcess('gh', base, { cwd: dir, env: ghEnv });
+    }
+  } finally {
+    fs.rmSync(body.dir, { recursive: true, force: true });
   }
-  fs.rmSync(path.dirname(bodyPath), { recursive: true, force: true });
 
   if (created.code !== 0) {
     throw new Error(`the pull request could not be opened: ${redact(created.stderr).trim()}`);
@@ -2978,6 +3017,27 @@ async function runTestJob(config, job) {
       if (!answer.ok) return { ok: false, detail: answer.error };
       return { ok: true, detail: `put ${TEST_MARKER} under s3://${settings.bucket}/${settings.prefix}${label}/ and removed it again` };
     });
+
+    // The pull request step of a fix, without the pull request: the body is
+    // written exactly as publish() writes it and read back by a process of the
+    // runner's account, which is the account gh runs as.
+    await step('pull_request', async () => {
+      const sample = pullRequestBody('Test job: this stands for a pull request body.', '', config.version);
+      let body;
+      try {
+        body = writePullRequestBody(sample);
+        const read = await runProcess('cat', ['--', body.file]);
+        if (read.code !== 0) {
+          return { ok: false, detail: `the pull request body could not be read back as the runner's account: ${oneLine(redact(read.stderr || ''), 160) || `cat exited ${read.code}`}` };
+        }
+        if (read.stdout !== sample) return { ok: false, detail: 'the pull request body read back as the runner\'s account is not what was written' };
+      } catch (error) {
+        return { ok: false, detail: `the pull request body could not be written: ${error.code || error.message}` };
+      } finally {
+        if (body) fs.rmSync(body.dir, { recursive: true, force: true });
+      }
+      return { ok: true, detail: 'wrote a pull request body as publish() does and read it back as the runner\'s account' };
+    });
   } finally {
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
     result.actions.push('ran the test job: no fix was run and nothing was pushed');
@@ -3184,7 +3244,7 @@ async function handleJob(config, job) {
       return result;
     }
 
-    result.pr_url = await publish(config, workspace, agent.finalMessage, brief, result);
+    result.pr_url = await publish(config, workspace, agent.finalMessage, brief, result, jobTitle(job, path.basename(workspace.branch)));
     result.actions.push(`opened ${result.pr_url}`);
     // The outcome stays not_validated and carries the pull request. The
     // agent's contract is to leave no change in place that does not build or

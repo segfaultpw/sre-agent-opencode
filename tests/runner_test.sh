@@ -261,15 +261,17 @@ queue_none() { rm -f "$queue_file"; }
 # One job in the queue. An empty repository argument becomes the null the
 # platform sends for an untargeted request, and an empty context argument the
 # null of an integration with no context repository.
+# $4 is a JSON object merged into the job (the keys a newer platform adds, such as
+# title), or nothing for the job an older platform sends.
 queue_one() {
-  jq -n --arg id "$1" --arg repo "$2" --arg context "${3:-}" --arg base "$server_url" --arg token "$handoff_token" \
+  jq -n --arg id "$1" --arg repo "$2" --arg context "${3:-}" --arg base "$server_url" --arg token "$handoff_token" --argjson extra "${4:-{\}}" \
     '[{handoff_id: $id,
        subject_id: "11111111-2222-3333-4444-555555555555",
        repo_full_name: (if $repo == "" then null else $repo end),
        context_repo_full_name: (if $context == "" then null else $context end),
        brief_url: ($base + "/api/handoffs/" + $id + "/brief"),
        report_url: ($base + "/api/handoffs/" + $id + "/report"),
-       token: $token}]' > "$queue_file"
+       token: $token} + $extra]' > "$queue_file"
 }
 
 # A test job as the platform queues it: the same shape as a fix request with
@@ -475,6 +477,44 @@ if [ "$rc" -eq 0 ]; then echo "ok   an untitled job exits 0"; else echo "FAIL an
 if grep -qF -- "--title fix: apply the requested fix (h-untitled) --body-file" "$gh_log"; then echo "ok   the title is a fix header naming the handoff"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF -- " commit -m fix: apply the requested fix (h-untitled)" "$git_log"; then echo "ok   the commit message is the same header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
 stop_fixture
+
+echo "--- 2d. the job's title is the commit subject and the pull request title, whatever the agent's last words are ---"
+closing_words="The change is complete, validated, and scoped. Here's the summary."
+start_fixture jobtitle
+queue_one h-jobtitle acme/app "" '{"title": "feat(pool): raise the connection pool ceiling"}'
+export STUB_OPENCODE_MODE=closing
+run_once jobtitle
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   a job that carries a title still ends in a pull request"; else echo "FAIL rc=$rc report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+if grep -qF -- "--title feat(pool): raise the connection pool ceiling --body-file" "$gh_log"; then echo "ok   the pull request title is the job's title"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if grep -qF -- " commit -m feat(pool): raise the connection pool ceiling" "$git_log"; then echo "ok   the commit subject is the job's title"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
+if ! grep -qF -- "complete, validated" "$gh_log" "$git_log"; then echo "ok   the agent's closing sentence is neither the pull request title nor the commit subject"; else echo "FAIL a title came from the agent's words: $(cat "$gh_log" "$git_log")"; fail=1; fi
+if grep -qF "$closing_words" "$gh_body" && grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the agent's own words still make the body, with the marker and the stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+stop_fixture
+
+echo "--- 2e. a title that is not a Conventional Commits header is normalised like any other ---"
+start_fixture jobtitle_plain
+queue_one h-jobtitle-plain acme/app "" '{"title": "  [numaris] Raise the connection pool ceiling  "}'
+export STUB_OPENCODE_MODE=closing
+run_once jobtitle_plain
+if grep -qF -- "--title fix: Raise the connection pool ceiling --body-file" "$gh_log" && grep -qF -- " commit -m fix: Raise the connection pool ceiling" "$git_log"; then echo "ok   a plain title is typed as a fix, its tag and padding taken off, for the pull request and the commit"; else echo "FAIL gh: $(cat "$gh_log") git: $(cat "$git_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 2f. no title, a null title and a blank title all fall back to the agent's first line ---"
+for shape in absent null blank number; do
+  case "$shape" in
+    absent) extra='{}' ;;
+    null) extra='{"title": null}' ;;
+    blank) extra='{"title": "   "}' ;;
+    number) extra='{"title": 7}' ;;
+  esac
+  start_fixture "jobtitle_$shape"
+  queue_one "h-jobtitle-$shape" acme/app "" "$extra"
+  export STUB_OPENCODE_MODE=closing
+  run_once "jobtitle_$shape"
+  if [ "$rc" -eq 0 ] && grep -qF -- "--title fix: The change is complete, validated, and scoped. Here's the summary. --body-file" "$gh_log" && grep -qF -- " commit -m fix: The change is complete, validated, and scoped. Here's the summary." "$git_log"; then echo "ok   $shape: the title is derived from the agent's first line, as before"; else echo "FAIL $shape: rc=$rc gh: $(cat "$gh_log") git: $(cat "$git_log")"; fail=1; fi
+  stop_fixture
+done
+export STUB_OPENCODE_MODE=fix
 
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"
 if [ "$(auth_for /brief)" = "Bearer $handoff_token" ]; then echo "ok   the brief is fetched with the handoff credential"; else echo "FAIL brief authorization: $(auth_for /brief)"; fail=1; fi
@@ -1227,7 +1267,7 @@ if jq -e '(.memory.summary | length) <= 500' <<<"$report" >/dev/null; then echo 
 stop_fixture
 seed_memory
 
-echo "--- 43. a test job runs no fix, pushes nothing, and reports all six steps ---"
+echo "--- 43. a test job runs no fix, pushes nothing, and reports all seven steps ---"
 before_memory="$(find "$mem" -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)"
 start_fixture testjob
 queue_test_job h-test-repo acme/app
@@ -1236,7 +1276,7 @@ run_once testjob
 export STUB_OPENCODE_MODE=fix
 test_prompt='This is a connectivity check from the self-hosted runner, not a fix request. Reply with one short line of plain text that says you are working. Do not run any command, read any file or use any tool.'
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a test job exits 0 and is reported as not_validated"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
-if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "reported"]' <<<"$report" >/dev/null; then echo "ok   the report carries all six steps, in the contract's order"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "pull_request", "reported"]' <<<"$report" >/dev/null; then echo "ok   the report carries all seven steps, in the contract's order"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
 if jq -e '.test.steps | all(.[]; (.ok == true) and (.detail | type == "string") and ((.detail | length) <= 300) and ((.detail | length) > 0))' <<<"$report" >/dev/null; then echo "ok   every step passed, with a boolean ok and a detail of at most 300 characters"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
 if jq -e '.test.steps[1].detail | test("acme/app")' <<<"$report" >/dev/null; then echo "ok   the cloned step names the repository it cloned"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
 if grep -q 'ls-remote --symref' "$git_log" && grep -q ' fetch ' "$git_log"; then echo "ok   the test repository was reached through git, and refreshed"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
@@ -1252,7 +1292,8 @@ if jq -e '.actions | any(test("within 60 seconds"))' <<<"$report" >/dev/null; th
 if jq -e '.test.steps[3].detail | test("runner-test")' <<<"$report" >/dev/null && [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   the memory step wrote .runner-test and removed it again"; else echo "FAIL steps: $(jq -c '.test' <<<"$report"); left: $(find "$workspace/memory" -name '.runner-test')"; fail=1; fi
 if [ "$(find "$mem" -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum)" = "$before_memory" ]; then echo "ok   the repository's memory is as it was"; else echo "FAIL the memory changed"; fail=1; fi
 if jq -e '.test.steps[4] == {name: "bucket", ok: true, detail: "no bucket configured"}' <<<"$report" >/dev/null; then echo "ok   with no bucket configured the bucket step is ok, saying so"; else echo "FAIL steps: $(jq -c '.test.steps[4]' <<<"$report")"; fail=1; fi
-if [ "$(jq -r '.test.steps[5].ok' <<<"$report")" = "true" ]; then echo "ok   the reported step is ok: the report is being sent"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps[5] | .name == "pull_request" and .ok and (.detail | test("read it back as the runner"))' <<<"$report" >/dev/null; then echo "ok   the pull_request step wrote a body as publish() does and read it back as the runner's account"; else echo "FAIL steps: $(jq -c '.test.steps[5]' <<<"$report")"; fail=1; fi
+if [ "$(jq -r '.test.steps[6].ok' <<<"$report")" = "true" ]; then echo "ok   the reported step is ok: the report is being sent"; else echo "FAIL steps: $(jq -c '.test' <<<"$report")"; fail=1; fi
 if [ "$(auth_for /brief)" = "Bearer $handoff_token" ] && [ "$(auth_for /report)" = "Bearer $handoff_token" ] && [ "$(count_path /brief)" -eq 1 ] && [ "$(count_path /report)" -eq 1 ]; then echo "ok   the brief is fetched once and the report posted once, with the handoff token"; else echo "FAIL fixture calls"; fail=1; fi
 stop_fixture
 
@@ -1264,7 +1305,7 @@ run_timeout=1800
 run_once test_cap
 run_timeout=60
 export STUB_OPENCODE_MODE=fix
-if jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.actions | any(test("within 120 seconds"))' <<<"$report" >/dev/null && ! jq -e '.actions | any(test("within 1800 seconds"))' <<<"$report" >/dev/null; then echo "ok   with a run timeout of 1800 seconds the model is given 120"; else echo "FAIL actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.actions | any(test("within 120 seconds"))' <<<"$report" >/dev/null && ! jq -e '.actions | any(test("within 1800 seconds"))' <<<"$report" >/dev/null; then echo "ok   with a run timeout of 1800 seconds the model is given 120"; else echo "FAIL actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
 stop_fixture
 
 echo "--- 44. a test job with no test repository uses scratch and says so ---"
@@ -1273,7 +1314,7 @@ queue_test_job h-test-scratch ""
 export STUB_OPENCODE_MODE=oneline
 run_once testscratch
 export STUB_OPENCODE_MODE=fix
-if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null; then echo "ok   every step passes"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' <<<"$report" >/dev/null; then echo "ok   every step passes"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
 if jq -e '.test.steps[1] | .ok and (.detail | test("no repository is set to the self-hosted runner"))' <<<"$report" >/dev/null; then echo "ok   the cloned step is ok and says no repository is set to the self-hosted runner"; else echo "FAIL steps: $(jq -c '.test.steps[1]' <<<"$report")"; fail=1; fi
 if [ ! -s "$git_log" ] && [ ! -s "$gh_log" ]; then echo "ok   git and gh are never called"; else echo "FAIL git: $(cat "$git_log") gh: $(cat "$gh_log")"; fail=1; fi
 if jq -e '.test.steps[3].detail | test("_estate")' <<<"$report" >/dev/null && [ ! -e "$workspace/memory/_estate/.runner-test" ]; then echo "ok   the memory step uses the estate's directory, and leaves nothing in it"; else echo "FAIL steps: $(jq -c '.test.steps[3]' <<<"$report")"; fail=1; fi
@@ -1283,7 +1324,7 @@ echo "--- 45. a failing step is reported with its sentence and every later step 
 fail_step_check() {
   local label="$1" failing="$2" pattern="$3" want="$4"
   if [ "$rc" -eq 0 ] && [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   $label: the job is still reported, as not_validated"; else echo "FAIL $label: rc=$rc report: $report"; fail=1; fi
-  if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "reported"]' <<<"$report" >/dev/null; then echo "ok   $label: all six steps are sent"; else echo "FAIL $label: $(jq -c '.test' <<<"$report")"; fail=1; fi
+  if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "pull_request", "reported"]' <<<"$report" >/dev/null; then echo "ok   $label: all seven steps are sent"; else echo "FAIL $label: $(jq -c '.test' <<<"$report")"; fail=1; fi
   if jq -e --argjson want "$want" '.test.steps | map(.ok) == $want' <<<"$report" >/dev/null; then echo "ok   $label: the steps before the failure pass, it fails, the steps after it are not ok, and reported is ok"; else echo "FAIL $label: $(jq -c '.test.steps | map([.name, .ok])' <<<"$report")"; fail=1; fi
   if jq -e --arg failing "$failing" --arg pattern "$pattern" '.test.steps | map(select(.name == $failing)) | .[0].detail | test($pattern)' <<<"$report" >/dev/null; then echo "ok   $label: the failing step says why"; else echo "FAIL $label: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
   if jq -e --arg failing "$failing" '[.test.steps[] | select(.name != "reported")] | (map(.name) | index($failing)) as $at | [.[($at + 1):][] | .detail] | all(. == "not run")' <<<"$report" >/dev/null; then echo "ok   $label: every step after it has the detail not run"; else echo "FAIL $label: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
@@ -1297,7 +1338,7 @@ printf '%s' "$work/nowhere.git" > "$work/ctl/remote"
 export STUB_OPENCODE_MODE=oneline
 run_once test_clone_fail
 rm -f "$work/ctl/remote"
-fail_step_check "a repository that cannot be reached" cloned 'could not be reached' '[true, false, false, false, false, true]'
+fail_step_check "a repository that cannot be reached" cloned 'could not be reached' '[true, false, false, false, false, false, true]'
 if [ ! -s "$opencode_log" ]; then echo "ok   the model is not asked after a failed clone"; else echo "FAIL opencode ran: $(cat "$opencode_log")"; fail=1; fi
 stop_fixture
 
@@ -1306,7 +1347,7 @@ queue_test_job h-test-no-token acme/app
 runner_github_token=""
 run_once test_no_token
 unset runner_github_token
-fail_step_check "a runner with no repository token" cloned 'SRE_GITHUB_TOKEN' '[true, false, false, false, false, true]'
+fail_step_check "a runner with no repository token" cloned 'SRE_GITHUB_TOKEN' '[true, false, false, false, false, false, true]'
 stop_fixture
 
 start_fixture_brief_status() {
@@ -1319,7 +1360,7 @@ queue_test_job h-test-collected-fail acme/app
 export STUB_OPENCODE_MODE=oneline
 run_once test_collected_fail
 export STUB_OPENCODE_MODE=fix
-fail_step_check "a brief the platform cannot serve" collected 'could not be fetched \(HTTP 500\)' '[false, false, false, false, false, true]'
+fail_step_check "a brief the platform cannot serve" collected 'could not be fetched \(HTTP 500\)' '[false, false, false, false, false, false, true]'
 if [ ! -s "$opencode_log" ] && [ ! -s "$git_log" ]; then echo "ok   neither the model nor git is reached after a failed collection"; else echo "FAIL opencode: $(cat "$opencode_log") git: $(cat "$git_log")"; fail=1; fi
 stop_fixture
 
@@ -1328,7 +1369,7 @@ queue_test_job h-test-model-long ""
 export STUB_OPENCODE_MODE=provider_error_long
 run_once test_model_long
 export STUB_OPENCODE_MODE=fix
-fail_step_check "a model whose error is a page long" model 'a long provider error' '[true, true, false, false, false, true]'
+fail_step_check "a model whose error is a page long" model 'a long provider error' '[true, true, false, false, false, false, true]'
 if jq -e '(.test.steps[2].detail | length) == 300' <<<"$report" >/dev/null; then echo "ok   the sentence is cut at exactly 300 characters"; else echo "FAIL detail length: $(jq -r '.test.steps[2].detail | length' <<<"$report")"; fail=1; fi
 stop_fixture
 
@@ -1336,7 +1377,7 @@ start_fixture test_model_error
 queue_test_job h-test-model-error acme/app
 export STUB_OPENCODE_MODE=provider_error
 run_once test_model_error
-fail_step_check "a model whose key is refused" model 'User not found\.' '[true, true, false, false, false, true]'
+fail_step_check "a model whose key is refused" model 'User not found\.' '[true, true, false, false, false, false, true]'
 if jq -e '.test.steps[2].detail | test("exited 1")' <<<"$report" >/dev/null; then echo "ok   the model step names the exit status too"; else echo "FAIL steps: $(jq -c '.test.steps[2]' <<<"$report")"; fail=1; fi
 if ! jq -r '.test.steps[].detail' <<<"$report" | grep -qF "$api_key"; then echo "ok   no secret is in any detail"; else echo "FAIL a secret is in a detail"; fail=1; fi
 stop_fixture
@@ -1345,7 +1386,7 @@ start_fixture test_model_silent
 queue_test_job h-test-model-silent ""
 export STUB_OPENCODE_MODE=silent
 run_once test_model_silent
-fail_step_check "a model that returns nothing" model 'without an answer' '[true, true, false, false, false, true]'
+fail_step_check "a model that returns nothing" model 'without an answer' '[true, true, false, false, false, false, true]'
 stop_fixture
 
 start_fixture test_model_hang
@@ -1355,7 +1396,7 @@ run_timeout=1
 run_once test_model_hang
 run_timeout=60
 unset STUB_OPENCODE_SLEEP
-fail_step_check "a model that never answers" model 'did not answer within 1 second' '[true, true, false, false, false, true]'
+fail_step_check "a model that never answers" model 'did not answer within 1 second' '[true, true, false, false, false, false, true]'
 stop_fixture
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -1367,15 +1408,26 @@ else
   chmod 500 "$mem"
   run_once test_memory_fail
   chmod 700 "$mem"
-  fail_step_check "a memory directory that cannot be written" memory 'runner-test' '[true, true, true, false, false, true]'
+  fail_step_check "a memory directory that cannot be written" memory 'runner-test' '[true, true, true, false, false, false, true]'
   stop_fixture
 fi
+export STUB_OPENCODE_MODE=fix
+
+# The pull_request step fails the way a fix's last step would: the body cannot
+# be written, and the step says so rather than the first pull request finding
+# out.
+start_fixture test_pr_body_fail
+queue_test_job h-test-pr-body-fail acme/app
+export STUB_OPENCODE_MODE=oneline
+TMPDIR="$work/no-such-tmp" run_once test_pr_body_fail
+fail_step_check "a pull request body that cannot be written" pull_request 'could not be written: ENOENT' '[true, true, true, true, true, false, true]'
+stop_fixture
 export STUB_OPENCODE_MODE=fix
 
 start_fixture test_long_detail
 queue_test_job h-test-long-detail "acme/$(printf 'a%.0s' $(seq 1 101))"
 run_once test_long_detail
-if jq -e '.test.steps | all(.[]; (.detail | length) <= 300)' <<<"$report" >/dev/null && jq -e '.test.steps | map(.ok) == [true, true, true, false, false, true]' <<<"$report" >/dev/null; then echo "ok   a repository whose memory directory cannot be named fails the memory step, every detail within 300 characters"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps | all(.[]; (.detail | length) <= 300)' <<<"$report" >/dev/null && jq -e '.test.steps | map(.ok) == [true, true, true, false, false, false, true]' <<<"$report" >/dev/null; then echo "ok   a repository whose memory directory cannot be named fails the memory step, every detail within 300 characters"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 stop_fixture
 
 echo "--- 45b. the bucket step against a test repository puts and removes the marker under the repository's key ---"
@@ -1393,7 +1445,7 @@ export STUB_OPENCODE_MODE=fix
 us=$'\037'
 want_put="s3${us}cp${us}${mem}/.runner-test${us}s3://acme-sre-memory/fleet/acme/app/.runner-test${us}--only-show-errors${us}"
 want_rm="s3${us}rm${us}s3://acme-sre-memory/fleet/acme/app/.runner-test${us}--only-show-errors${us}"
-if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/acme/app/")' <<<"$report" >/dev/null; then echo "ok   every step passes and the bucket step names the repository's place in the bucket"; else echo "FAIL rc=$rc steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if [ "$rc" -eq 0 ] && jq -e '.test.steps | map(.ok) == [true, true, true, true, true, true, true]' <<<"$report" >/dev/null && jq -e '.test.steps[4].detail | contains("s3://acme-sre-memory/fleet/acme/app/")' <<<"$report" >/dev/null; then echo "ok   every step passes and the bucket step names the repository's place in the bucket"; else echo "FAIL rc=$rc steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 if [ "$(grep -cxF "$want_put" "$work/ctl/aws_calls.log")" -eq 1 ] && [ "$(grep -cxF "$want_rm" "$work/ctl/aws_calls.log")" -eq 1 ]; then echo "ok   the marker is put under <owner>/<repo>/ and removed again, once each"; else echo "FAIL aws calls: $(tr '\037' ' ' < "$work/ctl/aws_calls.log")"; fail=1; fi
 if [ -z "$(find "$work/ctl/uploaded" -name '.runner-test' -print -quit 2>/dev/null)" ] && [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   neither the bucket nor the volume keeps the marker"; else echo "FAIL left: $(find "$work/ctl/uploaded" "$workspace/memory" -name '.runner-test')"; fail=1; fi
 if ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed"; else echo "FAIL git: $(cat "$git_log")"; fail=1; fi
@@ -1415,7 +1467,7 @@ export STUB_OPENCODE_MODE=fix
 if jq -e '.test.steps[3].ok == false and (.test.steps[3].detail | test("another runner instance .*acme/app.*marker was not written"))' <<<"$report" >/dev/null; then echo "ok   the memory step fails with the busy sentence and writes nothing"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 if jq -e '.test.steps[4] == {name: "bucket", ok: false, detail: "not run"}' <<<"$report" >/dev/null; then echo "ok   the bucket step after it is not run, as after any failed step"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 if [ -z "$(find "$workspace/memory" -name '.runner-test' -print -quit)" ]; then echo "ok   no marker was written into the busy repository's memory"; else echo "FAIL left: $(find "$workspace/memory" -name '.runner-test')"; fail=1; fi
-if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "reported"]' <<<"$report" >/dev/null; then echo "ok   all six steps are still reported, in order"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps | map(.name) == ["collected", "cloned", "model", "memory", "bucket", "pull_request", "reported"]' <<<"$report" >/dev/null; then echo "ok   all seven steps are still reported, in order"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
 rm -f "$workspace/locks/acme/app.lock"
 stop_fixture
 
