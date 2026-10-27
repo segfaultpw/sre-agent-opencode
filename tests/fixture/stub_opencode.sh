@@ -39,8 +39,9 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
     printf 'provider_key: [%s]\n' "${OPENROUTER_API_KEY-unset}"
-    printf 'opencode_log_path: %s\n' "${OPENCODE_LOG_PATH:-missing}"
+    printf 'opencode_print_logs: %s\n' "${OPENCODE_PRINT_LOGS:-missing}"
     printf 'opencode_log_level: %s\n' "${OPENCODE_LOG_LEVEL:-missing}"
+    if [ -n "${OPENCODE_LOG_PATH+set}" ]; then printf 'sees_OPENCODE_LOG_PATH: yes\n'; else printf 'sees_OPENCODE_LOG_PATH: no\n'; fi
     if [ -n "${SRE_OPENCODE_LOG_LEVEL+set}" ]; then printf 'sees_SRE_OPENCODE_LOG_LEVEL: yes\n'; else printf 'sees_SRE_OPENCODE_LOG_LEVEL: no\n'; fi
     printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
@@ -51,34 +52,45 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
   } >> "$STUB_OPENCODE_LOG"
 fi
 
-# The runner points opencode's own log at a file under its workspace; a real
-# binary writes its server log there, and the stub writes recognizable lines
-# so the runner's forwarding is provable end to end. A path that is a FIFO or
-# a directory is left alone: the runner refuses to read it, and opening a
-# FIFO to write would never return.
-if [ -n "${OPENCODE_LOG_PATH:-}" ] && [ ! -p "${OPENCODE_LOG_PATH}" ] && [ ! -d "${OPENCODE_LOG_PATH}" ]; then
+# The runner starts opencode with OPENCODE_PRINT_LOGS=1, and the real binary
+# answers by writing its structured server log, one
+# `timestamp=... level=... run=... message=...` line per event, on its stderr.
+# The stub writes the same shape there so the runner's forwarding is provable
+# end to end, and the STUB_OPENCODE_LOG_* variables shape what one case needs.
+if [ "${OPENCODE_PRINT_LOGS:-}" = "1" ]; then
   {
-    printf 'stub server log: opencode started in %s\n' "$PWD"
+    printf 'timestamp=2026-10-27T00:00:00.000Z level=INFO run=stub message="stub server log: opencode started in %s"\n' "$PWD"
     if [ -n "${STUB_OPENCODE_LOG_LINES:-}" ]; then
       number=1
       while [ "$number" -le "$STUB_OPENCODE_LOG_LINES" ]; do
-        printf 'stub server log line %s of %s\n' "$number" "$STUB_OPENCODE_LOG_LINES"
+        printf 'timestamp=2026-10-27T00:00:01.000Z level=INFO run=stub message="stub server log line %s of %s"\n' "$number" "$STUB_OPENCODE_LOG_LINES"
         number=$((number + 1))
       done
     fi
     if [ -n "${STUB_OPENCODE_LOG_LONG:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:02.000Z level=INFO run=stub message="'
       head -c 5000 /dev/zero | tr '\0' 'x'
-      printf '\n'
+      printf '"\n'
     fi
     if [ -n "${STUB_OPENCODE_LOG_SECRET:-}" ]; then
-      printf 'stub server log holds the provider key %s\n' "$STUB_OPENCODE_LOG_SECRET"
+      printf 'timestamp=2026-10-27T00:00:03.000Z level=INFO run=stub message="stub server log holds the provider key %s"\n' "$STUB_OPENCODE_LOG_SECRET"
+    fi
+    if [ -n "${STUB_OPENCODE_LOG_SECRET_LATE:-}" ]; then
+      # The key starts before the 2,000 character bound and ends past it, so a
+      # runner that truncated before it redacted would forward the key's head.
+      printf 'timestamp=2026-10-27T00:00:04.000Z level=INFO run=stub message="'
+      head -c 1926 /dev/zero | tr '\0' 'y'
+      printf '%s"\n' "$STUB_OPENCODE_LOG_SECRET_LATE"
     fi
     if [ -n "${STUB_OPENCODE_LOG_BADUTF8:-}" ]; then
-      printf 'stub good line alpha\n'
-      printf 'stub bad line has \xff\xfe invalid bytes and a tail of text that goes on\n'
-      printf 'stub good line beta\n'
+      printf 'timestamp=2026-10-27T00:00:05.000Z level=INFO run=stub message="stub good line alpha"\n'
+      printf 'timestamp=2026-10-27T00:00:06.000Z level=INFO run=stub message="stub bad line has \xff\xfe invalid bytes and a tail of text that goes on"\n'
+      printf 'timestamp=2026-10-27T00:00:07.000Z level=INFO run=stub message="stub good line beta"\n'
     fi
-  } >> "$OPENCODE_LOG_PATH"
+    if [ -n "${STUB_OPENCODE_LOG_NUL:-}" ]; then
+      printf 'timestamp=2026-10-27T00:00:08.000Z level=INFO run=stub message="stub nul line has a \0 byte inside"\n'
+    fi
+  } >&2
 fi
 
 # What the agent can reach from where it runs, for tests/uid_split_test.sh: the

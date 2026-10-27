@@ -7,7 +7,6 @@
 //   <workspace>/memory/_estate/            the same, for requests naming no repository
 //   <workspace>/scratch/                   untargeted runs
 //   <workspace>/context/<owner>/<repo>/    the integration's context repository, read-only reference
-//   <workspace>/opencode-logs/             opencode's own per-run logs, forwarded and removed by the runner
 //
 // With SRE_WORKSPACE_PER_INSTANCE=1 (memory.split below) the working
 // directories are this instance's own under <workspace>/instances/<id> while
@@ -46,9 +45,8 @@ const NAME_PATTERN = /^[A-Za-z0-9._-]{1,100}$/;
 // the shared working tree of every instance and the leases on the shared memory.
 // context/ holds the integration's context repository, the runner's own clone
 // of a repository the organization chose, so an owner of that name is left
-// where it is rather than moved under repos/. opencode-logs/ holds opencode's
-// own per-run logs, the runner's alone to read and forward.
-const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home', 'instances', 'locks', 'context', 'opencode-logs']);
+// where it is rather than moved under repos/.
+const RESERVED = new Set(['repos', 'gitdirs', 'memory', 'scratch', 'agent-home', 'instances', 'locks', 'context']);
 // What the runner keeps at the top of the workspace for the bucket mirror: a
 // restore's staging directory, the marker of a restore that has not succeeded
 // and the journal of paths not yet mirrored (runner/bucket.js). None is an owner.

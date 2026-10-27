@@ -2261,159 +2261,57 @@ function splitMemorySummary(message, hadBlock) {
   return { message, summary: '' };
 }
 
-// opencode's own log, the "server logs" its errors point at. The runner points
-// the process at a file of its own under the workspace (never inside the
-// agent's home, whose account must not be able to write what is forwarded),
-// and when the process ends it forwards the file's tail to its own output with
-// the `opencode:` prefix, so the operator's log group holds what the sentence
-// asks for. Every line goes through log(), so through redact(), and the bounds
-// hold whatever a chatty debug level produces: at most the last 2 MiB of the
-// file, at most the last 200 non-empty lines, each cut at 2,000 characters.
-const OPENCODE_LOG_DIRNAME = 'opencode-logs';
+// opencode's own log, the "server logs" its errors point at. The pinned
+// binary does not read OPENCODE_LOG_PATH (zero occurrences in it; its file
+// logger is hardwired), so a file of the runner's naming would forward
+// nothing. What it does read is OPENCODE_PRINT_LOGS: set to 1, it prints its
+// structured server log, one `timestamp=... level=... run=... message=...`
+// line per event, on stderr. The runner sets that variable for the process it
+// starts (runAgent) and, once that process has ended, however it ended,
+// forwards the tail of those lines from the captured stderr to its own output
+// with the `opencode:` prefix, so the operator's log group holds what the
+// sentence asks for. Every line goes through log(), so through redact(), and
+// the bounds hold whatever a chatty level produces: at most the last 200
+// lines, each cut at 2,000 characters.
 const OPENCODE_LOG_MAX_LINES = 200;
 const OPENCODE_LOG_MAX_CHARS = 2000;
-const OPENCODE_LOG_TAIL_BYTES = 2 * 1024 * 1024;
-const OPENCODE_LOG_STALE_MS = 24 * 60 * 60 * 1000;
-const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 
-function opencodeLogPath(config, id) {
-  if (typeof id !== 'string' || !RUN_ID.test(id)) return null;
-  return path.join(config.layout.workspace, OPENCODE_LOG_DIRNAME, `${id}.log`);
-}
-
-// The directory is the runner's alone, made when a run first needs it and
-// swept of last day's leftovers, which only a crash can leave: a file that
-// ends with its run is removed the moment it has been forwarded. The run's
-// file is made here too: the agent's account fills it for the length of the
-// run (opencode runs as the agent) and can neither list the directory, nor
-// create or replace anything in it, so it cannot choose the path, plant a
-// link in its place or leave a file for another run.
-function openOpencodeLog(config, id) {
-  const file = opencodeLogPath(config, id);
-  if (!file) return null;
-  const dir = path.dirname(file);
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    if (!fs.lstatSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`);
-    ownByRunner(dir);
-    // 0711 under the account split, the mode of every directory the agent
-    // walks through: it reaches its own log file and nothing else in here.
-    // One account, one mode: 0700, closed like the runner's other state.
-    fs.chmodSync(dir, identity.mode === 'none' ? 0o700 : 0o711);
-    sweepOpencodeLogs(dir);
-    try {
-      fs.closeSync(fs.openSync(file, 'wx', 0o600));
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-    }
-    if (identity.mode !== 'none' && identity.agent) fs.lchownSync(file, identity.agent.uid, identity.agent.gid);
-  } catch (error) {
-    log('warn', `opencode's log could not be prepared (${redact(error.message)}); the run goes ahead without it`);
-    return null;
-  }
-  return file;
-}
-
-function sweepOpencodeLogs(dir) {
-  for (const name of fs.readdirSync(dir)) {
-    const entry = path.join(dir, name);
-    let stat;
-    try {
-      stat = fs.lstatSync(entry);
-    } catch {
-      continue;
-    }
-    if (!stat.isFile() || Date.now() - stat.mtimeMs <= OPENCODE_LOG_STALE_MS) continue;
-    fs.rmSync(entry, { force: true });
-  }
-}
-
-// Reads the file's tail and logs it, then removes the file: the log group
-// holds the lines, and nothing on the volume grows with the runs. A missing
-// file is not an error (an opencode that ignores the knob, or a run that never
-// reached it) and forwards nothing. Returns the number of lines forwarded, or
-// null when there was nothing to forward or the path was refused.
-function forwardOencodeLog(file, options = {}) {
+// Only the `timestamp=` lines are the structured server log; whatever else the
+// process wrote to stderr (pretty error text) keeps the treatment it already
+// has. Called once per run, after the process ended. Returns the number of
+// lines forwarded, or null when the process printed no structured line at all
+// (which the failure paths leave out of their evidence).
+function forwardOpencodeLog(stderrText, options = {}) {
   const maxLines = options.lines || OPENCODE_LOG_MAX_LINES;
   const maxChars = options.chars || OPENCODE_LOG_MAX_CHARS;
-  let stat;
-  try {
-    stat = fs.lstatSync(file);
-  } catch {
-    return null;
-  }
-  // A link, a FIFO or a directory where the log belongs is never followed and
-  // never read: the agent's account cannot make the runner read a file of its
-  // choosing. A non-directory at the path goes with the run's scratch.
-  if (!stat.isFile()) {
-    log('warn', `opencode: ${path.basename(file)} is not a regular file, so it was not read`);
-    if (!stat.isDirectory()) fs.rmSync(file, { force: true });
-    return null;
-  }
-  // The file was the agent's for the length of its run; the run is over, so it
-  // is the runner's again before anything is read from it.
-  if (identity.mode !== 'none' && identity.agent) {
-    try {
-      fs.lchownSync(file, identity.runner.uid, identity.runner.gid);
-    } catch {
-      // Without it the read below fails closed; the sweep takes the file.
-    }
-  }
-  const size = stat.size;
-  const length = Math.min(size, OPENCODE_LOG_TAIL_BYTES);
-  const buffer = Buffer.alloc(length);
-  let read = 0;
-  let fd;
-  try {
-    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    // What was opened is what was measured: a swap between the two stats
-    // fails closed rather than reading something else.
-    if (!fs.fstatSync(fd).isFile()) throw new Error('not a regular file');
-    const start = Math.max(0, size - OPENCODE_LOG_TAIL_BYTES);
-    while (read < length) {
-      const got = fs.readSync(fd, buffer, read, length - read, start + read);
-      if (got <= 0) break;
-      read += got;
-    }
-  } catch (error) {
-    log('warn', `opencode: the log could not be read (${redact(error.message)})`);
-    return null;
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-  let forwarded = 0;
-  let dropped = 0;
-  const decoder = new TextDecoder('utf-8', { fatal: true });
-  const lines = [];
-  let begin = 0;
-  for (let at = 0; at <= read; at += 1) {
-    if (at !== read && buffer[at] !== 0x0a) continue;
-    let end = at;
-    if (end > begin && buffer[end - 1] === 0x0d) end -= 1;
-    if (end > begin) lines.push(buffer.subarray(begin, end));
-    begin = at + 1;
-  }
-  for (const raw of lines.slice(-maxLines)) {
-    let line = null;
-    // A NUL byte or a sequence that is not UTF-8 is dropped whole, never
-    // forwarded mangled: counted in one line instead.
-    if (!raw.includes(0)) {
-      try {
-        line = decoder.decode(raw);
-      } catch {
-        line = null;
-      }
-    }
-    if (line === null) {
-      dropped += 1;
+  if (typeof stderrText !== 'string' || stderrText === '') return null;
+  const structured = [];
+  let unreadable = 0;
+  for (const piece of stderrText.split('\n')) {
+    const line = piece.endsWith('\r') ? piece.slice(0, -1) : piece;
+    if (!line.startsWith('timestamp=')) continue;
+    // A NUL byte, or a byte sequence that was not UTF-8 (the stream decoder
+    // has already replaced those with U+FFFD, which none of the binary's own
+    // structured lines contains) drops the line whole, never forwards it
+    // mangled: it is counted in one line instead.
+    if (line.includes('\0') || line.includes('�')) {
+      unreadable += 1;
       continue;
     }
-    log('info', `opencode: ${boundedLine(line, maxChars)}`);
-    forwarded += 1;
+    structured.push(line);
   }
-  if (dropped > 0) log('warn', `opencode: ${dropped} unreadable line${dropped === 1 ? '' : 's'} dropped`);
-  fs.rmSync(file, { force: true });
-  return forwarded;
+  if (structured.length === 0 && unreadable === 0) return null;
+  const overflow = Math.max(0, structured.length - maxLines);
+  for (const line of structured.slice(-maxLines)) {
+    // Redaction before the bound: a secret cut in half by a truncation is no
+    // longer a string redact() can find, so the whole line is redacted first
+    // and the cut falls where it falls. log() redacts again, which changes
+    // nothing (redaction is idempotent).
+    log('info', `opencode: ${boundedLine(redact(line), maxChars)}`);
+  }
+  if (unreadable > 0) log('warn', `opencode: ${unreadable} unreadable line${unreadable === 1 ? '' : 's'} dropped`);
+  if (overflow > 0) log('info', `opencode: ${overflow} earlier line${overflow === 1 ? '' : 's'} dropped, keeping the last ${structured.length - overflow}`);
+  return structured.length - overflow;
 }
 
 // One line at most `maxChars` long, cut at a character boundary and marked,
@@ -2466,16 +2364,17 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // process keeps them; only the module's agent_aws_access opts the agent in.
   delete env.SRE_AGENT_AWS_ACCESS;
   // opencode's own log is the runner's business: the knob never reaches the
-  // agent as the runner's variable, and an inherited OPENCODE_LOG_* value from
-  // the runner's own environment never survives either. What the process gets
-  // is what this run chose: the runner's file, and the level it was given.
+  // agent as the runner's variable, and an inherited OPENCODE_LOG_* value
+  // from the runner's own environment never survives either. What the process
+  // gets is what this run chose: its structured server log printed to stderr
+  // (the print switch is the variable the pinned binary reads; it reads no
+  // OPENCODE_LOG_PATH), and the level it was given.
   delete env.SRE_OPENCODE_LOG_LEVEL;
   delete env.OPENCODE_LOG_PATH;
   delete env.OPENCODE_LOG_LEVEL;
-  if (options.opencodeLog) {
-    env.OPENCODE_LOG_PATH = options.opencodeLog;
-    if (config.opencodeLogLevel) env.OPENCODE_LOG_LEVEL = config.opencodeLogLevel;
-  }
+  delete env.OPENCODE_PRINT_LOGS;
+  env.OPENCODE_PRINT_LOGS = '1';
+  if (config.opencodeLogLevel) env.OPENCODE_LOG_LEVEL = config.opencodeLogLevel;
   // Where the memory is mirrored to is the runner's business: the agent edits a
   // copy in its checkout and has no use for the bucket.
   for (const name of Object.keys(env)) {
@@ -2521,11 +2420,11 @@ async function runAgent(config, workspace, prompt, options = {}) {
     home: options.home,
     timeoutMs: options.timeoutMs || config.runTimeoutMs,
   });
-  // Once, right after the process ends, whatever ended it: the tail of
-  // opencode's own log goes to the operator's log group and the file goes.
-  // null when this run kept no log (or the path was refused), which the
-  // failure paths below can name in their evidence.
-  const opencodeLogLines = options.opencodeLog ? forwardOencodeLog(options.opencodeLog) : null;
+  // Once, right after the process ends, whatever ended it: the tail of the
+  // structured server log opencode printed on stderr goes to the operator's
+  // log group. null when the process printed no structured line, which the
+  // failure paths below can leave out of their evidence.
+  const opencodeLogLines = forwardOpencodeLog(result.stderr);
 
   const texts = [];
   const errors = [];
@@ -3015,13 +2914,9 @@ async function runTestJob(config, job) {
       let agent;
       let quiet = true;
       const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
-      // opencode's own log for this test job, the one its "check server logs"
-      // errors point at: the step the bug report named is the one that needs
-      // it most, and the model call keeps every scrubbing and bound a fix has.
-      const opencodeLog = openOpencodeLog(config, job.handoff_id);
       try {
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, opencodeLog });
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
@@ -3175,14 +3070,11 @@ async function handleJob(config, job) {
     // Made while the tree is still the runner's: the bundle needs the runner's
     // git directory, and nothing of the agent's.
     const bundle = repo ? await makeBaseBundle(workspace) : null;
-    // opencode's own log for this run, under the runner's workspace: made
-    // before the agent starts, forwarded and removed when the run ends.
-    const opencodeLog = openOpencodeLog(config, job.handoff_id);
     try {
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, opencodeLog });
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -3222,8 +3114,8 @@ async function handleJob(config, job) {
     if (agent.timedOut) {
       result.summary = `The agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds) and nothing was published.`;
       result.evidence.timed_out = true;
-      // The killed run's log was forwarded too; the count says how much of it
-      // the log group holds, the file itself is already gone.
+      // The killed run's structured stderr tail was forwarded too; the count
+      // says how much of it the log group holds.
       if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       if (agent.abandoned) {
         // Reported rather than hidden: the operator is the only one who can
