@@ -69,8 +69,9 @@ expect '.permission.bash["*rm -f *"]' deny
 expect '.permission.bash["*rm --recursive*"]' deny
 expect '.permission.bash["*rm --force*"]' deny
 expect '.permission.bash["*sudo *"]' deny
-# The ninth, and on the CI door it is a privilege escalation rather than a
-# convenience: fix.yml puts GITHUB_TOKEN in the agent's environment, so
+# The ninth, and on the runner it is a privilege escalation rather than a
+# convenience: the agent's GH_TOKEN is the runner's own repository token
+# unless SRE_AGENT_GITHUB_TOKEN or App mode gives it a read-only one, so
 # "gh pr merge" and "gh api -X PUT" walk around the git push deny and the
 # protected paths gate both, and the agent could merge its own pull request.
 #
@@ -82,9 +83,7 @@ expect '.permission.bash["*sudo *"]' deny
 # environment-variable prefix, and the env wrapper. "sudo gh" is covered by
 # the sudo deny, and a backslash form is covered by the path one, since the
 # matcher replaces a backslash with a slash in the resource as well as in the
-# pattern. On the runner door this is the second line, the first being that
-# the runner deletes GH_TOKEN and GITHUB_TOKEN from the environment it starts
-# the agent in.
+# pattern.
 expect '.permission.bash["gh *"]' deny
 expect ".permission.bash[\"*'gh' *\"]" deny
 expect '.permission.bash["*\"gh\" *"]' deny
@@ -309,11 +308,11 @@ check '{{SRE_AGENT_OPENCODE_VERSION}}' 'agent carries the version placeholder'
 check 'Declined:' 'agent knows the decline prefix'
 check 'sre-agent:remediation' 'agent copies the platform marker'
 check 'sre-agent-opencode:{{SRE_AGENT_OPENCODE_VERSION}}' 'agent writes the stamp line'
-# One prompt serves both doors. Two copies would drift, and the CI door's
-# live proof is what validated these steps.
-check 'workflow or runner that runs you' 'agent names both doors'
+# One prompt, written for the runner that executes it; the runner's own live
+# proof (tests/runner_test.sh) is what validated these steps.
+check 'the runner that runs you' 'agent names what runs it'
 check 'no repository was resolved' 'agent knows the untargeted case'
-if grep -q "this repository's own CI" "$agent"; then echo "FAIL agent still assumes it was started by CI"; fail=1; else echo "ok   agent does not assume the CI door"; fi
+if grep -q "this repository's own CI" "$agent"; then echo "FAIL agent still assumes it was started by CI"; fail=1; else echo "ok   agent does not assume it was started by CI"; fi
 if grep -q 'git push\|open a pull request yourself\|never commit' "$agent"; then echo "ok   agent is told the action commits and pushes"; else echo "FAIL agent push contract"; fail=1; fi
 
 if grep -q $'\xe2\x80\x94' "$agent" "$cfg" "$here/../README.md"; then echo "FAIL em dash present"; fail=1; else echo "ok   no em dash"; fi

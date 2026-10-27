@@ -20,13 +20,10 @@ FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3e
 # is the machine's own arch.
 ARG TARGETARCH
 
-# opencode is pinned at the version the reusable workflow's action tag names,
-# so both doors were built against the same permission matcher. It does not
-# follow that a run here meets the same binary a run in CI does: the action
-# installs whatever release is current at run time and does not expose the
-# install script's version option, so this is the only one of the two doors
-# where the binary that enforces the fences is pinned at all. A bump belongs
-# in the CHANGELOG.
+# opencode is pinned at the release this package was tested against, because
+# that binary is what enforces the permission fences, and the runner turns
+# its self-update off so it cannot move under a run. A bump belongs in the
+# CHANGELOG.
 ARG OPENCODE_VERSION=1.18.29
 ARG KUBECTL_VERSION=v1.37.0
 ARG GH_VERSION=2.100.0

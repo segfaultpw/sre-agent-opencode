@@ -1,10 +1,9 @@
 'use strict';
 // The title of a pull request and the message of a commit, as one Conventional
 // Commits header: `type(scope)!: subject`. The same rules, in the same order,
-// as scripts/conventional_title.sh (the CI door's) and as SRE Agent's own
-// SreCore.Remediation.ConventionalTitle, so a pull request reads the same
-// whichever door opened it. tests/conventional_title_test.sh runs this and the
-// script over one fixture table, and the platform runs a copy of that table.
+// as SRE Agent's own SreCore.Remediation.ConventionalTitle, so a pull request
+// reads the same whichever runner opened it. tests/conventional_title_test.sh
+// runs this over the fixture table, and the platform runs a copy of that table.
 //
 // Standard library only: this file is installed on a machine the customer owns.
 

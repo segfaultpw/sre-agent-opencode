@@ -78,10 +78,9 @@ const KILL_GRACE_MS = 5_000;
 // means never reporting at all.
 const ABANDON_GRACE_MS = 2_000;
 
-// The same shapes the CI door uses, so a pull request from either door carries
-// the same two lines: scripts/decline_comment.sh and fix.yml's marking step
-// read the marker with this expression and append each line only when the body
-// does not already carry it.
+// The shapes SRE Agent reads off a pull request: the marker line this runner
+// appends to every body, matched with this expression so a line is only ever
+// appended when the body does not already carry it.
 const MARKER_PATTERN = /<!-- sre-agent:remediation:[^>]*-->/;
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
@@ -2325,7 +2324,7 @@ function boundedLine(line, maxChars) {
 }
 
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
-// fences handed over the way fix.yml hands them over. The runner's own
+// fences handed over as opencode's configuration. The runner's own
 // credentials are stripped from the child's environment: the agent has a
 // shell, so anything left there is reachable, and it needs none of them.
 async function runAgent(config, workspace, prompt, options = {}) {
@@ -2338,9 +2337,9 @@ async function runAgent(config, workspace, prompt, options = {}) {
   };
   // The first line, and the one that holds: the agent has a shell, so a
   // credential left here is a credential it can use. The config's gh deny is
-  // the second line and matters most on the CI door, where the job's token is
-  // in the environment by construction and "gh pr merge" would walk around
-  // both the git push deny and the protected paths gate.
+  // the second line and matters on its own: in static-token mode the agent's
+  // GH_TOKEN is the runner's own write token, and "gh pr merge" would walk
+  // around both the git push deny and the protected paths gate.
   delete env.SRE_API_KEY;
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;
@@ -2460,8 +2459,8 @@ async function runAgent(config, workspace, prompt, options = {}) {
 
 // Step 5. The gate. The fences are opencode's own tool gates and the agent
 // also runs a shell, which can write a file without any tool, so what actually
-// changed is judged here, by the same script the CI door uses, before anything
-// is published.
+// changed is judged here, by this package's own protected paths script, before
+// anything is published.
 async function stageAndGate(workspace, memoryBlobs) {
   const { dir, gitdir, cleanUrl } = workspace;
   // The agent has had the tree and never the git directory, but what the runner
@@ -2591,8 +2590,8 @@ async function publish(config, workspace, message, brief, result, providedTitle 
 
   // The identity is set on the command rather than in the repository, because
   // a service account has no git identity of its own and "empty ident name"
-  // after the agent has already done its work is a failure the CI door hit
-  // once for exactly this reason.
+  // after the agent has already done its work is exactly the failure setting
+  // the identity here prevents.
   await gitIn(workspace, [
     '-c',
     'user.name=sre-agent-fix-runner',

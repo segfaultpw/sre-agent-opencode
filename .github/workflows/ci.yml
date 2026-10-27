@@ -12,10 +12,7 @@ permissions:
 # (segfaultpw/runner-switch), which sets RUNNER_X64 and RUNNER_ARM64 to
 # GitHub-hosted labels while the month's included Actions minutes last and to
 # Blacksmith labels once they are nearly spent. The fallback in each expression
-# is the Blacksmith label, so an unset variable changes nothing. fix.yml is
-# deliberately not part of this: it runs in a customer's repository, where
-# these variables do not exist, and its runner input defaults to a label
-# GitHub itself provides.
+# is the Blacksmith label, so an unset variable changes nothing.
 jobs:
   lint:
     name: actionlint
@@ -24,8 +21,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Install actionlint
         run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.12
-      - name: Lint the workflows and the example
-        run: ./actionlint -color .github/workflows/*.yml examples/opencode.yml
+      - name: Lint the workflows
+        run: ./actionlint -color .github/workflows/*.yml
 
   tests:
     name: config, provider mapping and changelog tests
@@ -33,19 +30,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - run: bash tests/config_test.sh
-      - run: bash tests/workflow_test.sh
       - run: bash tests/pattern_probe_test.sh
       - run: bash tests/provider_env_test.sh
       - run: bash tests/protected_paths_test.sh
       - run: bash tests/strip_repo_config_test.sh
       - run: bash tests/gate_agreement_test.sh
-      - run: bash tests/run_prs_test.sh
-      - run: bash tests/decline_comment_test.sh
-      - run: bash tests/install_test.sh
       - run: bash tests/changelog_section_test.sh
       - run: bash tests/conventional_title_test.sh
-      - run: bash tests/card_key_test.sh
-      - run: bash tests/pr_body_test.sh
       # The runner is the only Node file in the package, so its syntax gate is
       # the one lint it gets; the test that follows runs it for real against a
       # fixture platform.
@@ -248,24 +239,3 @@ jobs:
           echo "$out"
           grep -q 'the agent would run as root, so the runner will not start' <<<"$out" || { echo "::error::root without capabilities was refused for another reason"; exit 1; }
           if grep -q 'polling' <<<"$out"; then echo "::error::root without capabilities reached a poll"; exit 1; fi
-
-  # The reusable workflow called the way a customer calls it, stopped after
-  # the install and the secret mapping: proof on GitHub itself that a called
-  # workflow resolves its own commit and fetches the package's files at it.
-  # A pull request's merge commit is not fetchable from raw.githubusercontent.com,
-  # so this runs on pushes only.
-  smoke:
-    name: reusable workflow dry run
-    if: github.event_name == 'push'
-    permissions:
-      id-token: write
-      contents: write
-      pull-requests: write
-      issues: write
-    uses: ./.github/workflows/fix.yml
-    with:
-      model: openrouter/deepseek/deepseek-v4-pro
-      use_github_token: true
-      dry_run: true
-    secrets:
-      provider_key: not-a-key-the-dry-run-stops-before-opencode
