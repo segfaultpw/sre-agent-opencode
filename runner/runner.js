@@ -2337,9 +2337,9 @@ async function runAgent(config, workspace, prompt, options = {}) {
   };
   // The first line, and the one that holds: the agent has a shell, so a
   // credential left here is a credential it can use. The config's gh deny is
-  // the second line and matters most on the CI door, where the job's token is
-  // in the environment by construction and "gh pr merge" would walk around
-  // both the git push deny and the protected paths gate.
+  // the second line and matters on its own: in static-token mode the agent's
+  // GH_TOKEN is the runner's own write token, and "gh pr merge" would walk
+  // around both the git push deny and the protected paths gate.
   delete env.SRE_API_KEY;
   delete env.SRE_GITHUB_TOKEN;
   delete env.GH_TOKEN;
@@ -2459,8 +2459,8 @@ async function runAgent(config, workspace, prompt, options = {}) {
 
 // Step 5. The gate. The fences are opencode's own tool gates and the agent
 // also runs a shell, which can write a file without any tool, so what actually
-// changed is judged here, by the same script the CI door uses, before anything
-// is published.
+// changed is judged here, by this package's own protected paths script, before
+// anything is published.
 async function stageAndGate(workspace, memoryBlobs) {
   const { dir, gitdir, cleanUrl } = workspace;
   // The agent has had the tree and never the git directory, but what the runner
@@ -2590,8 +2590,8 @@ async function publish(config, workspace, message, brief, result, providedTitle 
 
   // The identity is set on the command rather than in the repository, because
   // a service account has no git identity of its own and "empty ident name"
-  // after the agent has already done its work is a failure the CI door hit
-  // once for exactly this reason.
+  // after the agent has already done its work is exactly the failure setting
+  // the identity here prevents.
   await gitIn(workspace, [
     '-c',
     'user.name=sre-agent-fix-runner',

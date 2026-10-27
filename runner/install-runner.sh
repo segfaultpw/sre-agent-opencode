@@ -75,7 +75,7 @@ lack() { missing+=("$1"$'\n'"           fix: $2"); }
 
 if ! command -v systemctl >/dev/null 2>&1; then
   lack "this machine has no systemctl, and this installer only knows how to install a systemd unit" \
-    "run the container image instead: docker run ghcr.io/segfaultpw/sre-agent-opencode-runner:v1"
+    "run the container image instead: docker run ghcr.io/segfaultpw/sre-agent-opencode-runner:v2"
 fi
 
 # The files the runner reads at run time. A clone that is missing one of them

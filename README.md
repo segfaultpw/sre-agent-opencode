@@ -1,6 +1,6 @@
 # sre-agent-opencode
 
-A fix request from [SRE Agent](https://sreagent.app) runs on a runner you deploy on your own machine: this package's [opencode](https://opencode.ai) agent, under this package's fences, in a checkout it makes itself, ending in one draft pull request that SRE Agent links to the card and reviews. Deploy the runner with this package's Terraform module, its container image, or systemd; everything below describes it. Your code and your provider key stay on your machine: SRE Agent never runs opencode and never holds the key.
+A fix request from [SRE Agent](https://sreagent.app) runs on a runner you deploy on your own machine: this package's [opencode](https://opencode.ai) agent, under this package's fences, in a checkout it makes itself, ending in one draft pull request that SRE Agent links to the card and reviews. Deploy the runner with the `fix-runner` module of `terraform-sre-agent` (one ECS service in your own AWS account), its container image, or systemd; everything below describes it. Your code and your provider key stay on your machine: SRE Agent never runs opencode and never holds the key.
 
 ## Choosing a model
 
@@ -37,9 +37,9 @@ What the machine gives the agent:
 
 - **The access the machine has.** The agent gets a checkout, and whatever the machine itself lets a process on it reach: a cluster whose kubeconfig or service account token any account can read, an internal endpoint, and a cloud role the machine provides through its metadata service (see [What it can reach, and what actually bounds it](#what-it-can-reach-and-what-actually-bounds-it)). The runner's own AWS variables are not among them unless `SRE_AGENT_AWS_ACCESS=1`. It reads the live system while it reasons about the change instead of inferring it from the source.
 - **Requests that resolved no repository.** SRE Agent's own agent declines those because it has nothing to check out. This runner answers one with a diagnosis, the evidence for it, and the repository the change probably belongs in. It changes nothing and opens nothing.
-- **No tracking issue.** The brief is fetched over HTTPS with a token good for that one request, and nothing is written to the repository until a pull request.
+- **Nothing in the repository until a pull request.** The brief is fetched over HTTPS with a token good for that one request; no issue carries it and nothing is written to the repository until a pull request.
 
-Run one runner per organization, and expect it to answer one request at a time. The queue is not a lease: two runners sharing one key can both collect the same request and do the work twice.
+Run one runner per organization, or several as a pool on one volume (see [Running several runners on one volume](#running-several-runners-on-one-volume)): collecting a request leases it to the instance that collected it, so two runners never answer one request twice.
 
 ### What SRE Agent stores about it
 
@@ -59,10 +59,10 @@ docker run -d --name sre-agent-fix-runner \
   --restart unless-stopped \
   --env-file /etc/sre-agent-fix-runner.env \
   -v sre-agent-fix-runner-workspace:/workspace \
-  ghcr.io/segfaultpw/sre-agent-opencode-runner:v1
+  ghcr.io/segfaultpw/sre-agent-opencode-runner:v2
 ```
 
-The image is built for amd64 and arm64 and carries node, git, `gh`, opencode, kubectl, the AWS CLI and mise (so the agent can install language runtimes into its own home), plus this package's own VERSION, configuration, agent and scripts, root-owned and not writable by the account the agent runs as. `:v1` moves with every release of this major; pin `:v1.2.0` to freeze one.
+The image is built for amd64 and arm64 and carries node, git, `gh`, opencode, kubectl, the AWS CLI and mise (so the agent can install language runtimes into its own home), plus this package's own VERSION, configuration, agent and scripts, root-owned and not writable by the account the agent runs as. `:v2` moves with every release of this major; pin `:v2.0.0` to freeze one.
 
 The container starts as root, and only the container does: the runner needs it to start every agent run as a second account (`agent`, uid 10002) and to hand that account one checkout at a time. Everything else runs as `runner` (uid 10001): the git and `gh` calls, the scripts, and every file in `/workspace`. If you mount a host directory at `/workspace`, any owner works: the runner chowns the workspace to uid 10001 when it starts, so a volume that an earlier release filled as 10001 keeps working. Root needs six capabilities and no others (`SETUID`, `SETGID`, `CHOWN`, `DAC_OVERRIDE`, `FOWNER` and `KILL`), all of which are in Docker's default set (which holds fourteen); if you drop capabilities, add those back. A start that cannot make the split is handled by who it starts as. A start that is **not root** and lacks one of those six (the manifest of an earlier release: `runAsUser: 10001`, every capability dropped) does not crash: the runner runs the agent as its own account, as releases before v1.5.0 did, and says so in a `warn` line at start that names the missing capabilities and in the `agent_isolation` entry of every report's evidence; in that mode taking secrets out of the agent's environment is not a boundary, because the agent can read the runner's process environment and write the memory directory, so give the container the six capabilities to get the split back. A start that **is root** and lacks any of the six (`--cap-drop ALL` as root, a securityContext with `runAsUser: 0` that drops them without adding them back) never falls back, because the one account there is root: the runner refuses to start, naming the missing capabilities and saying that the agent would run as root, and polls nothing. [Who runs what](#who-runs-what) says what each account can reach.
 
@@ -123,7 +123,7 @@ spec:
       serviceAccountName: sre-agent-fix-runner
       containers:
         - name: runner
-          image: ghcr.io/segfaultpw/sre-agent-opencode-runner:v1
+          image: ghcr.io/segfaultpw/sre-agent-opencode-runner:v2
           env:
             - name: SRE_SERVER_URL
               value: https://app.example.com
@@ -378,7 +378,7 @@ The image carries a base toolset for typical repositories: `build-essential` (a 
 
 1. **mise, in the agent's home, no root.** The agent installs language runtimes as itself (`mise use node@22`, `mise install python@3.12`, and so on), and `npm -g`, `pip --user`, `cargo`, `go install`, `gem` and `mix` all write under its home. The home is on the volume, so they stay for the next request. This needs nothing from you.
 2. **A setup script, root, once at container start.** Set `SRE_RUNNER_SETUP` to the path of an executable file that is in the container (mount it, or bake it into a derived image). The entrypoint runs it once, as root, after the two accounts are resolved and before the runner starts (so before the first poll and before anything is handed to the agent), logs its output line by line, and refuses to start the runner if it exits non-zero, saying which script and what status. The runner never fetches a script; a URL is refused, and so is a relative path, and any path at all when `SRE_WORKSPACE` is `/`. Every path is judged as given and again where it resolves to, so a link cannot get one past: it is refused when it is on the workspace; when it is under `/tmp`, `/var/tmp`, `/dev/shm`, `/run/lock` or `/var/lock`; and when the script itself, or any directory above it, is one the agent's account can write: it owns it, its group can write it, or anyone can (the "other" write bit), except in a sticky directory, where only an entry's owner can replace or remove it. That last rule is what a mount with the wrong mode that no list names is caught by, and it is why a script mounted from a ConfigMap or projected volume works: the mount point is a world-writable sticky directory on a read-only volume holding root-owned files and links (`..data`), out of the agent's reach. The agent can write all the refused places and the script runs as root at the next start. The script gets an allowlisted environment, not the container's: `PATH`, `HOME=/root`, the locale and time zone (`LANG`, `LC_ALL`, `TZ`, `TERM`), the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lower-case forms) and any variable you name `SRE_SETUP_*`. It never sees `SRE_API_KEY`, either GitHub token, a model provider key or AWS credentials. It runs on every container start, not once per volume, so make it idempotent and quick (an `apt-get install` of a few packages is the intended use); for anything heavy, use a derived image. It is for the container only: a start that is not root refuses a script rather than running it as somebody else.
-3. **A derived image.** `FROM ghcr.io/segfaultpw/sre-agent-opencode-runner:v1`, `RUN apt-get update && apt-get install ...` as root, and leave the `ENTRYPOINT` and `USER` alone. This is the way for system packages that are large or slow to install.
+3. **A derived image.** `FROM ghcr.io/segfaultpw/sre-agent-opencode-runner:v2`, `RUN apt-get update && apt-get install ...` as root, and leave the `ENTRYPOINT` and `USER` alone. This is the way for system packages that are large or slow to install.
 
 The agent has no sudo, and a sudo limited to `apt-get` would still be root, because package maintainer scripts run as root and root can read the runner's credentials. System packages therefore come from the setup script or a derived image, both of which are yours and run before the agent exists.
 
@@ -420,7 +420,7 @@ The provider key and the repository token exist in the runner's environment whil
 ## Maintenance
 
 - Every pull request the runner opens carries the stamp `<!-- sre-agent-opencode:vX.Y.Z -->` in its body. SRE Agent records the version with the link, so the Integrations page can say which version of this package a repository ran.
-- The runner image is published to `ghcr.io/segfaultpw/sre-agent-opencode-runner` on every release, as one manifest covering amd64 and arm64, with `vX.Y.Z` frozen and `v1` moving. It is built on every push as well, without being pushed, so a Dockerfile is never first exercised at release time.
+- The runner image is published to `ghcr.io/segfaultpw/sre-agent-opencode-runner` on every release, as one manifest covering amd64 and arm64, with `vX.Y.Z` frozen and the current major moving (`:v2` today). It is built on every push as well, without being pushed, so a Dockerfile is never first exercised at release time.
 - For whoever publishes this package: GHCR creates a package **private** on its first push. The first release's image has to be made public by hand, in the package's settings on GitHub, before anyone can pull it.
 
 ## Security

@@ -201,7 +201,7 @@ fi
 find "$hostile" -maxdepth 1 -name 'the-plugin-ran*' -delete
 bash "$pkg/scripts/strip_repo_config.sh" "$hostile" > strip.out 2>&1
 # The strip empties the tree; the caller then writes the package's own agent
-# back into it, which is what both doors do.
+# back into it, which is what the runner does before every run.
 mkdir -p "$hostile/.opencode/agents"
 cp "$work/repo/.opencode/agents/sre-fix.md" "$hostile/.opencode/agents/sre-fix.md"
 after="$(hostile_rules)"
