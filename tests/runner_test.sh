@@ -672,6 +672,15 @@ PATH="$refuse_dir:$real_path" run_once d_refused_ci
 export STUB_OPENCODE_MODE=fix
 if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && grep -qxF '## CI configuration' "$gh_body" && ! grep -qF 'opens as a draft' "$gh_body" && grep -qF 'a person should review these files before it merges' "$gh_body" && grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   a CI change on a repository that refuses drafts opens ready with a body that does not claim to be a draft, and says a person must review the files"; else echo "FAIL refused CI draft: rc=$rc gh calls: $(cat "$gh_log") body: $(cat "$gh_body")"; fail=1; fi
 stop_fixture
+# The same fallback body prints a path as one line too: a backtick or a line break in a CI file name must not
+# become markup in the sentence that tells the reader a person has to review these files.
+start_fixture d_refused_ci_odd
+queue_one h-d-refused-ci-odd acme/app "" '{"draft": true}'
+export STUB_OPENCODE_MODE=ci_odd_names
+PATH="$refuse_dir:$real_path" run_once d_refused_ci_odd
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && grep -qxF 'This change edits CI configuration (.circleci/a'"'"'b.yml, .circleci/c d.yml). Draft pull requests are not available in this repository, so it is open for review: a person should review these files before it merges.' "$gh_body"; then echo "ok   the fallback body prints odd CI file names on one line, as the draft reason does"; else echo "FAIL refused CI odd names: rc=$rc body: $(cat "$gh_body")"; fail=1; fi
+stop_fixture
 start_fixture d_refused_ready
 queue_one h-d-refused-ready acme/app "" '{"draft": false}'
 PATH="$refuse_dir:$real_path" run_once d_refused_ready

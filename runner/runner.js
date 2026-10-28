@@ -2850,6 +2850,13 @@ function draftDecision(job, changed) {
   return { draft: true, reason: draftReason(ci), ci };
 }
 
+// A path is repository text: a backtick or a line break would turn a line of the
+// body into something else, so it is printed as one line (a backtick becomes an
+// apostrophe, a CR or LF a space), the rule SRE Agent applies to its own bodies.
+function pathOnOneLine(entry) {
+  return entry.replace(/`/g, "'").replace(/[\r\n]/g, ' ');
+}
+
 // The text is SRE Agent's own for a change that edits CI configuration
 // (`SreCore.Remediation.DraftDecision.sentence/1`: a "## Why this is a draft"
 // heading and the reason as a list item), copied byte for byte so the platform's
@@ -2858,15 +2865,14 @@ function draftDecision(job, changed) {
 // platform's one-line rule is applied (backtick to an apostrophe, a CR or LF to
 // a space).
 function draftReason(ci) {
-  const oneLine = (entry) => entry.replace(/`/g, "'").replace(/[\r\n]/g, ' ');
-  return `## Why this is a draft\n\n- This change edits CI configuration (${ci.map(oneLine).join(', ')}), so it opens as a draft for a person to review.`;
+  return `## Why this is a draft\n\n- This change edits CI configuration (${ci.map(pathOnOneLine).join(', ')}), so it opens as a draft for a person to review.`;
 }
 
 // What the body says when a repository refuses drafts and a change that edits CI
 // configuration therefore opens ready: the draft sentence would be false, and
 // the files still need a person.
 function readyAnyway(ci) {
-  return `## CI configuration\n\nThis change edits CI configuration (${ci.join(', ')}). Draft pull requests are not available in this repository, so it is open for review: a person should review these files before it merges.`;
+  return `## CI configuration\n\nThis change edits CI configuration (${ci.map(pathOnOneLine).join(', ')}). Draft pull requests are not available in this repository, so it is open for review: a person should review these files before it merges.`;
 }
 
 // The gh arguments with the body file swapped for another.
