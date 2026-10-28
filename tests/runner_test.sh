@@ -603,7 +603,7 @@ draft_case() {
   fi
   if [ "$(grep -c 'pr create' "$gh_log")" -eq 1 ]; then echo "ok   $name: exactly one pull request is opened"; else echo "FAIL $name: gh calls: $(cat "$gh_log")"; fail=1; fi
   if [ "$reason" = yes ]; then
-    if grep -qxF '## Why this is a draft' "$gh_body" && grep -qxF "This change edits CI configuration ($ci_file), so it opens as a draft for a person to review." "$gh_body"; then echo "ok   $name: the body says why it is a draft and names the CI file, in SRE Agent's words"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+    if grep -qxF '## Why this is a draft' "$gh_body" && grep -qxF -- "- This change edits CI configuration ($ci_file), so it opens as a draft for a person to review." "$gh_body"; then echo "ok   $name: the body says why it is a draft and names the CI file, in SRE Agent's words"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
   else
     if ! grep -qF 'Why this is a draft' "$gh_body"; then echo "ok   $name: the body has no reason section"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
   fi
@@ -618,6 +618,9 @@ draft_case draft_false_ci '{"draft": false}' ci draft yes
 draft_case draft_true_ci '{"draft": true}' ci draft no
 # git quotes a name with a non-ASCII character unless asked not to; the runner lists names NUL separated
 # and unquoted, so such a CI file is still CI configuration and such a protected file is still refused.
+# A backtick or a line break in a path would turn the reason line into something else; SRE Agent's rule
+# (one_line) is a backtick to an apostrophe and a CR or LF to a space, and the runner applies the same.
+draft_case draft_false_ci_odd_names '{"draft": false}' ci_odd_names draft yes ".circleci/a'b.yml, .circleci/c d.yml"
 draft_case draft_false_ci_unicode '{"draft": false}' ci_unicode draft yes ".circleci/caf$(printf '\303\251').yml"
 draft_case key_absent '{}' fix draft no
 draft_case key_absent_ci '{}' ci draft no

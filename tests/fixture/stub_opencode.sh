@@ -309,6 +309,15 @@ case "$mode" in
     printf 'version: 2.1\n' > ".circleci/caf$(printf '\303\251').yml"
     emit "Raised the connection pool ceiling in README.md and added a CI job. Ran bash test.sh and it passed."
     ;;
+  ci_odd_names)
+    # CI files whose names hold a backtick and a line break: text the pull request body must not let become markup.
+    printf 'a line the fix added\n' >> README.md
+    mkdir -p .circleci
+    printf 'version: 2.1\n' > ".circleci/a\`b.yml"
+    printf 'version: 2.1\n' > ".circleci/c
+d.yml"
+    emit "Raised the connection pool ceiling in README.md and added two CI jobs. Ran bash test.sh and it passed."
+    ;;
   protected_unicode)
     # The same under .github/, with a non-ASCII character in the name: git quotes such a name unless it is asked not to, and a
     # quoted name does not match the gate's .github/ prefix rule, so the gate must be handed the real name.

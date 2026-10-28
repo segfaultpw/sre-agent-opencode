@@ -2850,10 +2850,16 @@ function draftDecision(job, changed) {
   return { draft: true, reason: draftReason(ci), ci };
 }
 
-// The text is SRE Agent's own for a change that edits CI configuration, copied
-// byte for byte so the two runners say the same thing.
+// The text is SRE Agent's own for a change that edits CI configuration
+// (`SreCore.Remediation.DraftDecision.sentence/1`: a "## Why this is a draft"
+// heading and the reason as a list item), copied byte for byte so the platform's
+// pull requests and this runner's say the same thing. A path is repository text:
+// a backtick or a line break would turn the line into something else, so the
+// platform's one-line rule is applied (backtick to an apostrophe, a CR or LF to
+// a space).
 function draftReason(ci) {
-  return `## Why this is a draft\n\nThis change edits CI configuration (${ci.join(', ')}), so it opens as a draft for a person to review.`;
+  const oneLine = (entry) => entry.replace(/`/g, "'").replace(/[\r\n]/g, ' ');
+  return `## Why this is a draft\n\n- This change edits CI configuration (${ci.map(oneLine).join(', ')}), so it opens as a draft for a person to review.`;
 }
 
 // What the body says when a repository refuses drafts and a change that edits CI
