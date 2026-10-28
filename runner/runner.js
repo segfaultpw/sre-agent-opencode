@@ -19,7 +19,7 @@ const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
 const { spawn } = require('node:child_process');
-const { conventionalTitle } = require('./conventional_title.js');
+const { conventionalTitle, validHeader, TYPES, MIN_SUBJECT, TITLE_MAX } = require('./conventional_title.js');
 const memory = require('./memory.js');
 const bucket = require('./bucket.js');
 const githubApp = require('./github_app.js');
@@ -2522,11 +2522,13 @@ async function stageAndGate(workspace, memoryBlobs) {
 }
 
 // The pull request title and the commit message are one line, a Conventional
-// Commits header, because a repository that checks its titles refuses anything
-// else and a squash merge keeps this line. This is the derivation for a job that
-// carries no title (an older platform): the first line of the agent's
-// final message with markdown decoration taken off; the shared normaliser
-// drops tags, keeps a valid header, and otherwise types the line as a fix.
+// Commits header of at most 72 characters, because a repository that checks its
+// titles refuses anything else and a squash merge keeps this line. Four sources,
+// in this order (resolveTitle): the title the request names, the header the
+// model proposed on a `Title:` line, the platform's generated title, and this
+// last resort: the first line of the agent's final message with markdown
+// decoration taken off; the shared normaliser drops tags, keeps a valid header,
+// and otherwise types the line as a fix.
 // It is handed no card key, because neither the queue's job nor the brief
 // carries one, so no key-shaped word is taken off the title here. With nothing
 // usable the handoff id is what the title names.
@@ -2536,19 +2538,79 @@ function pullRequestTitle(message, handoffId) {
     .map((candidate) => candidate.trim())
     .find((candidate) => candidate && !candidate.startsWith('<!--'));
   const cleaned = (line || '').replace(/^#+\s*/, '').replace(/^[-*]\s+/, '');
-  return conventionalTitle(cleaned, `apply the requested fix (${handoffId})`);
+  return runnerTitle(cleaned, `apply the requested fix (${handoffId})`);
 }
 
-// The title the platform put on the job: the Conventional Commits header it
-// derives from the request's own summary. It wins over the agent's closing
-// words, which are not a title (a model that ends on "Here is the summary" put
-// that sentence in the subject of the commit). An older platform sends no key,
-// and a null or blank one is the same as none, so the agent's line stands then.
-// The title is never read from the brief: that is text the agent can also see.
-function jobTitle(job, handoffId) {
-  const raw = job && typeof job.title === 'string' ? job.title : '';
-  if (!raw.trim()) return null;
-  return conventionalTitle(raw, `apply the requested fix (${handoffId})`);
+// A string key of the job that holds text; null, a blank string and any other
+// type are no title, which is what an older platform sends too.
+function jobText(job, key) {
+  const raw = job && typeof job[key] === 'string' ? job[key] : '';
+  return raw.trim() ? raw : null;
+}
+
+const TITLE_LINE = /^Title:/;
+const FENCE_LINE = /^\s*```/;
+
+// The model's proposal: the one line of its final message that begins `Title:`.
+// It stands only when it is already a valid Conventional Commits header of at
+// most 72 characters as written; prose is never coerced into one, and two such
+// lines are a model that did not follow the rule. Every other line of the message
+// is body, never a title. The lines that begin `Title:` are metadata and leave
+// the pull request body, except those between three-backtick fences, which are
+// the agent quoting something: they are neither a proposal nor removed.
+function modelTitle(message) {
+  const proposals = [];
+  const kept = [];
+  let fenced = false;
+  for (const line of message.split('\n')) {
+    if (FENCE_LINE.test(line)) fenced = !fenced;
+    if (!fenced && TITLE_LINE.test(line)) proposals.push(line);
+    else kept.push(line);
+  }
+  return {
+    title: proposals.length === 1 ? validHeader(proposals[0].replace(TITLE_LINE, '').replace(/\r$/, '')) : null,
+    body: proposals.length === 0 ? message : kept.join('\n'),
+  };
+}
+
+const codePointCount = (text) => Array.from(text).length;
+const HEADER_PREFIX = new RegExp(`^(?:${TYPES.join('|')})(?:\\([^()]*\\))?!?: `, 'u');
+
+// conventionalTitle at the runner's 72, with the cut moved back to the last space
+// that still leaves a subject of at least the module's minimum length, so a word is
+// never cut in half. A title with no such space keeps the plain cut.
+function runnerTitle(text, fallback) {
+  const full = conventionalTitle(text, fallback);
+  if (codePointCount(full) <= TITLE_MAX) return full;
+  const cut = conventionalTitle(text, fallback, { max: TITLE_MAX });
+  if (full.startsWith(cut) && /[ \t]/.test(full[cut.length] || '')) return cut;
+  const prefix = (HEADER_PREFIX.exec(cut) || [''])[0];
+  const chars = Array.from(cut);
+  for (let index = chars.length - 1; index > codePointCount(prefix); index -= 1) {
+    if (chars[index] === ' ' && index - codePointCount(prefix) >= MIN_SUBJECT) {
+      return chars.slice(0, index).join('').replace(/[ \t]+$/u, '');
+    }
+  }
+  return cut;
+}
+
+// The title and the body for one request. The request's own title wins when the
+// platform sends one (`requested_title`, already validated there); then the
+// model's valid `Title:` line; then the platform's generated `title` (an older
+// platform sends neither key, and a null or blank one is none); then the agent's
+// first line. All four are cut at 72 characters. The title is never read from the
+// brief: that is text the agent can also see.
+function resolveTitle(job, message, handoffId) {
+  const fallback = `apply the requested fix (${handoffId})`;
+  const { title: proposed, body } = modelTitle(message);
+  const requested = jobText(job, 'requested_title');
+  const generated = jobText(job, 'title');
+  let title;
+  if (requested) title = runnerTitle(requested, fallback);
+  else if (proposed) title = proposed;
+  else if (generated) title = runnerTitle(generated, fallback);
+  else title = pullRequestTitle(body, handoffId);
+  return { title, body };
 }
 
 // The pull request body is read by gh, which runs as the runner's account, so
@@ -2584,9 +2646,8 @@ function pullRequestBody(message, brief, version) {
 
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
-async function publish(config, workspace, message, brief, result, providedTitle = null) {
+async function publish(config, workspace, message, brief, result, title) {
   const { dir, gitdir, repo, branch, defaultBranch, cleanUrl } = workspace;
-  const title = providedTitle || pullRequestTitle(message, path.basename(branch));
 
   // The identity is set on the command rather than in the repository, because
   // a service account has no git identity of its own and "empty ident name"
@@ -3196,7 +3257,7 @@ async function handleJob(config, job) {
     const memorySection = splitMemorySummary(agent.finalMessage, mem !== null);
     agent.finalMessage = memorySection.message;
     result.memorySummary = memorySection.summary;
-    result.summary = agent.finalMessage || 'The agent produced no final message.';
+    result.summary = modelTitle(agent.finalMessage).body || 'The agent produced no final message.';
 
     if (agent.code !== 0) {
       result.summary = `The agent exited ${agent.code} and nothing was published. ${result.summary}`;
@@ -3243,7 +3304,8 @@ async function handleJob(config, job) {
       return result;
     }
 
-    result.pr_url = await publish(config, workspace, agent.finalMessage, brief, result, jobTitle(job, path.basename(workspace.branch)));
+    const { title, body: prose } = resolveTitle(job, agent.finalMessage, path.basename(workspace.branch));
+    result.pr_url = await publish(config, workspace, prose, brief, result, title);
     result.actions.push(`opened ${result.pr_url}`);
     // The outcome stays not_validated and carries the pull request. The
     // agent's contract is to leave no change in place that does not build or

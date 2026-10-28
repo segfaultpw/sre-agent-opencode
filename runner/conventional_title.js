@@ -9,6 +9,10 @@
 
 const TYPES = ['feat', 'fix', 'chore', 'docs', 'refactor', 'perf', 'test', 'build', 'ci', 'style', 'revert'];
 const MAX_TITLE = 256;
+// What the runner writes as a pull request title and a commit headline: the
+// length a squash merge keeps on the default branch. The normaliser's own default
+// stays MAX_TITLE, the limit the shared fixture table is written against.
+const TITLE_MAX = 72;
 const DEFAULT_FALLBACK = 'apply the requested fix';
 
 // The least room a cut header keeps for its subject; a scope that would leave
@@ -130,4 +134,28 @@ function conventionalTitle(text, fallback = DEFAULT_FALLBACK, { max = MAX_TITLE,
   return codePoints(title) <= codePoints(prefix) + 1 ? finish(`${prefix}: ${subjectFallback}`, max) : title;
 }
 
-module.exports = { conventionalTitle, TYPES, MAX_TITLE, DEFAULT_FALLBACK };
+// The strict header, for a title the model proposed. The type is lower case and
+// on the list, the scope (when there is one) has no inner parentheses and does not
+// start with a blank, a `: ` follows, and the subject starts with a non-blank.
+// Nothing is repaired: prose, an upper case type, a tag, a card key or a missing
+// space after the colon is not a header here. The engine's `.` leaves out the
+// line separators it knows and not VT, FF or U+0085, so a break is refused on its own.
+const STRICT = new RegExp(`^(${TYPES.join('|')})(\\([^() \\t][^()]*\\))?!?: ([^ \\t].*)$`, 'u');
+
+// The header, with the blanks round it taken off, when the whole text already is
+// one Conventional Commits header of at most `max` code points; otherwise null.
+function validHeader(text, { max = TITLE_MAX } = {}) {
+  if (typeof text !== 'string' || text.includes('﻿')) return null;
+  const header = trimSet(text, BLANK_CHARS);
+  if (header === '' || BREAK.test(header) || codePoints(header) > max) return null;
+  // The normaliser folds every run of blanks to one space, so a header with a tab
+  // or a run of spaces is not one it would keep.
+  if (header.includes('\t') || / {2,}/.test(header)) return null;
+  const found = STRICT.exec(header);
+  if (!found) return null;
+  const subject = found[3];
+  if (MARKS_ONLY.test(trimSet(subject, BLANK_CHARS)) || /^[ \u00a0\u3000]*$/u.test(subject)) return null;
+  return header;
+}
+
+module.exports = { conventionalTitle, validHeader, TYPES, MAX_TITLE, TITLE_MAX, MIN_SUBJECT, DEFAULT_FALLBACK };

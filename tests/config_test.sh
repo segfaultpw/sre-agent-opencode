@@ -307,6 +307,21 @@ check '^mode: primary$' 'agent is primary'
 check '{{SRE_AGENT_OPENCODE_VERSION}}' 'agent carries the version placeholder'
 check 'Declined:' 'agent knows the decline prefix'
 check 'sre-agent:remediation' 'agent copies the platform marker'
+check "exactly one line \`Title: <type(scope): subject>\`" 'agent ends with one Title line'
+check 'Conventional Commits header of 72 characters or fewer' 'agent keeps the title at 72 characters'
+check 'feat for a new capability or new access, fix for a correction' 'agent picks the type for the change'
+check "the 72 counts the header after \`Title: \`" 'agent says what the 72 counts'
+# The list is read from the validator, so the prompt and the check cannot drift.
+validator_types="$(node -e "console.log(require('$here/../runner/conventional_title.js').TYPES.join(' '))")"
+agent_types="$(grep -o 'one of [a-z, ]* or [a-z]*, in lower case' "$agent" | head -n 1 | sed 's/^one of //; s/, in lower case$//; s/, / /g; s/ or / /')"
+if [ -z "$validator_types" ]; then echo "FAIL the validator's type list could not be read"; fail=1; fi
+for type in $validator_types; do
+  case " $agent_types " in
+    *" $type "*) echo "ok   agent names the type $type" ;;
+    *) echo "FAIL agent does not name the type $type"; fail=1 ;;
+  esac
+done
+if [ "$agent_types" = "$validator_types" ]; then echo "ok   the agent's type list is the validator's list, in order, and nothing more"; else echo "FAIL agent list '$agent_types' differs from the validator's '$validator_types'"; fail=1; fi
 check 'sre-agent-opencode:{{SRE_AGENT_OPENCODE_VERSION}}' 'agent writes the stamp line'
 # One prompt, written for the runner that executes it; the runner's own live
 # proof (tests/runner_test.sh) is what validated these steps.

@@ -444,8 +444,8 @@ if grep -qx '.opencode/' "$workspace/gitdirs/acme/app/info/exclude"; then echo "
 if branch_exists sre-agent/h-targeted; then echo "ok   the branch is pushed to the repository"; else echo "FAIL sre-agent/h-targeted was not pushed"; fail=1; fi
 if grep -q 'pr create --repo acme/app --base main --head sre-agent/h-targeted' "$gh_log" && grep -q -- '--draft' "$gh_log"; then echo "ok   a draft pull request is opened against the default branch"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the pull request body carries the marker from the brief and the version stamp"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
-expected_title="fix: Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
-if grep -qF -- "--title ${expected_title} --body-file" "$gh_log"; then echo "ok   the pull request title is a Conventional Commits header"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+expected_title="fix: Raised the connection pool ceiling in README.md so the service"
+if grep -qF -- "--title ${expected_title} --body-file" "$gh_log"; then echo "ok   the pull request title is a Conventional Commits header, cut at 72 characters on a word when the agent named none"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF -- " commit -m ${expected_title}" "$git_log"; then echo "ok   the commit message is the same header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
 if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the report's pr_url is the pull request gh opened"; else echo "FAIL report: $report"; fail=1; fi
 if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a delivered pull request is reported as not_validated, carrying the pull request"; else echo "FAIL outcome: $report"; fail=1; fi
@@ -464,7 +464,7 @@ run_once titled
 if [ "$rc" -eq 0 ]; then echo "ok   a titled job exits 0"; else echo "FAIL a titled job exited $rc: $(cat "$out")"; fail=1; fi
 if grep -qF -- "--title feat(sso)!: allow the new IdP --body-file" "$gh_log"; then echo "ok   the title is the normalised header"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF -- " commit -m feat(sso)!: allow the new IdP" "$git_log"; then echo "ok   the commit message is the normalised header"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
-if grep -qF "[numaris] Feat(sso)!:" "$gh_body"; then echo "ok   the agent's own words stay in the body untouched"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+if grep -qF "[acme] Feat(sso)!:" "$gh_body"; then echo "ok   the agent's own words stay in the body untouched"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   the marker and the stamp are still in the body byte for byte"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 stop_fixture
 
@@ -493,7 +493,7 @@ stop_fixture
 
 echo "--- 2e. a title that is not a Conventional Commits header is normalised like any other ---"
 start_fixture jobtitle_plain
-queue_one h-jobtitle-plain acme/app "" '{"title": "  [numaris] Raise the connection pool ceiling  "}'
+queue_one h-jobtitle-plain acme/app "" '{"title": "  [acme] Raise the connection pool ceiling  "}'
 export STUB_OPENCODE_MODE=closing
 run_once jobtitle_plain
 if grep -qF -- "--title fix: Raise the connection pool ceiling --body-file" "$gh_log" && grep -qF -- " commit -m fix: Raise the connection pool ceiling" "$git_log"; then echo "ok   a plain title is typed as a fix, its tag and padding taken off, for the pull request and the commit"; else echo "FAIL gh: $(cat "$gh_log") git: $(cat "$git_log")"; fail=1; fi
@@ -514,6 +514,71 @@ for shape in absent null blank number; do
   if [ "$rc" -eq 0 ] && grep -qF -- "--title fix: The change is complete, validated, and scoped. Here's the summary. --body-file" "$gh_log" && grep -qF -- " commit -m fix: The change is complete, validated, and scoped. Here's the summary." "$git_log"; then echo "ok   $shape: the title is derived from the agent's first line, as before"; else echo "FAIL $shape: rc=$rc gh: $(cat "$gh_log") git: $(cat "$git_log")"; fail=1; fi
   stop_fixture
 done
+echo "--- 2g. the title is the request's, else the model's valid Title line, else the job's, else the last resort, at most 72 characters ---"
+requested="feat(iam): add a read-only permission set for the reporting group"
+model_title="feat(pool): raise the connection pool ceiling"
+job_title="fix(job): the platform generated header"
+export STUB_OPENCODE_MODE=closing
+
+# The lines that begin `Title:` outside a three-backtick fence, which are the lines
+# the runner takes for the model's proposal and removes.
+unfenced_title_lines() { awk '/^[[:space:]]*```/ { fenced = !fenced; next } !fenced && /^Title:/ { print }'; }
+
+# title_case NAME JOB_EXTRA TAIL EXPECTED_TITLE [KEPT_LINE]: one run with the given job keys and the
+# lines the agent ended on, then the same header must be the pull request title and the commit subject.
+title_case() {
+  local name="$1" extra="$2" tail_text="$3" expected="$4" kept_line="${5:-}"
+  start_fixture "t_$name"
+  queue_one "h-t-$name" acme/app "" "$extra"
+  if [ -n "$tail_text" ]; then export STUB_OPENCODE_TAIL="$tail_text"; else unset STUB_OPENCODE_TAIL; fi
+  run_once "t_$name"
+  unset STUB_OPENCODE_TAIL
+  local pr_title commit_subject
+  pr_title="$(sed -n 's/.*--title \(.*\) --body-file.*/\1/p' "$gh_log" | head -n 1)"
+  commit_subject="$(sed -n 's/.* commit -m \(.*\)$/\1/p' "$git_log" | head -n 1)"
+  if [ "$rc" -eq 0 ] && [ "$pr_title" = "$expected" ] && [ "$commit_subject" = "$expected" ]; then
+    echo "ok   $name: the pull request title and the commit subject are one header, '$expected'"
+  else
+    echo "FAIL $name: rc=$rc expected '$expected' pr '$pr_title' commit '$commit_subject'"; fail=1
+  fi
+  if [ "$(unfenced_title_lines < "$gh_body" | grep -c '')" -eq 0 ]; then echo "ok   $name: no Title line in the pull request body"; else echo "FAIL $name: the body holds a Title line: $(cat "$gh_body")"; fail=1; fi
+  if [ "$(jq -r '.summary' <<<"$report" | unfenced_title_lines | grep -c '')" -eq 0 ]; then echo "ok   $name: no Title line in the report's summary"; else echo "FAIL $name: the summary holds a Title line: $report"; fail=1; fi
+  if grep -qF "Here's the summary." "$gh_body" && grep -qF "$marker" "$gh_body"; then echo "ok   $name: the closing words and the marker stay in the pull request body"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+  if [ -n "$kept_line" ]; then
+    if grep -qxF -- "$kept_line" "$gh_body" && jq -r '.summary' <<<"$report" | grep -qxF -- "$kept_line"; then echo "ok   $name: the fenced line reaches the pull request body and the summary unchanged"; else echo "FAIL $name: body: $(cat "$gh_body") report: $report"; fail=1; fi
+  fi
+  if [ "${#pr_title}" -le 72 ] && [ "${#commit_subject}" -le 72 ]; then echo "ok   $name: the produced title and subject are at most 72 characters"; else echo "FAIL $name: ${#pr_title} and ${#commit_subject} characters"; fail=1; fi
+  stop_fixture
+}
+
+title_case requested_beats_model "$(jq -cn --arg r "$requested" --arg t "$job_title" '{requested_title: $r, title: $t}')" "Title: ${model_title}" "$requested"
+title_case model_beats_job "$(jq -cn --arg t "$job_title" '{requested_title: null, title: $t}')" "Title: ${model_title}" "$model_title"
+title_case model_beats_older_platform '{}' "Title: ${model_title}" "$model_title"
+title_case requested_blank_falls_to_model '{"requested_title": "   "}' "Title: ${model_title}" "$model_title"
+title_case requested_cut_at_72 "$(jq -cn '{requested_title: ("feat(sso): " + ("a" * 90))}')" "" "feat(sso): $(printf 'a%.0s' $(seq 1 61))"
+long_job_title="$(printf '%s' "fix: Give the reporting group read-only access to the analytics bucket in the shared account, the same access the finance group already has for the billing exports, so the weekly reports can be read without asking the platform team each time and without widening anything else." | cut -c1-256)"
+cut_on_a_word="fix: Give the reporting group read-only access to the analytics bucket"
+title_case old_platform_long_title "$(jq -cn --arg t "$long_job_title" '{title: $t}')" "" "$cut_on_a_word"
+title_case model_beats_long_title "$(jq -cn --arg t "$long_job_title" '{title: $t}')" "Title: ${model_title}" "$model_title"
+title_case requested_nonstring "$(jq -cn --arg t "$job_title" '{requested_title: 7, title: $t}')" "Title: ${model_title}" "$model_title"
+title_case requested_cut_on_a_word "$(jq -cn --arg r "$long_job_title" '{requested_title: $r}')" "" "$cut_on_a_word"
+fenced_tail=$'Quoted from the log:\n```\nTitle: a line inside a fence\n```\nTitle: '"${model_title}"
+title_case fenced_title_line_ignored '{}' "$fenced_tail" "$model_title" 'Title: a line inside a fence'
+long_model="feat(pool): $(printf 'b%.0s' $(seq 1 70))"
+unknown_type="wip(pool): raise the ceiling"
+for shape in prose long unknown upper two nospace; do
+  case "$shape" in
+    prose) line="Title: Raise the connection pool ceiling" ;;
+    long) line="Title: ${long_model}" ;;
+    unknown) line="Title: ${unknown_type}" ;;
+    upper) line="Title: Feat(pool): raise the ceiling" ;;
+    two) line=$'Title: feat(pool): raise the ceiling\nTitle: fix(pool): raise it more' ;;
+    nospace) line="Title: feat(pool):raise the ceiling" ;;
+  esac
+  title_case "invalid_$shape" "$(jq -cn --arg t "$job_title" '{title: $t}')" "$line" "$job_title"
+done
+title_case invalid_without_job_title '{}' "Title: Raise the connection pool ceiling" "fix: The change is complete, validated, and scoped. Here's the summary."
+title_case no_line_no_keys '{}' "" "fix: The change is complete, validated, and scoped. Here's the summary."
 export STUB_OPENCODE_MODE=fix
 
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"

@@ -296,7 +296,7 @@ case "$mode" in
     # What a model writes when it ignores the brief's title rule: a tag and
     # a header with an upper case type, then the explanation.
     printf 'a line the fix added\n' >> README.md
-    emit "$(printf '[numaris] Feat(sso)!: allow the new IdP\n\nAdded the IdP to the allow list and ran bash test.sh.')"
+    emit "$(printf '[acme] Feat(sso)!: allow the new IdP\n\nAdded the IdP to the allow list and ran bash test.sh.')"
     ;;
   closing)
     # What a model writes when it opens with a closing remark: the sentence a

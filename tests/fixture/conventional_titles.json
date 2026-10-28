@@ -1,8 +1,8 @@
 [
  {
   "name": "a valid header is kept",
-  "input": "feat(sso): add AbrahamIbarra to Analysts-BI",
-  "expected": "feat(sso): add AbrahamIbarra to Analysts-BI"
+  "input": "feat(sso): add AbrahamRivera to Analysts-BI",
+  "expected": "feat(sso): add AbrahamRivera to Analysts-BI"
  },
  {
   "name": "every listed type is kept",
@@ -47,12 +47,12 @@
  },
  {
   "name": "leading bracketed tags are dropped",
-  "input": "[numaris] fix(sso): add a",
+  "input": "[acme] fix(sso): add a",
   "expected": "fix(sso): add a"
  },
  {
   "name": "several tags are dropped before a plain subject",
-  "input": "[numaris] [OPS-4] widen the timeout",
+  "input": "[acme] [OPS-4] widen the timeout",
   "expected": "fix: widen the timeout"
  },
  {
@@ -128,7 +128,7 @@
  },
  {
   "name": "only a tag takes the fallback",
-  "input": "[numaris] [OPS-1]  ",
+  "input": "[acme] [OPS-1]  ",
   "expected": "fix: apply the requested fix"
  },
  {
@@ -154,8 +154,8 @@
  },
  {
   "name": "non-ASCII subjects are kept",
-  "input": "[numaris] fix(sso): añadir a Ibarra 日本語",
-  "expected": "fix(sso): añadir a Ibarra 日本語"
+  "input": "[acme] fix(sso): añadir a Rivera 日本語",
+  "expected": "fix(sso): añadir a Rivera 日本語"
  },
  {
   "name": "a 300 character summary is cut to 256 characters",

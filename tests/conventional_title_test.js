@@ -5,7 +5,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { conventionalTitle, DEFAULT_FALLBACK, MAX_TITLE } = require('../runner/conventional_title.js');
+const { conventionalTitle, validHeader, DEFAULT_FALLBACK, MAX_TITLE, TITLE_MAX } = require('../runner/conventional_title.js');
 
 const cases = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixture', 'conventional_titles.json'), 'utf8'));
 let failed = 0;
@@ -121,6 +121,85 @@ check('[js] long whitespace runs at the edges and inside the line are handled in
   assert.equal(conventionalTitle(`fix: a${run}b`), 'fix: a b');
   assert.equal(conventionalTitle(`\t${run}\n${run}fix: x\n${run}`), 'fix: x');
   assert.ok(Date.now() - started < 2000, 'took too long');
+});
+
+check('[js] the runner caps a title at 72 characters while the shared normaliser keeps its 256 default', () => {
+  assert.equal(TITLE_MAX, 72);
+  assert.equal(MAX_TITLE, 256);
+  const title = conventionalTitle(`feat(sso): ${'a'.repeat(200)}`, undefined, { max: TITLE_MAX });
+  assert.equal(codePoints(title), 72);
+  assert.ok(title.startsWith('feat(sso): a'));
+});
+
+check('[js] validHeader keeps a header that is already valid, byte for byte', () => {
+  for (const header of [
+    'feat(iam): add a read-only permission set for the reporting group',
+    'fix: raise the pool ceiling',
+    'chore(deps)!: drop node 18',
+    'revert(api): undo the rename',
+    'feat(a b): scope with an inner space',
+    `fix: ${'a'.repeat(67)}`,
+  ]) {
+    assert.equal(validHeader(header), header);
+  }
+});
+
+check('[js] validHeader surrounds nothing: edge blanks are taken off, nothing else is repaired', () => {
+  assert.equal(validHeader('  fix: raise the ceiling \t'), 'fix: raise the ceiling');
+});
+
+check('[js] validHeader refuses what would need repair', () => {
+  const refused = [
+    'Raise the pool ceiling',
+    'Feat(sso): add it',
+    'FIX: add it',
+    'wip(pool): raise it',
+    'feat(): add it',
+    'feat( sso): add it',
+    'feat(sso)(more): add it',
+    'feat(sso):add it',
+    'feat(sso):  add it',
+    'feat(sso) : add it',
+    'feat(sso): ',
+    'feat(sso):',
+    'feat!(sso): add it',
+    '[acme] feat(sso): add it',
+    'NUM-12: feat(sso): add it',
+    'fix: a\nsecond line',
+    'fix: a\rsecond',
+    'fix: a\u0085b',
+    'fix: a b',
+    'fix: a\u000bb',
+    '﻿fix: add it',
+    'fix: ́́',
+    `fix: ${'a'.repeat(68)}`,
+    'fix: a  b',
+    'fix: a\tb',
+    'feat(a\tb): x',
+    'feat(a  b): x',
+    'fix: \u00a0',
+    'fix: \u3000',
+    'fix: \u00a0\u3000',
+    '',
+    '   ',
+  ];
+  for (const text of refused) assert.equal(validHeader(text), null, JSON.stringify(text));
+  for (const value of [null, undefined, 42, {}, ['fix: x']]) assert.equal(validHeader(value), null);
+});
+
+check('[js] validHeader counts code points against its limit, and the limit is an option', () => {
+  const header = `fix: ${'😀'.repeat(67)}`;
+  assert.equal(codePoints(header), 72);
+  assert.equal(validHeader(header), header);
+  assert.equal(validHeader(`${header}😀`), null);
+  assert.equal(validHeader(`fix: ${'a'.repeat(100)}`, { max: 120 }), `fix: ${'a'.repeat(100)}`);
+});
+
+check('[js] whatever validHeader accepts is a fixed point of the normaliser at the same limit', () => {
+  for (const text of generated(3000, 777, 40)) {
+    const kept = validHeader(text);
+    if (kept !== null) assert.equal(conventionalTitle(kept, undefined, { max: TITLE_MAX }), kept, JSON.stringify(text));
+  }
 });
 
 if (failed > 0) {

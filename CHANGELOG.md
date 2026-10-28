@@ -2,6 +2,23 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.1.0
+
+The pull request title is the request's own, or the model's, a Conventional Commits header of at most 72 characters.
+
+What an operator gets. The title and the commit headline were the first sentence of the request's description cut at 256 characters (for example `fix: Give the reporting group read-only access to the analytics bucket in the shared account, the same access the finance group already has ...`), although the request named its own title. A squash merge keeps that line on the default branch. The runner now chooses one line, the same for the commit and the pull request, from the first of these that exists:
+
+1. The job's new `requested_title` key, the title the request names, already validated by the platform.
+2. The agent's own proposal. The agent now ends its final message with exactly one `Title: <type(scope): subject>` line, with the type that fits the change (`feat` for new access or capability, `fix` for a correction). The runner uses it only when, as written, it is already a valid Conventional Commits header of 72 characters or fewer: a known type in lower case, an optional scope and `!`, a colon, one space and a subject. It never turns prose into a header, ignores a message with two `Title:` lines, and takes no other line of the message as a title.
+3. The job's `title` key, the header the platform generates (at most 72 characters).
+4. The first line of the agent's message, typed as a fix (a header it already wrote is kept as it is), as before.
+
+A title from sources 1, 3 or 4 that is longer than 72 characters is cut at the last space that leaves a subject of at least ten characters, so a word is not cut in half; a title with no such space is cut at 72. A proposal from source 2 that is longer than 72 characters is refused, not cut, and the next source applies. The agent is told the exact list of types it may use (`feat`, `fix`, `chore`, `docs`, `refactor`, `perf`, `test`, `build`, `ci`, `style`, `revert`) and that the 72 counts the header after `Title: `. A proposal is also refused when it holds a tab, two blanks in a row, or a subject made only of spaces.
+
+Lines that begin `Title:` are left out of the pull request body and of the report's summary; the rest of the message is the body as before. A `Title:` line between three-backtick fences is the agent quoting something: it is not a proposal and it stays in the body. An older platform sends neither `requested_title` nor a short `title`, and a runner on this release handles every combination (a `null`, blank or non-string value is none). The shared test table keeps its 256 default and the runner passes 72; its fixture names changed only in a tag and a surname.
+
+What a customer must change on upgrade: nothing. The wire contract only grows (one optional job key), and a runner older than this release ignores it.
+
 ## v2.0.0
 
 The GitHub Actions door is gone; the runner on your own machine is the one external door.
