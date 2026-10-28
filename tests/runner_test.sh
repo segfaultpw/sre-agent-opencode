@@ -2249,14 +2249,16 @@ echo "--- 73. a beat that renewed nothing is sent again after a fifth of the int
 export FIXTURE_HEARTBEAT_SECONDS=5 FIXTURE_HEARTBEAT_ANSWERS=route404,503,route404,continue
 start_fixture rebeat
 queue_one h-rebeat acme/app
-export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=12
+# Long enough for a beat to follow the renewal: misses at 5, 6 and 7 s, the
+# renewal at 8 s, the next beat at 13 s.
+export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=16
 run_once rebeat
 unset STUB_OPENCODE_SLEEP FIXTURE_HEARTBEAT_ANSWERS
 export STUB_OPENCODE_MODE=fix FIXTURE_HEARTBEAT_SECONDS=1
 beat_times="$(jq -r 'select(.path | endswith("/heartbeat")) | "\(.at) \(.answer)"' "$fixture_log")"
 # The gaps after each of the three misses, and the one after the renewal.
 gaps="$(awk 'NR > 1 { printf "%d:%s ", $1 - prev, prev_answer } { prev = $1; prev_answer = $2 }' <<<"$beat_times")"
-miss_gaps_ok="$(awk '{ ok = 1; n = 0; for (i = 1; i <= NF; i++) { split($i, g, ":"); if (g[2] != "continue") { n++; if (g[1] < 700 || g[1] > 2500) ok = 0 } else if (g[1] < 4500) ok = 0 } print (ok && n == 3) ? "yes" : "no" }' <<<"$gaps")"
+miss_gaps_ok="$(awk '{ ok = 1; n = 0; for (i = 1; i <= NF; i++) { split($i, g, ":"); if (g[2] != "continue") { n++; if (g[1] < 700 || g[1] > 2500) ok = 0 } else if (g[1] < 4500) ok = 0 } print (ok && n == 3 && NF >= 4) ? "yes" : "no" }' <<<"$gaps")"
 if [ "$miss_gaps_ok" = "yes" ]; then echo "ok   at a five second interval the beat after each of three misses comes about a second later, and the one after the renewal five seconds later (gap:previous answer, ms: $gaps)"; else echo "FAIL gaps: $gaps"; fail=1; fi
 if grep -q 'every 5 s while this runner holds it (every 1 s after a beat that renewed nothing)' "$out" && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the misses ended nothing: the run kept its job and reported its pull request"; else echo "FAIL out: $(grep beating "$out") report: $report"; fail=1; fi
 stop_fixture
