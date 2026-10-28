@@ -70,7 +70,8 @@ if [ "$rc" -eq 1 ] && [ "$got" = ".sre-agent-memory/NOTES.md" ]; then echo "ok  
 # special character ("\"...\\303\\251...\""), which begins with a quote and so matches no prefix rule: a workflow file with
 # such a name passed the gate. The runner lists staged names with core.quotePath=false and -z; this proves, in a
 # scratch repository, that the real name reaches the gate and is refused, and that the default listing is the one
-# that would have slipped through (so the runner must not go back to it).
+# that would have slipped through (so the runner must not go back to it). The default is pinned with
+# core.quotePath=true because a machine may set it false globally, and the assertion must hold on any machine.
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT
 git -C "$scratch" init -q .
@@ -79,7 +80,7 @@ printf 'on: push\n' > "$scratch/.github/workflows/caf$(printf '\303\251').yml"
 printf 'x\n' > "$scratch/src/app.ex"
 git -C "$scratch" add -A
 rc=0
-got="$(git -C "$scratch" diff --cached --name-only | bash "$script")" || rc=$?
+got="$(git -C "$scratch" -c core.quotePath=true diff --cached --name-only | bash "$script")" || rc=$?
 if [ "$rc" -eq 0 ]; then echo "ok   the default listing quotes the name and the gate's .github/ rule does not see it (the hole the runner's listing closes)"; else echo "FAIL the default listing no longer hides the name: exit $rc, '$got'"; fail=1; fi
 rc=0
 got="$(git -C "$scratch" -c core.quotePath=false diff --cached --name-only -z --no-renames | tr '\0' '\n' | bash "$script")" || rc=$?
