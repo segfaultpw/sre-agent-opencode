@@ -30,6 +30,7 @@ const yes = [
   '.drone.yml',
   '.cirrus.star',
   'codemagic.yaml',
+  '".circleci/\\303\\251.yml"',
 ];
 
 const no = [

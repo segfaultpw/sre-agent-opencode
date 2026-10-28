@@ -2674,9 +2674,12 @@ async function stageAndGate(workspace, memoryBlobs) {
   if (embedded.length > 0) return { changed: embedded, flagged: embedded, memoryCopies: [], embedded };
 
   await gitIn(workspace, ['add', '-A']);
-  const staged = (await gitIn(workspace, ['diff', '--cached', '--name-only']))
-    .split('\n')
-    .map((line) => line.trim())
+  // NUL separated and unquoted: git's default quoting wraps a name that holds a
+  // non-ASCII or special character in double quotes with octal escapes, and a
+  // quoted name matches neither the protected paths gate nor the CI paths rule.
+  // --no-renames lists both ends of a rename, so neither can hide behind the other.
+  const staged = (await gitIn(workspace, ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only', '-z', '--no-renames']))
+    .split('\0')
     .filter(Boolean);
 
   if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [] };
@@ -2842,23 +2845,27 @@ function writePullRequestBody(text) {
 function draftDecision(job, changed) {
   const wantsReady = Boolean(job) && job.draft === false;
   const ci = ciPaths(changed);
-  if (wantsReady && ci.length === 0) return { draft: false, reason: null };
-  if (!wantsReady) return { draft: true, reason: null };
-  return { draft: true, reason: draftReason(ci) };
+  if (wantsReady && ci.length === 0) return { draft: false, reason: null, ci };
+  if (!wantsReady) return { draft: true, reason: null, ci };
+  return { draft: true, reason: draftReason(ci), ci };
 }
 
-const DRAFT_REASON_PATHS = 10;
-
-// Provisional wording: the platform's own sentence for this case is settled in
-// SRE Agent and copied here byte for byte when it lands.
+// The text is SRE Agent's own for a change that edits CI configuration, copied
+// byte for byte so the two runners say the same thing.
 function draftReason(ci) {
-  const shown = ci.slice(0, DRAFT_REASON_PATHS).map((entry) => `\`${entry}\``).join(', ');
-  const more = ci.length > DRAFT_REASON_PATHS ? ` and ${ci.length - DRAFT_REASON_PATHS} more` : '';
-  return (
-    '## Why this is a draft\n\n' +
-    `This pull request changes CI configuration (${shown}${more}), so it opens as a draft ` +
-    'whatever the repository setting for draft pull requests says.'
-  );
+  return `## Why this is a draft\n\nThis change edits CI configuration (${ci.join(', ')}), so it opens as a draft for a person to review.`;
+}
+
+// What the body says when a repository refuses drafts and a change that edits CI
+// configuration therefore opens ready: the draft sentence would be false, and
+// the files still need a person.
+function readyAnyway(ci) {
+  return `## CI configuration\n\nThis change edits CI configuration (${ci.join(', ')}). Draft pull requests are not available in this repository, so it is open for review: a person should review these files before it merges.`;
+}
+
+// The gh arguments with the body file swapped for another.
+function replaceBodyFile(args, file) {
+  return args.map((arg, index) => (args[index - 1] === '--body-file' ? file : arg));
 }
 
 function pullRequestBody(message, brief, version, reason) {
@@ -2930,7 +2937,19 @@ async function publish(config, workspace, message, brief, result, title, draft) 
         // already pushed by this point, so refusing to open the pull request at
         // all would leave the work stranded where nobody looks for it.
         log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
-        created = await runProcess('gh', base, { cwd: dir, env: ghEnv });
+        // A body that says "opens as a draft" would now be false. A change that edits CI configuration
+        // gets the sentence that says it is open and still needs a person; the branch is pushed, so
+        // not opening the pull request at all would strand the work where nobody looks for it.
+        let readyBody = null;
+        if (draft.ci.length > 0) {
+          readyBody = writePullRequestBody(pullRequestBody(message, brief, config.version, readyAnyway(draft.ci)));
+          log('warn', 'the change edits CI configuration, so the pull request body says it is open for review');
+        }
+        try {
+          created = await runProcess('gh', readyBody ? replaceBodyFile(base, readyBody.file) : base, { cwd: dir, env: ghEnv });
+        } finally {
+          if (readyBody) fs.rmSync(readyBody.dir, { recursive: true, force: true });
+        }
       }
     } else {
       created = await runProcess('gh', base, { cwd: dir, env: ghEnv });

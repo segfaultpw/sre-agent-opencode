@@ -12,9 +12,10 @@ The pull request was always a draft, whatever the draft setting of your GitHub i
 - `draft: true` opens a draft.
 - A job with no `draft` key, or with any value other than the boolean `false`, opens a draft, exactly as v2.2.0 did, so an older SRE Agent task serving a poll during a deploy gives the same result.
 - A change that touches CI configuration (the rule SRE Agent applies to its own pull requests, in `runner/ci_config.js`) opens as a draft whatever the key says, and its body gets a "Why this is a draft" section naming the files.
-- A repository that refuses draft pull requests still gets a normal one after one refused attempt, as before. A job that asked for ready never attempts a draft.
+- A repository that refuses draft pull requests still gets a normal one after one refused attempt, as before; for a change that edits CI configuration its body then says it is open for review and that a person should review those files, not that it is a draft. A job that asked for ready never attempts a draft.
+- The changed files are listed NUL separated and unquoted. A file whose name holds a non-ASCII or special character used to be reported in git's quoted form, which the gate's `.github/` and `.sre-agent-memory/` prefix rules did not match (a workflow file with such a name under `.github/` passed the protected paths gate); it is now judged by its real name, and so is the CI rule.
 
-The brief gains a "Pull request" row for the agent. The runner never reads it: the job's key is the one source.
+SRE Agent's brief names the setting in a "Pull request" row for the agent. The runner never reads it: the job's key is the one source.
 
 The installer's list of files a complete clone must hold now names `runner/ci_config.js` and `runner/github_app.js`.
 

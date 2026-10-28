@@ -586,7 +586,7 @@ echo "--- 2h. the job's draft key decides whether the pull request opens as a dr
 # request is opened as a draft (gh is given --draft) or not, and the body carries the "Why this is a draft"
 # section only when REASON is yes. A repository that refuses drafts is a separate case below.
 draft_case() {
-  local name="$1" extra="$2" mode="$3" expected="$4" reason="$5"
+  local name="$1" extra="$2" mode="$3" expected="$4" reason="$5" ci_file="${6:-.circleci/config.yml}"
   start_fixture "d_$name"
   queue_one "h-d-$name" acme/app "" "$extra"
   export STUB_OPENCODE_MODE="$mode"
@@ -603,7 +603,7 @@ draft_case() {
   fi
   if [ "$(grep -c 'pr create' "$gh_log")" -eq 1 ]; then echo "ok   $name: exactly one pull request is opened"; else echo "FAIL $name: gh calls: $(cat "$gh_log")"; fail=1; fi
   if [ "$reason" = yes ]; then
-    if grep -qF '## Why this is a draft' "$gh_body" && grep -qF '`.circleci/config.yml`' "$gh_body"; then echo "ok   $name: the body says why it is a draft and names the CI file"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+    if grep -qxF '## Why this is a draft' "$gh_body" && grep -qxF "This change edits CI configuration ($ci_file), so it opens as a draft for a person to review." "$gh_body"; then echo "ok   $name: the body says why it is a draft and names the CI file, in SRE Agent's words"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
   else
     if ! grep -qF 'Why this is a draft' "$gh_body"; then echo "ok   $name: the body has no reason section"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
   fi
@@ -616,6 +616,9 @@ draft_case draft_true '{"draft": true}' fix draft no
 draft_case draft_false '{"draft": false}' fix ready no
 draft_case draft_false_ci '{"draft": false}' ci draft yes
 draft_case draft_true_ci '{"draft": true}' ci draft no
+# git quotes a name with a non-ASCII character unless asked not to; the runner lists names NUL separated
+# and unquoted, so such a CI file is still CI configuration and such a protected file is still refused.
+draft_case draft_false_ci_unicode '{"draft": false}' ci_unicode draft yes ".circleci/caf$(printf '\303\251').yml"
 draft_case key_absent '{}' fix draft no
 draft_case key_absent_ci '{}' ci draft no
 draft_case draft_null '{"draft": null}' fix draft no
@@ -658,6 +661,20 @@ start_fixture d_refused
 queue_one h-d-refused acme/app "" '{"draft": true}'
 PATH="$refuse_dir:$real_path" run_once d_refused
 if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && [ "$(grep -c -- ' --draft' "$gh_log")" -eq 1 ]; then echo "ok   a repository that refuses drafts gets the ready pull request after one draft attempt"; else echo "FAIL refused drafts: rc=$rc gh calls: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+start_fixture d_refused_ci
+queue_one h-d-refused-ci acme/app "" '{"draft": false}'
+export STUB_OPENCODE_MODE=ci
+PATH="$refuse_dir:$real_path" run_once d_refused_ci
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && grep -qxF '## CI configuration' "$gh_body" && ! grep -qF 'opens as a draft' "$gh_body" && grep -qF 'a person should review these files before it merges' "$gh_body" && grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   a CI change on a repository that refuses drafts opens ready with a body that does not claim to be a draft, and says a person must review the files"; else echo "FAIL refused CI draft: rc=$rc gh calls: $(cat "$gh_log") body: $(cat "$gh_body")"; fail=1; fi
+stop_fixture
+start_fixture d_protected_unicode
+queue_one h-d-protected-unicode acme/app "" '{"draft": false}'
+export STUB_OPENCODE_MODE=protected_unicode
+run_once d_protected_unicode
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ ! -s "$gh_log" ] && ! grep -q ' push ' "$git_log" && jq -e '.summary | test("protected paths gate refuses")' <<<"$report" >/dev/null; then echo "ok   a protected file with a non-ASCII name is refused by the gate: nothing is pushed and no pull request is opened"; else echo "FAIL protected unicode: rc=$rc gh: $(cat "$gh_log") git: $(cat "$git_log") report: $report"; fail=1; fi
 stop_fixture
 start_fixture d_refused_ready
 queue_one h-d-refused-ready acme/app "" '{"draft": false}'

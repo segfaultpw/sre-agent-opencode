@@ -68,6 +68,11 @@ function ciName(name) {
 
 function isCiConfig(filePath) {
   if (typeof filePath !== 'string') return false;
+  // git quotes a name with a special character in double quotes (octal escapes),
+  // which hides its components from this rule. The caller lists names unquoted
+  // (-z); a name that still begins with a quote is judged CI configuration, so
+  // a parsing difference can only make a pull request a draft, never a ready one.
+  if (filePath.startsWith('"')) return true;
   return filePath
     .replace(/^(\.\/)+/, '')
     .split('/')

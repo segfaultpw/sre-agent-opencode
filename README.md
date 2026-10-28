@@ -241,13 +241,14 @@ The runner removes surrounding whitespace, a trailing newline included, from `SR
 
 ### Draft or ready for review
 
-From v2.3.0 the runner follows the setting SRE Agent holds for your GitHub integration (draft pull requests on or off). The queue's job carries it as a boolean `draft`, and the brief names it in a "Pull request" row for the agent.
+From v2.3.0 the runner follows the setting SRE Agent holds for your GitHub integration (draft pull requests on or off). The queue's job carries it as a boolean `draft`, and SRE Agent's brief names it in a "Pull request" row for the agent.
 
 - `draft: false` opens the pull request ready for review. This is what lets a pipeline that does not run on drafts (a plan or auto-approve step, for example) run on the runner's pull request.
 - `draft: true` opens a draft.
 - A job with no `draft` key (a platform older than this setting) opens a draft, as every release before v2.3.0 did, so the answer is the same whichever SRE Agent task served the poll. Any value other than the boolean `false` is a draft.
 - A change that touches CI configuration opens as a draft whatever the key says, and its body gets a "Why this is a draft" section naming the files. The paths are the ones SRE Agent applies to its own pull requests ([`runner/ci_config.js`](runner/ci_config.js)): any component at any depth that is a CI directory (`.circleci`, `.buildkite`, `.gitlab`, `.woodpecker`, `.gitea`, `.forgejo`, `.semaphore`, `.tekton`, `.azure-pipelines`), a CI file (`.gitlab-ci.yml`, `.travis.yml`, `azure-pipelines.yml`, `bitbucket-pipelines.yml`, `cloudbuild.yaml`, `buildspec.yml`, and the others in that file), `Jenkinsfile`, or `CODEOWNERS`. Files under `.github/` never get this far: the protected paths gate refuses them.
-- A repository that refuses draft pull requests gets a normal one after a refused attempt, for a job that asked for a draft; a job that asked for ready never attempts a draft.
+- A repository that refuses draft pull requests gets a normal one after a refused attempt, for a job that asked for a draft; a job that asked for ready never attempts a draft. When that happens to a change that edits CI configuration, the body says the pull request is open for review and that a person should review the files before it merges, instead of claiming to be a draft.
+- The runner lists the changed files NUL separated and unquoted, so a CI file or a protected file whose name holds a non-ASCII or special character is judged by its real name (git otherwise wraps such a name in quotes, which hid it from both the protected paths gate and the CI rule).
 
 The runner reads the job key only; the brief's row is text for the agent and is never parsed.
 8. It reports the answer. **The outcome is always `not_validated`, a pull request notwithstanding**, and the summary says the change is an unmerged pull request that nothing has verified in a running system. The runner cannot deploy, so it cannot validate; `validated_fixed` belongs to a door that checked a fix where it runs. SRE Agent posts the answer as a comment on the card and links the pull request to it.

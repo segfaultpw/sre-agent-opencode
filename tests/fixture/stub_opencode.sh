@@ -302,6 +302,19 @@ case "$mode" in
     printf 'version: 2.1\n' > .circleci/config.yml
     emit "Raised the connection pool ceiling in README.md and pinned the CI image. Ran bash test.sh and it passed."
     ;;
+  ci_unicode)
+    # A CI file whose name holds a non-ASCII character: git quotes such a name unless it is asked not to.
+    printf 'a line the fix added\n' >> README.md
+    mkdir -p .circleci
+    printf 'version: 2.1\n' > ".circleci/caf$(printf '\303\251').yml"
+    emit "Raised the connection pool ceiling in README.md and added a CI job. Ran bash test.sh and it passed."
+    ;;
+  protected_unicode)
+    # The same under .github/, which the protected paths gate must refuse whatever the name holds.
+    mkdir -p .github/workflows
+    printf 'on: push\n' > ".github/workflows/caf$(printf '\303\251').yml"
+    emit "Added a workflow that publishes the build."
+    ;;
   slowfix)
     # The same fix after a while, long enough for the runner to beat in between.
     sleep "${STUB_OPENCODE_SLEEP:-3}"
