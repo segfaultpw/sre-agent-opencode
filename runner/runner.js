@@ -20,6 +20,7 @@ const http = require('node:http');
 const https = require('node:https');
 const { spawn } = require('node:child_process');
 const { conventionalTitle, validHeader, TYPES, MIN_SUBJECT, TITLE_MAX } = require('./conventional_title.js');
+const { ciPaths } = require('./ci_config.js');
 const memory = require('./memory.js');
 const bucket = require('./bucket.js');
 const githubApp = require('./github_app.js');
@@ -2829,18 +2830,50 @@ function writePullRequestBody(text) {
   }
 }
 
-function pullRequestBody(message, brief, version) {
+// Whether the pull request opens as a draft, and why when the job asked for a
+// ready one. The platform's job carries `draft`: only the boolean `false` means
+// ready for review. `true`, a missing key (an older platform) and any other
+// value mean a draft, which is what this runner did before the key existed, so
+// the answer is the same whichever platform task served the poll. A change to CI
+// configuration is a draft whatever the key says, the rule the platform applies
+// to its own pull requests (`runner/ci_config.js`); `reason` is then the
+// section the pull request body carries. The brief's own "Pull request" row is
+// text for the agent and is never read here: the job key is the one source.
+function draftDecision(job, changed) {
+  const wantsReady = Boolean(job) && job.draft === false;
+  const ci = ciPaths(changed);
+  if (wantsReady && ci.length === 0) return { draft: false, reason: null };
+  if (!wantsReady) return { draft: true, reason: null };
+  return { draft: true, reason: draftReason(ci) };
+}
+
+const DRAFT_REASON_PATHS = 10;
+
+// Provisional wording: the platform's own sentence for this case is settled in
+// SRE Agent and copied here byte for byte when it lands.
+function draftReason(ci) {
+  const shown = ci.slice(0, DRAFT_REASON_PATHS).map((entry) => `\`${entry}\``).join(', ');
+  const more = ci.length > DRAFT_REASON_PATHS ? ` and ${ci.length - DRAFT_REASON_PATHS} more` : '';
+  return (
+    '## Why this is a draft\n\n' +
+    `This pull request changes CI configuration (${shown}${more}), so it opens as a draft ` +
+    'whatever the repository setting for draft pull requests says.'
+  );
+}
+
+function pullRequestBody(message, brief, version, reason) {
   const marker = (MARKER_PATTERN.exec(brief) || [])[0] || '';
   const stamp = `<!-- sre-agent-opencode:v${version} -->`;
   let tail = '';
   if (marker && !message.includes(marker)) tail += `${marker}\n`;
   if (!message.includes(stamp)) tail += `${stamp}\n`;
-  return tail ? `${message}\n\n${tail}` : `${message}\n`;
+  const text = reason ? `${message}\n\n${reason}` : message;
+  return tail ? `${text}\n\n${tail}` : `${text}\n`;
 }
 
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
-async function publish(config, workspace, message, brief, result, title) {
+async function publish(config, workspace, message, brief, result, title, draft) {
   const { dir, gitdir, repo, branch, defaultBranch, cleanUrl } = workspace;
 
   // The identity is set on the command rather than in the repository, because
@@ -2863,7 +2896,7 @@ async function publish(config, workspace, message, brief, result, title) {
   await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], runnerToken);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
-  const body = writePullRequestBody(pullRequestBody(message, brief, config.version));
+  const body = writePullRequestBody(pullRequestBody(message, brief, config.version, draft.reason));
   const bodyPath = body.file;
 
   const ghEnv = {
@@ -2890,12 +2923,16 @@ async function publish(config, workspace, message, brief, result, title) {
 
   let created;
   try {
-    created = await runProcess('gh', [...base, '--draft'], { cwd: dir, env: ghEnv });
-    if (created.code !== 0) {
-      // Draft pull requests need a plan that supports them. The branch is
-      // already pushed by this point, so refusing to open the pull request at
-      // all would leave the work stranded where nobody looks for it.
-      log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
+    if (draft.draft) {
+      created = await runProcess('gh', [...base, '--draft'], { cwd: dir, env: ghEnv });
+      if (created.code !== 0) {
+        // Draft pull requests need a plan that supports them. The branch is
+        // already pushed by this point, so refusing to open the pull request at
+        // all would leave the work stranded where nobody looks for it.
+        log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
+        created = await runProcess('gh', base, { cwd: dir, env: ghEnv });
+      }
+    } else {
       created = await runProcess('gh', base, { cwd: dir, env: ghEnv });
     }
   } finally {
@@ -3566,7 +3603,7 @@ async function handleJob(config, job, options = {}) {
     // the pull request run to their end: a pull request opened after the job was
     // taken carries the request's marker, which is how SRE Agent finds it.
     stillHeld(signal);
-    result.pr_url = await publish(config, workspace, prose, brief, result, title);
+    result.pr_url = await publish(config, workspace, prose, brief, result, title, draftDecision(job, changed));
     result.actions.push(`opened ${result.pr_url}`);
     // The outcome stays not_validated and carries the pull request. The
     // agent's contract is to leave no change in place that does not build or

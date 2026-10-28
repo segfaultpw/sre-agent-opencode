@@ -155,7 +155,7 @@ install_into() {
 install_into first
 if [ "$rc" -eq 0 ]; then echo "ok   a complete clone installs"; else echo "FAIL the installer exited $rc: $out"; fail=1; fi
 if cmp -s "$unit" "${root}${unit_file}"; then echo "ok   the unit is installed byte for byte"; else echo "FAIL the unit at ${root}${unit_file} is not the one in the repository"; fail=1; fi
-for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/bucket.js runner/entrypoint.sh; do
+for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh runner/runner.js runner/conventional_title.js runner/ci_config.js runner/github_app.js runner/memory.js runner/bucket.js runner/entrypoint.sh; do
   if [ -s "${root}/opt/sre-agent-opencode/${relative}" ]; then echo "ok   the package's ${relative} is installed"; else echo "FAIL ${relative} is missing from the installed package"; fail=1; fi
 done
 if [ -x "${root}/opt/sre-agent-opencode/runner/entrypoint.sh" ]; then echo "ok   the entrypoint is executable"; else echo "FAIL the entrypoint is not executable"; fail=1; fi

@@ -581,6 +581,90 @@ title_case invalid_without_job_title '{}' "Title: Raise the connection pool ceil
 title_case no_line_no_keys '{}' "" "fix: The change is complete, validated, and scoped. Here's the summary."
 export STUB_OPENCODE_MODE=fix
 
+echo "--- 2h. the job's draft key decides whether the pull request opens as a draft ---"
+# draft_case NAME JOB_EXTRA MODE EXPECTED REASON: one run with the given job keys and ending, then the pull
+# request is opened as a draft (gh is given --draft) or not, and the body carries the "Why this is a draft"
+# section only when REASON is yes. A repository that refuses drafts is a separate case below.
+draft_case() {
+  local name="$1" extra="$2" mode="$3" expected="$4" reason="$5"
+  start_fixture "d_$name"
+  queue_one "h-d-$name" acme/app "" "$extra"
+  export STUB_OPENCODE_MODE="$mode"
+  run_once "d_$name"
+  export STUB_OPENCODE_MODE=fix
+  local created=no
+  if grep -q 'pr create --repo acme/app' "$gh_log"; then created=yes; fi
+  local opened_as=ready
+  if grep -q -- ' --draft' "$gh_log"; then opened_as=draft; fi
+  if [ "$rc" -eq 0 ] && [ "$created" = yes ] && [ "$opened_as" = "$expected" ]; then
+    echo "ok   $name: the pull request opens as $expected"
+  else
+    echo "FAIL $name: rc=$rc created=$created opened as $opened_as, expected $expected: $(cat "$gh_log")"; fail=1
+  fi
+  if [ "$(grep -c 'pr create' "$gh_log")" -eq 1 ]; then echo "ok   $name: exactly one pull request is opened"; else echo "FAIL $name: gh calls: $(cat "$gh_log")"; fail=1; fi
+  if [ "$reason" = yes ]; then
+    if grep -qF '## Why this is a draft' "$gh_body" && grep -qF '`.circleci/config.yml`' "$gh_body"; then echo "ok   $name: the body says why it is a draft and names the CI file"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+  else
+    if ! grep -qF 'Why this is a draft' "$gh_body"; then echo "ok   $name: the body has no reason section"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+  fi
+  if grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   $name: the marker and the stamp are still in the body"; else echo "FAIL $name: body: $(cat "$gh_body")"; fail=1; fi
+  if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   $name: the report carries the pull request"; else echo "FAIL $name: report: $report"; fail=1; fi
+  stop_fixture
+}
+
+draft_case draft_true '{"draft": true}' fix draft no
+draft_case draft_false '{"draft": false}' fix ready no
+draft_case draft_false_ci '{"draft": false}' ci draft yes
+draft_case draft_true_ci '{"draft": true}' ci draft no
+draft_case key_absent '{}' fix draft no
+draft_case key_absent_ci '{}' ci draft no
+draft_case draft_null '{"draft": null}' fix draft no
+draft_case draft_string_false '{"draft": "false"}' fix draft no
+draft_case draft_zero '{"draft": 0}' fix draft no
+
+# The brief's "Pull request" row is text for the agent: the runner never reads it, so a brief that says ready
+# changes nothing when the job says draft, and a brief that says draft changes nothing when the job says ready.
+brief_backup="$work/brief.original.md"
+cp "$brief_file" "$brief_backup"
+printf '\n- Pull request: open it ready for review\n' >> "$brief_file"
+draft_case brief_says_ready_job_says_draft '{"draft": true}' fix draft no
+cp "$brief_backup" "$brief_file"
+printf '\n- Pull request: open it as a draft\n' >> "$brief_file"
+draft_case brief_says_draft_job_says_ready '{"draft": false}' fix ready no
+cp "$brief_backup" "$brief_file"
+
+# A repository that refuses drafts: the draft attempt is retried as a ready pull request, as before; a job that
+# asked for ready never makes the draft attempt at all.
+refuse_dir="$work/bin-refuse"
+mkdir -p "$refuse_dir"
+cat > "$refuse_dir/gh" <<REFUSE
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "\$*" >> "$gh_log"
+body=""
+draft=no
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = "--body-file" ]; then body="\$2"; fi
+  if [ "\$1" = "--draft" ]; then draft=yes; fi
+  shift
+done
+if [ -n "\$body" ]; then cp "\$body" "$gh_body"; fi
+if [ "\$draft" = yes ]; then echo "draft pull requests are not supported in this repository" >&2; exit 1; fi
+printf '%s\n' "$pr_url"
+REFUSE
+chmod +x "$refuse_dir/gh"
+real_path="$PATH"
+start_fixture d_refused
+queue_one h-d-refused acme/app "" '{"draft": true}'
+PATH="$refuse_dir:$real_path" run_once d_refused
+if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && [ "$(grep -c -- ' --draft' "$gh_log")" -eq 1 ]; then echo "ok   a repository that refuses drafts gets the ready pull request after one draft attempt"; else echo "FAIL refused drafts: rc=$rc gh calls: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+start_fixture d_refused_ready
+queue_one h-d-refused-ready acme/app "" '{"draft": false}'
+PATH="$refuse_dir:$real_path" run_once d_refused_ready
+if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 1 ] && ! grep -q -- ' --draft' "$gh_log"; then echo "ok   a job that asked for ready never attempts a draft"; else echo "FAIL ready on a refusing repository: rc=$rc gh calls: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
 echo "--- 3. the brief is fetched with the handoff token, never with the API key ---"
 if [ "$(auth_for /brief)" = "Bearer $handoff_token" ]; then echo "ok   the brief is fetched with the handoff credential"; else echo "FAIL brief authorization: $(auth_for /brief)"; fail=1; fi
 if ! jq -r 'select(.path | endswith("/brief")) | .authorization' "$fixture_log" | grep -qF "$api_key"; then echo "ok   the API key never reaches the brief endpoint"; else echo "FAIL the API key was sent to the brief endpoint"; fail=1; fi

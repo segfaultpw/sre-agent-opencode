@@ -81,7 +81,7 @@ fi
 # The files the runner reads at run time. A clone that is missing one of them
 # would install a runner that starts and fails its first job.
 for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
-  runner/runner.js runner/conventional_title.js runner/memory.js runner/bucket.js runner/entrypoint.sh runner/sre-agent-fix-runner.service; do
+  runner/runner.js runner/conventional_title.js runner/ci_config.js runner/github_app.js runner/memory.js runner/bucket.js runner/entrypoint.sh runner/sre-agent-fix-runner.service; do
   if [ ! -f "${source_root}/${relative}" ]; then
     lack "${source_root} has no ${relative}, so this is not a complete clone of the package" \
       "git clone https://github.com/segfaultpw/sre-agent-opencode && cd sre-agent-opencode"
@@ -205,7 +205,7 @@ chmod 0755 "${staging}/runner/entrypoint.sh"
 # What the runner opens on its first job, checked in the staged tree while the
 # old one is still in place.
 for relative in VERSION config/opencode.json agents/sre-fix.md scripts/protected_paths.sh \
-  scripts/strip_repo_config.sh scripts/init_agent_repo.sh runner/runner.js runner/conventional_title.js runner/memory.js runner/bucket.js runner/entrypoint.sh; do
+  scripts/strip_repo_config.sh scripts/init_agent_repo.sh runner/runner.js runner/conventional_title.js runner/ci_config.js runner/github_app.js runner/memory.js runner/bucket.js runner/entrypoint.sh; do
   if [ ! -f "${staging}/${relative}" ]; then
     echo "the staged package is missing ${relative}; nothing was replaced" >&2
     exit 1

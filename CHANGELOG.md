@@ -2,6 +2,24 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.3.0
+
+The runner opens its pull request as a draft or ready for review as SRE Agent's setting says.
+
+The pull request was always a draft, whatever the draft setting of your GitHub integration said, so a pipeline that does not run on drafts never ran on it. The queue's job now carries a boolean `draft`, and the runner reads it:
+
+- `draft: false` opens the pull request ready for review.
+- `draft: true` opens a draft.
+- A job with no `draft` key, or with any value other than the boolean `false`, opens a draft, exactly as v2.2.0 did, so an older SRE Agent task serving a poll during a deploy gives the same result.
+- A change that touches CI configuration (the rule SRE Agent applies to its own pull requests, in `runner/ci_config.js`) opens as a draft whatever the key says, and its body gets a "Why this is a draft" section naming the files.
+- A repository that refuses draft pull requests still gets a normal one after one refused attempt, as before. A job that asked for ready never attempts a draft.
+
+The brief gains a "Pull request" row for the agent. The runner never reads it: the job's key is the one source.
+
+The installer's list of files a complete clone must hold now names `runner/ci_config.js` and `runner/github_app.js`.
+
+What a customer must change on upgrade: nothing. The wire contract only grows (one optional job key), and an older platform sends none. To get ready pull requests, turn off draft pull requests in the GitHub integration in SRE Agent once the platform sends the key.
+
 ## v2.2.0
 
 The runner tells SRE Agent it is still working, stops when the job was taken back, and says what failed.

@@ -295,6 +295,13 @@ case "$mode" in
     printf 'a line the fix added\n' >> README.md
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
+  ci)
+    # A fix that also changes CI configuration the repository's CI system reads.
+    printf 'a line the fix added\n' >> README.md
+    mkdir -p .circleci
+    printf 'version: 2.1\n' > .circleci/config.yml
+    emit "Raised the connection pool ceiling in README.md and pinned the CI image. Ran bash test.sh and it passed."
+    ;;
   slowfix)
     # The same fix after a while, long enough for the runner to beat in between.
     sleep "${STUB_OPENCODE_SLEEP:-3}"
