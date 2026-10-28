@@ -19,6 +19,20 @@
 //   FIXTURE_BRIEF_FILE     the brief the brief endpoint serves
 //   FIXTURE_BRIEF_STATUS   a status other than 200 to answer the brief with, as a
 //                          platform that failed to serve it would
+//   FIXTURE_HEARTBEAT_SECONDS  when set, the queue's answer carries it as
+//                          heartbeat_seconds, as a platform with heartbeats
+//                          does; unset, the answer is an older platform's
+//   FIXTURE_HEARTBEAT_ANSWERS  a comma separated list of answers to the
+//                          heartbeat, in order, the last one repeating:
+//                          continue, taken_over, time_limit, 404 (the handoff
+//                          endpoints' own not found, which a replaced token
+//                          gets), route404 (what a platform task without the
+//                          heartbeat route answers), or another status such
+//                          as 503 (default: continue). Each beat's
+//                          answer is in its log entry, as `answer`.
+//   FIXTURE_HEARTBEAT_AFTER_FILE  when set, every beat is answered continue
+//                          until this file exists, and the list above starts
+//                          from there: a case can wait for its agent to start
 
 const fs = require('node:fs');
 const http = require('node:http');
@@ -30,12 +44,23 @@ const handoffToken = process.env.FIXTURE_HANDOFF_TOKEN || '';
 const statuses = (process.env.FIXTURE_QUEUE_STATUSES || '200').split(',').map((value) => Number.parseInt(value, 10));
 const briefFile = process.env.FIXTURE_BRIEF_FILE || '';
 const briefStatus = Number.parseInt(process.env.FIXTURE_BRIEF_STATUS || '200', 10);
+const heartbeatSeconds = process.env.FIXTURE_HEARTBEAT_SECONDS ? Number(process.env.FIXTURE_HEARTBEAT_SECONDS) : null;
+const heartbeatAnswers = (process.env.FIXTURE_HEARTBEAT_ANSWERS || 'continue').split(',');
+const heartbeatAfterFile = process.env.FIXTURE_HEARTBEAT_AFTER_FILE || '';
 
 let queueCalls = 0;
 let queueServed = false;
+let heartbeatCalls = 0;
 
 function record(entry) {
   fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+}
+
+function nextHeartbeatAnswer() {
+  if (heartbeatAfterFile && !fs.existsSync(heartbeatAfterFile)) return 'continue';
+  const answer = heartbeatAnswers[Math.min(heartbeatCalls, heartbeatAnswers.length - 1)];
+  heartbeatCalls += 1;
+  return answer;
 }
 
 // Served once. A job the runner already collected must not be handed to it
@@ -67,7 +92,9 @@ const server = http.createServer((request, response) => {
         body = raw;
       }
     }
-    record({ method: request.method, path: url.pathname, authorization, body });
+    const beat = request.method === 'POST' && url.pathname.endsWith('/heartbeat') && authorization === `Bearer ${handoffToken}`;
+    const beatAnswer = beat ? nextHeartbeatAnswer() : undefined;
+    record({ method: request.method, path: url.pathname, authorization, body, ...(beat ? { answer: beatAnswer } : {}) });
 
     if (url.pathname === '/api/fix-runner/queue') {
       const status = statuses[Math.min(queueCalls, statuses.length - 1)];
@@ -84,7 +111,9 @@ const server = http.createServer((request, response) => {
         send(response, 401, 'application/json', JSON.stringify({ error: 'unauthorized' }));
         return;
       }
-      send(response, 200, 'application/json', JSON.stringify({ data: readQueue() }));
+      const answer = { data: readQueue() };
+      if (heartbeatSeconds !== null) answer.heartbeat_seconds = heartbeatSeconds;
+      send(response, 200, 'application/json', JSON.stringify(answer));
       return;
     }
 
@@ -102,6 +131,22 @@ const server = http.createServer((request, response) => {
         return;
       }
       send(response, 200, 'text/markdown', briefFile ? fs.readFileSync(briefFile, 'utf8') : 'no brief');
+      return;
+    }
+
+    if (beat) {
+      const answer = beatAnswer;
+      if (answer === 'continue') {
+        send(response, 200, 'application/json', JSON.stringify({ continue: true, lease_seconds: 180 }));
+      } else if (answer === 'taken_over' || answer === 'time_limit') {
+        send(response, 200, 'application/json', JSON.stringify({ continue: false, reason: answer }));
+      } else if (answer === '404') {
+        send(response, 404, 'application/json', JSON.stringify({ error: 'not found' }));
+      } else if (answer === 'route404') {
+        send(response, 404, 'application/json', JSON.stringify({ errors: { detail: 'Not Found' } }));
+      } else {
+        send(response, Number.parseInt(answer, 10), 'application/json', JSON.stringify({ error: 'fixture' }));
+      }
       return;
     }
 

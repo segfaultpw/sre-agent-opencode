@@ -12,6 +12,9 @@ set -euo pipefail
 brief="$(cat)"
 mode="${STUB_OPENCODE_MODE:-fix}"
 
+# This process's pid, for a case that proves the runner stopped the agent.
+if [ -n "${STUB_OPENCODE_PIDFILE:-}" ]; then printf '%s\n' "$$" > "$STUB_OPENCODE_PIDFILE"; fi
+
 if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
   {
     printf 'argv: %s\n' "$*"
@@ -289,6 +292,12 @@ emit() {
 
 case "$mode" in
   fix)
+    printf 'a line the fix added\n' >> README.md
+    emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
+    ;;
+  slowfix)
+    # The same fix after a while, long enough for the runner to beat in between.
+    sleep "${STUB_OPENCODE_SLEEP:-3}"
     printf 'a line the fix added\n' >> README.md
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;

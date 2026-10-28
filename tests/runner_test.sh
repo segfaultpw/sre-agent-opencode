@@ -2104,6 +2104,132 @@ if [ "$(grep -c 'opencode: timestamp=' "$out")" -eq 1 ]; then echo "ok   the mod
 if [ "$(jq -r '.evidence.opencode_log_lines' <<<"$report")" = "1" ]; then echo "ok   a failed model step names the forwarded line count in evidence"; else echo "FAIL evidence: $report"; fail=1; fi
 stop_fixture
 
+# The fixture log of one case, read after the fact: the cases above left one
+# per label, and the report each posted is the last /report body in it.
+report_in() { jq -c 'select(.path | endswith("/report")) | .body' "$work/$1.requests.jsonl" | tail -n 1; }
+paths_in() { jq -r '.path' "$work/$1.requests.jsonl"; }
+
+echo "--- 67. a platform that names heartbeat_seconds is beaten while the job is held, and never after the report ---"
+export FIXTURE_HEARTBEAT_SECONDS=1
+start_fixture beating
+queue_one h-beating acme/app
+export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=4
+run_once beating
+unset STUB_OPENCODE_SLEEP
+export STUB_OPENCODE_MODE=fix
+poll_body="$(jq -c 'select(.path == "/api/fix-runner/queue") | .body' "$fixture_log" | head -n 1)"
+if jq -e --arg v "v$version" '.heartbeat == true and .version == $v' <<<"$poll_body" >/dev/null; then echo "ok   the poll says the runner beats while it holds a job, and names its version"; else echo "FAIL poll body: $poll_body"; fail=1; fi
+beats="$(count_path /api/handoffs/h-beating/heartbeat)"
+if [ "$beats" -ge 2 ]; then echo "ok   a four second run at one second is beaten ($beats beats)"; else echo "FAIL beats: $beats out: $(tail -n 5 "$out")"; fail=1; fi
+if [ "$(auth_for /heartbeat)" = "Bearer $handoff_token" ] && ! jq -r 'select(.path | endswith("/heartbeat")) | .authorization' "$fixture_log" | grep -qF "$api_key"; then echo "ok   the beat carries the handoff credential and never the API key"; else echo "FAIL heartbeat authorization: $(auth_for /heartbeat)"; fail=1; fi
+beat_instances="$(jq -r 'select(.path | endswith("/heartbeat")) | .body.instance' "$fixture_log" | sort -u)"
+if [ "$beat_instances" = "$(jq -r '.instance' <<<"$poll_body")" ]; then echo "ok   every beat names the instance the poll named"; else echo "FAIL beat instances: $beat_instances poll: $poll_body"; fail=1; fi
+last_beat="$(paths_in beating | grep -n '/heartbeat$' | tail -n 1 | cut -d: -f1)"
+report_line="$(paths_in beating | grep -n '/report$' | tail -n 1 | cut -d: -f1)"
+if [ -n "$report_line" ] && [ -n "$last_beat" ] && [ "$last_beat" -lt "$report_line" ]; then echo "ok   no beat is sent once the report is on its way"; else echo "FAIL order: last beat line $last_beat, report line $report_line"; fail=1; fi
+if jq -e --arg pr "$pr_url" '.pr_url == $pr and (has("failure") | not)' <<<"$report" >/dev/null; then echo "ok   the beaten job ends in its pull request, and a pull request carries no failure"; else echo "FAIL report: $report"; fail=1; fi
+if grep -q 'beating for handoff h-beating every 1 s' "$out"; then echo "ok   the log says the job is beaten, and how often"; else echo "FAIL out: $(tail -n 5 "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 68. a single handoff 404, a 503 and an older task's 404 are logged and the job goes on ---"
+export FIXTURE_HEARTBEAT_ANSWERS=404,continue,503,route404,route404,route404,continue
+start_fixture beat_errors
+queue_one h-beat-errors acme/app
+export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=9
+run_once beat_errors
+unset STUB_OPENCODE_SLEEP FIXTURE_HEARTBEAT_ANSWERS
+export STUB_OPENCODE_MODE=fix
+answers="$(jq -r 'select(.path | endswith("/heartbeat")) | .answer' "$fixture_log" | tr '\n' ' ')"
+if [[ "$answers" == "404 continue 503 route404 route404 route404 continue"* ]]; then echo "ok   the beats go on through every one of those answers ($answers)"; else echo "FAIL answers: $answers"; fail=1; fi
+if grep -q 'heartbeat for handoff h-beat-errors was answered with not found; one more in a row' "$out" && grep -q 'answered with HTTP 503; the job goes on' "$out" && [ "$(grep -c 'answered with HTTP 404; the job goes on' "$out")" -eq 3 ]; then echo "ok   each refused beat is logged, a handoff 404 told apart from an older task's"; else echo "FAIL out: $(grep heartbeat "$out")"; fail=1; fi
+if ! grep -q 'so the agent is stopped' "$out" && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   one handoff 404 followed by continue, and three older-task 404s in a row, end nothing: the job ends in its pull request and is reported"; else echo "FAIL report: $report out: $(grep 'so the agent is stopped' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 69. continue false, or two handoff 404s in a row, stop the agent, clean up, and report nothing ---"
+# answer:reason the log names:how many stop answers end the job
+for spec in taken_over:taken_over:1 time_limit:time_limit:1 404:not_found:2; do
+  answer="${spec%%:*}"; rest="${spec#*:}"; reason="${rest%%:*}"; stops="${rest#*:}"
+  # Answered continue until the agent has started, so the stop lands on a
+  # running agent rather than on the checkout before it.
+  rm -f "$work/stopped.pid"
+  export FIXTURE_HEARTBEAT_ANSWERS="$answer" FIXTURE_HEARTBEAT_AFTER_FILE="$work/stopped.pid"
+  start_fixture "stopped-$reason"
+  queue_one "h-stopped-$reason" acme/app
+  export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120 STUB_OPENCODE_PIDFILE="$work/stopped.pid"
+  started="$(date +%s%N)"
+  run_once "stopped-$reason"
+  elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
+  unset STUB_OPENCODE_SLEEP STUB_OPENCODE_PIDFILE FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE
+  export STUB_OPENCODE_MODE=fix
+  if [ "$rc" -eq 0 ] && [ "$elapsed" -lt 30000 ]; then echo "ok   $reason: the run ends at the answer, in ${elapsed} ms, not at its 60 second bound"; else echo "FAIL $reason: rc=$rc in ${elapsed} ms: $(tail -n 5 "$out")"; fail=1; fi
+  if [ "$(count_path /report)" -eq 0 ]; then echo "ok   $reason: nothing is reported"; else echo "FAIL $reason: a report was posted: $report"; fail=1; fi
+  stop_answers="$(jq -r 'select(.path | endswith("/heartbeat")) | .answer' "$fixture_log" | grep -cv '^continue$' || true)"
+  if [ "$stop_answers" -eq "$stops" ]; then echo "ok   $reason: the job ends at stop answer $stops and no beat follows it"; else echo "FAIL $reason: answers: $(jq -r 'select(.path | endswith("/heartbeat")) | .answer' "$fixture_log" | tr '\n' ' ')"; fail=1; fi
+  if grep -q "no longer this runner's, so the agent is stopped" "$out" && grep -q "h-stopped-$reason was taken from this runner ($reason), so it is not reported" "$out"; then echo "ok   $reason: the log names the answer and says nothing is reported"; else echo "FAIL $reason: $(grep -E 'no longer|taken from' "$out")"; fail=1; fi
+  stub_pid="$(cat "$work/stopped.pid" 2>/dev/null || true)"
+  if [ -n "$stub_pid" ] && ! kill -0 "$stub_pid" 2>/dev/null; then echo "ok   $reason: the agent's process is gone"; else echo "FAIL $reason: the agent's process ${stub_pid:-(no pid)} is still running"; fail=1; [ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; fi
+  if ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ] && ! branch_exists "sre-agent/h-stopped-$reason"; then echo "ok   $reason: nothing is pushed and no pull request is opened"; else echo "FAIL $reason: git: $(grep ' push ' "$git_log") gh: $(cat "$gh_log")"; fail=1; fi
+  if [ ! -e "$workspace/repos/acme/app/.sre-agent-memory" ]; then echo "ok   $reason: the run's working copy of the notes is cleaned up"; else echo "FAIL $reason: the notes' working copy was left in the checkout"; fail=1; fi
+  stop_fixture
+done
+
+echo "--- 70. a platform that names no interval is never beaten, and a longer interval is beaten at one minute ---"
+if [ "$(paths_in targeted | grep -c '/heartbeat$' || true)" -eq 0 ]; then echo "ok   a poll answered without heartbeat_seconds sends no beat"; else echo "FAIL beats against an older platform: $(paths_in targeted | grep -c '/heartbeat$')"; fail=1; fi
+export FIXTURE_HEARTBEAT_SECONDS=600
+start_fixture beat_capped
+queue_one h-beat-capped acme/app
+run_once beat_capped
+export FIXTURE_HEARTBEAT_SECONDS=1
+if grep -q 'beating for handoff h-beat-capped every 60 s' "$out" && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   heartbeat_seconds of 600 is beaten every 60 seconds, inside the platform's three minute lease"; else echo "FAIL out: $(grep beating "$out") report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 71. a test job is beaten too, and continue false stops it unreported ---"
+rm -f "$work/test-stopped.pid"
+export FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_HEARTBEAT_AFTER_FILE="$work/test-stopped.pid"
+start_fixture test_stopped
+queue_test_job h-test-stopped ""
+export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120 STUB_OPENCODE_PIDFILE="$work/test-stopped.pid"
+started="$(date +%s%N)"
+run_once test_stopped
+elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
+unset STUB_OPENCODE_SLEEP STUB_OPENCODE_PIDFILE FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE FIXTURE_HEARTBEAT_SECONDS
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$elapsed" -lt 30000 ] && [ "$(count_path /report)" -eq 0 ]; then echo "ok   the test job's model step is stopped at the answer and nothing is reported (${elapsed} ms)"; else echo "FAIL rc=$rc ${elapsed} ms reports=$(count_path /report): $(tail -n 5 "$out")"; fail=1; fi
+if grep -q 'test job h-test-stopped was taken from this runner (taken_over), so it is not reported' "$out" && [ "$(jq -r 'select(.path | endswith("/heartbeat")) | .answer' "$fixture_log" | grep -cv '^continue$' || true)" -eq 1 ]; then echo "ok   the log says the test job is not reported, and no beat follows the stop"; else echo "FAIL out: $(tail -n 5 "$out")"; fail=1; fi
+stub_pid="$(cat "$work/test-stopped.pid" 2>/dev/null || true)"
+if [ -n "$stub_pid" ] && ! kill -0 "$stub_pid" 2>/dev/null; then echo "ok   the model step's process is gone"; else echo "FAIL the model step's process ${stub_pid:-(no pid)} is still running"; fail=1; [ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; fi
+stop_fixture
+
+echo "--- 72. a report names what failed, and an answer names nothing ---"
+check_failure() {
+  local label="$1" kind="$2" pattern="$3" body
+  body="$(report_in "$label")"
+  if jq -e --arg k "$kind" --arg p "$pattern" '.failure.kind == $k and (.failure.detail | test($p))' <<<"$body" >/dev/null; then echo "ok   $label: failure $kind, its detail naming the cause"; else echo "FAIL $label: $(jq -c '.failure' <<<"$body")"; fail=1; fi
+}
+check_failure timeout timeout 'SRE_RUN_TIMEOUT_SECONDS \(1 seconds\)'
+check_failure provider agent_exit '^opencode exited 1: User not found\.$'
+check_failure malformed runner_error 'owner/name'
+check_failure redacted runner_error '\[redacted\]'
+check_failure busy-b busy_repository 'acme/app is being worked on by another runner instance \(alpha\)'
+if ! grep -qF "$github_token" "$work/redacted.requests.jsonl"; then echo "ok   a failure detail is redacted like the rest of the report"; else echo "FAIL the token reached the failure detail"; fail=1; fi
+for label in targeted decline gated untargeted; do
+  if jq -e 'has("failure") | not' <<<"$(report_in "$label")" >/dev/null; then echo "ok   $label: an answer carries no failure"; else echo "FAIL $label: $(report_in "$label")"; fail=1; fi
+done
+start_fixture unchanged
+queue_one h-unchanged acme/app
+export STUB_OPENCODE_MODE=nochange
+run_once unchanged
+if jq -e '.failure.kind == "no_changes" and (has("pr_url") | not)' <<<"$report" >/dev/null; then echo "ok   a tree left unchanged without a decline is the no_changes failure"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+start_fixture long_failure
+queue_one h-long-failure acme/app
+export STUB_OPENCODE_MODE=provider_error_long
+run_once long_failure
+export STUB_OPENCODE_MODE=fix
+detail_bytes="$(jq -j '.failure.detail' <<<"$report" | wc -c)"
+if jq -e '.failure.kind == "agent_exit"' <<<"$report" >/dev/null && [ "$detail_bytes" -le 500 ] && [ "$detail_bytes" -ge 400 ]; then echo "ok   a long failure detail is cut at the 500 bytes the platform keeps ($detail_bytes bytes)"; else echo "FAIL detail of $detail_bytes bytes: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

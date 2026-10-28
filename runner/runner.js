@@ -49,6 +49,14 @@ const APP_MODE_MAX_RUN_SECONDS = 3300;
 // off in SRE Agent, and the code the queue says so with.
 const DISABLED_POLL_MS = 60_000;
 const RUNNER_DISABLED_CODE = 'runner_disabled';
+// The platform says how often to beat in the poll's answer (heartbeat_seconds).
+// An interval longer than this would let the platform's three minute lease run
+// out between two beats, so a longer value is beaten at this one.
+const HEARTBEAT_MAX_SECONDS = 60;
+// How many of the handoff endpoints' own 404s in a row end a held job.
+const HEARTBEAT_NOT_FOUND_LIMIT = 2;
+// What the platform keeps of a report's failure detail, in bytes.
+const FAILURE_DETAIL_MAX_BYTES = 500;
 
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
@@ -537,8 +545,15 @@ function launch(command, args, env, as, home) {
   return { command, args, env: base, ids: {} };
 }
 
+// `signal`, an AbortSignal, stops the child the way the time bound does
+// (SIGTERM to its group, SIGKILL after the grace, then the pipes let go of),
+// and the answer says `aborted` rather than `timedOut`. A signal already
+// aborted starts nothing.
 function runProcess(command, args, options = {}) {
-  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null } = options;
+  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null, signal: abortSignal = null } = options;
+  if (abortSignal && abortSignal.aborted) {
+    return Promise.resolve({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
+  }
   const launched = launch(command, args, requestedEnv, as, home);
   const env = launched.env;
   // A shell hands every command a PWD that matches its working directory; a
@@ -562,10 +577,13 @@ function runProcess(command, args, options = {}) {
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let aborted = false;
+    let stopping = false;
     let killTimer = null;
     let graceTimer = null;
     let abandonTimer = null;
     let settled = false;
+    let onAbort = null;
 
     const done = (result) => {
       if (settled) return;
@@ -573,7 +591,33 @@ function runProcess(command, args, options = {}) {
       clearTimeout(killTimer);
       clearTimeout(graceTimer);
       clearTimeout(abandonTimer);
-      resolve(result);
+      if (onAbort) abortSignal.removeEventListener('abort', onAbort);
+      resolve(aborted ? { ...result, aborted: true } : result);
+    };
+
+    // The time bound and an abort end the child the same way, once.
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      killGroup(child.pid, 'SIGTERM');
+      graceTimer = setTimeout(() => {
+        killGroup(child.pid, 'SIGKILL');
+        // "close" needs the child gone AND every pipe closed, and a
+        // grandchild that put itself in another session survives the group
+        // kill while still holding them. Waiting for that event is waiting
+        // for ever, and a request that is never reported is the one failure
+        // the platform cannot tell apart from a runner that never existed:
+        // it waits out its 45 minute sweep and tells the customer nobody
+        // answered. So the stop answers on its own, lets go of the pipes,
+        // and says that something may still be running.
+        abandonTimer = setTimeout(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          child.stdin.destroy();
+          child.unref();
+          done({ code: null, signal: 'SIGKILL', stdout, stderr, timedOut, abandoned: true });
+        }, ABANDON_GRACE_MS);
+      }, KILL_GRACE_MS);
     };
 
     // Decoded by the stream rather than by concatenation, so a multi-byte
@@ -595,27 +639,16 @@ function runProcess(command, args, options = {}) {
 
     if (timeoutMs > 0) {
       killTimer = setTimeout(() => {
-        timedOut = true;
-        killGroup(child.pid, 'SIGTERM');
-        graceTimer = setTimeout(() => {
-          killGroup(child.pid, 'SIGKILL');
-          // "close" needs the child gone AND every pipe closed, and a
-          // grandchild that put itself in another session survives the group
-          // kill while still holding them. Waiting for that event is waiting
-          // for ever, and a request that is never reported is the one failure
-          // the platform cannot tell apart from a runner that never existed:
-          // it waits out its 45 minute sweep and tells the customer nobody
-          // answered. So the timeout answers on its own, lets go of the
-          // pipes, and says that something may still be running.
-          abandonTimer = setTimeout(() => {
-            child.stdout.destroy();
-            child.stderr.destroy();
-            child.stdin.destroy();
-            child.unref();
-            done({ code: null, signal: 'SIGKILL', stdout, stderr, timedOut: true, abandoned: true });
-          }, ABANDON_GRACE_MS);
-        }, KILL_GRACE_MS);
+        if (!stopping) timedOut = true;
+        stop();
       }, timeoutMs);
+    }
+    if (abortSignal) {
+      onAbort = () => {
+        if (!stopping) aborted = true;
+        stop();
+      };
+      abortSignal.addEventListener('abort', onAbort, { once: true });
     }
 
     child.stdin.on('error', () => {
@@ -829,13 +862,25 @@ function switchedOff(body) {
   return String(body).includes(RUNNER_DISABLED_CODE);
 }
 
+// How often the platform asked to be told this runner is still on its job, in
+// whole seconds, or null when the answer names no interval (a platform release
+// without heartbeats, which leases a job for 45 minutes instead).
+function heartbeatInterval(payload) {
+  const seconds = payload.heartbeat_seconds;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 1) return null;
+  return Math.min(Math.floor(seconds), HEARTBEAT_MAX_SECONDS);
+}
+
+// Answers { jobs, heartbeatSeconds }.
 async function poll(config) {
   const url = `${config.serverUrl}/api/fix-runner/queue`;
-  // The poll still names the queue the same way; it now carries this runner's
-  // instance id, so the platform can lease the job to this instance alone. A
-  // GET with a body is what the wire contract says, and the length is spelled
-  // out so the body is framed whatever the platform reads it with.
-  const body = JSON.stringify({ instance: config.instance });
+  // The poll names this runner's instance, so the platform can lease the job to
+  // this instance alone; says it will beat while it holds a job, so a platform
+  // that reads heartbeats leases for minutes rather than for 45 of them; and
+  // names its version, a label the platform shows beside the instance. A GET
+  // with a body is what the wire contract says, and the length is spelled out
+  // so the body is framed whatever the platform reads it with.
+  const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}` });
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
     let failure = '';
@@ -865,7 +910,7 @@ async function poll(config) {
         `this runner is switched off in SRE Agent, so the queue is refusing it; asking again in ${DISABLED_POLL_MS} ms. SRE_API_KEY is not the problem.`
       );
       if (!config.once) await sleep(DISABLED_POLL_MS);
-      return [];
+      return { jobs: [], heartbeatSeconds: null };
     }
 
     if (response && (response.status === 401 || response.status === 403)) {
@@ -878,7 +923,7 @@ async function poll(config) {
       try {
         const payload = JSON.parse(response.body);
         if (!Array.isArray(payload.data)) throw new Error('the queue answered without a data array');
-        return payload.data;
+        return { jobs: payload.data, heartbeatSeconds: heartbeatInterval(payload) };
       } catch (error) {
         failure = error.message;
       }
@@ -893,7 +938,131 @@ async function poll(config) {
     log('warn', `the queue could not be read (${failure}); retrying in ${delay} ms`);
     await sleep(delay);
   }
-  return [];
+  return { jobs: [], heartbeatSeconds: null };
+}
+
+// Step 2a. While a job is held, tell the platform this machine is still on it.
+// The runner polls nothing during a run, so without a beat the platform cannot
+// tell a long run from a dead machine until its 45 minute backstop; with one, a
+// machine that stops beating is taken over within minutes. Two answers end the
+// job here; `signal` is aborted with the reason:
+//
+//   continue: false  the platform gave the job to another runner or to its own
+//                    (`taken_over`) or moved it on past its run ceiling
+//                    (`time_limit`).
+//   two handoff 404s in a row  the handoff endpoints' own "not found", which is
+//                    what a token answers once a take-over has replaced it
+//                    (`not_found`). Two, so one stray answer from something in
+//                    between ends nothing.
+//
+// Everything else changes nothing and the next beat is sent on time: a 5xx, no
+// answer at all, and a 404 that is not the handoff endpoints' own, such as an
+// older platform task without the heartbeat route (its router answers
+// {"errors": ...}), which a rolling deploy can route a beat to. The run's own
+// SRE_RUN_TIMEOUT_SECONDS stays the backstop. Answers an inert handle when the
+// platform named no interval.
+function startHeartbeat(config, job, seconds) {
+  const inert = { signal: null, stop() {} };
+  if (!seconds || !job || !job.token || typeof job.report_url !== 'string') return inert;
+  let url;
+  try {
+    // The beat sits beside the report: /api/handoffs/<id>/heartbeat.
+    url = new URL('heartbeat', job.report_url).toString();
+  } catch {
+    log('warn', `the job for handoff ${job.handoff_id} carries a report URL no heartbeat can be built from, so none is sent`);
+    return inert;
+  }
+  const controller = new AbortController();
+  const body = JSON.stringify({ instance: config.instance });
+  let stopped = false;
+  let inFlight = false;
+  let timer = null;
+  // The handoff endpoints' own 404s, in a row.
+  let handoffMisses = 0;
+
+  const beat = async () => {
+    // One beat at a time: a slow answer is not stacked under the next one.
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      let response;
+      try {
+        response = await httpRequest(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${job.token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body,
+          timeoutMs: Math.min(HTTP_TIMEOUT_MS, seconds * 1000),
+        });
+      } catch (error) {
+        handoffMisses = 0;
+        if (!stopped) log('warn', `the heartbeat for handoff ${job.handoff_id} could not be sent (${error.message}); the job goes on and the next beat is in ${seconds} s`);
+        return;
+      }
+      if (stopped) return;
+      let answer = null;
+      try {
+        answer = JSON.parse(response.body);
+      } catch {
+        answer = null;
+      }
+      const end = (reason, why) => {
+        log('warn', `${why}: the job is no longer this runner's, so the agent is stopped and nothing is published or reported`);
+        stopped = true;
+        clearInterval(timer);
+        controller.abort(reason);
+      };
+      if (response.status === 404 && answer && answer.error === 'not found') {
+        handoffMisses += 1;
+        if (handoffMisses >= HEARTBEAT_NOT_FOUND_LIMIT) {
+          end('not_found', `SRE Agent answered ${handoffMisses} heartbeats in a row for handoff ${job.handoff_id} with not found`);
+          return;
+        }
+        log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with not found; one more in a row and the job is taken as no longer this runner's`);
+        return;
+      }
+      handoffMisses = 0;
+      if (response.status === 200 && answer && answer.continue === false) {
+        const reason = typeof answer.reason === 'string' && /^[a-z_]{1,40}$/.test(answer.reason) ? answer.reason : 'unknown';
+        end(reason, `SRE Agent answered the heartbeat for handoff ${job.handoff_id} with continue false (${reason})`);
+        return;
+      }
+      if (response.status === 200 && answer && answer.continue === true) {
+        log('debug', `heartbeat for handoff ${job.handoff_id}: continue`);
+        return;
+      }
+      const what = response.status === 200 ? 'a body that is not a heartbeat answer' : `HTTP ${response.status}`;
+      log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with ${what}; the job goes on and the next beat is in ${seconds} s`);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  timer = setInterval(() => {
+    beat();
+  }, seconds * 1000);
+  timer.unref();
+  log('info', `beating for handoff ${job.handoff_id} every ${seconds} s while this runner holds it`);
+  return {
+    signal: controller.signal,
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
+}
+
+// What a run does when its heartbeat ended the job (startHeartbeat): it stops
+// where it stands. Thrown at the points between the steps; the agent itself is
+// stopped through runProcess.
+function stillHeld(signal) {
+  if (!signal || !signal.aborted) return;
+  const error = new Error(`the job was taken from this runner (${signal.reason})`);
+  error.takenOver = true;
+  throw error;
 }
 
 // Step 2. Fetch the brief with the handoff token, never with the API key: the
@@ -2418,6 +2587,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
     as: 'agent',
     home: options.home,
     timeoutMs: options.timeoutMs || config.runTimeoutMs,
+    signal: options.signal || null,
   });
   // Once, right after the process ends, whatever ended it: the tail of the
   // structured server log opencode printed on stderr goes to the operator's
@@ -2449,6 +2619,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
   return {
     code: result.code,
     timedOut: result.timedOut,
+    aborted: Boolean(result.aborted),
     abandoned: Boolean(result.abandoned),
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
@@ -2758,6 +2929,28 @@ function testReport(result) {
   };
 }
 
+// failure: what stopped a run that did not finish, {kind, detail}, so the
+// platform does not have to read it out of the evidence. The kinds are the
+// platform's (timeout, agent_exit, runner_error, busy_repository, no_changes,
+// processes_survived); a decline, a protected path refusal, an untargeted
+// diagnosis and a pull request are answers, and carry none. The detail is one
+// line, redacted, and cut at what the platform keeps.
+function recordFailure(result, kind, detail) {
+  result.failure = { kind, detail: withinBytes(oneLine(redact(detail), Infinity), FAILURE_DETAIL_MAX_BYTES) };
+}
+
+function withinBytes(text, max) {
+  let out = '';
+  let bytes = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char);
+    if (bytes + size > max) break;
+    out += char;
+    bytes += size;
+  }
+  return out;
+}
+
 // Step 7. Report. This is the only thing that ends the request, so it runs in
 // a finally: a crash between the run and the report leaves the platform
 // waiting 45 minutes for its sweep to fail the row.
@@ -2768,6 +2961,7 @@ async function report(job, result) {
     actions: result.actions,
     evidence: result.evidence,
     ...(result.pr_url ? { pr_url: result.pr_url } : {}),
+    ...(result.failure ? { failure: result.failure } : {}),
     ...memoryReport(result),
     ...testReport(result),
   });
@@ -2962,7 +3156,8 @@ function testBusyDetail(holder, repo) {
   return `another runner instance (${holder.instance || 'unknown'}, pid ${holder.pid || 'unknown'}) is working on ${whose}, so the marker was not written`;
 }
 
-async function runTestJob(config, job) {
+async function runTestJob(config, job, heartbeat) {
+  const signal = heartbeat.signal;
   const result = newResult(config);
   result.test = [];
   let failed = null;
@@ -2971,7 +3166,7 @@ async function runTestJob(config, job) {
   const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
   const step = async (name, run) => {
-    if (failed) {
+    if (failed || (signal && signal.aborted)) {
       result.test.push({ name, ok: false, detail: TEST_NOT_RUN });
       return;
     }
@@ -3015,7 +3210,7 @@ async function runTestJob(config, job) {
       const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
       try {
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo });
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
@@ -3102,17 +3297,29 @@ async function runTestJob(config, job) {
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
     result.actions.push('ran the test job: no fix was run and nothing was pushed');
     result.summary = testSummary(config, result.test, failed);
-    await report(job, result);
+    // Stopped before the report, so no beat lands on a handoff the report closes.
+    heartbeat.stop();
+    if (signal && signal.aborted) {
+      log('warn', `test job ${job.handoff_id} was taken from this runner (${signal.reason}), so it is not reported`);
+    } else {
+      await report(job, result);
+    }
     jobSecret = null;
     await mirrorMemory(config, result);
   }
   return result;
 }
 
-async function handleJob(config, job) {
+// `options.heartbeat` is the handle startHeartbeat answered for this job, or
+// none: a caller that beats nothing (a platform without heartbeats, a test that
+// drives one job) gets the behaviour of every release before heartbeats.
+async function handleJob(config, job, options = {}) {
+  const heartbeat = options.heartbeat || { signal: null, stop() {} };
+  const signal = heartbeat.signal;
   identity = config.identity || NO_IDENTITY;
   settleRunnerHome();
   if (!job || !job.handoff_id || !job.report_url || !job.token) {
+    heartbeat.stop();
     log('error', 'the queue answered with a job carrying no handoff id, report URL or credential; skipping it');
     return;
   }
@@ -3124,7 +3331,7 @@ async function handleJob(config, job) {
     repo_full_name: job.repo_full_name || null,
   });
 
-  if (job.test === true) return runTestJob(config, job);
+  if (job.test === true) return runTestJob(config, job, heartbeat);
 
   const result = newResult(config);
   // The repository's lease, released in the finally below and again after the
@@ -3133,12 +3340,14 @@ async function handleJob(config, job) {
   let lease = null;
 
   try {
+    stillHeld(signal);
     const brief = await fetchBrief(job);
     result.actions.push('fetched the brief');
     log('info', `fetched the brief for handoff ${job.handoff_id}`, { bytes: Buffer.byteLength(brief) });
 
     const repo = job.repo_full_name ? parseRepo(job.repo_full_name) : null;
     lease = await acquireRepoLease(config, repo);
+    stillHeld(signal);
     if (lease && lease.busy) {
       // Another instance is working on the same repository. The honest answer
       // is no answer at all: nothing is published, nothing is staged and the
@@ -3147,6 +3356,7 @@ async function handleJob(config, job) {
       result.summary = `${subject} is being worked on by another runner instance (${lease.busy.instance || 'unknown'}), so this request was not run here: nothing was published, nothing was staged and its memory was left as it was.`;
       result.evidence.busy_repository = repo ? repo.fullName : memory.ESTATE;
       result.actions.push(`${subject} was busy on another runner instance, so nothing was run`);
+      recordFailure(result, 'busy_repository', `${subject} is being worked on by another runner instance (${lease.busy.instance || 'unknown'})`);
       return result;
     }
     const workspace = repo ? await prepareCheckout(config, job, repo) : prepareScratch(config);
@@ -3173,6 +3383,7 @@ async function handleJob(config, job) {
       );
     }
 
+    stillHeld(signal);
     writeAgent(config, workspace.dir);
     let mem = null;
     try {
@@ -3194,7 +3405,7 @@ async function handleJob(config, job) {
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo });
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -3216,6 +3427,9 @@ async function handleJob(config, job) {
         lease = null;
       }
     }
+    // A run stopped because the job was taken is not judged at all: its exit
+    // code and its tree are the stop's, not the agent's.
+    stillHeld(signal);
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
     if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors.map(redact);
@@ -3227,6 +3441,7 @@ async function handleJob(config, job) {
       result.summary = 'A process of the agent\'s account could not be ended after the run, so nothing was published. It may still be running on this machine.';
       result.evidence.agent_processes_survived = true;
       result.actions.push('a process of the agent\'s account could not be ended, so nothing was published');
+      recordFailure(result, 'processes_survived', 'a process of the agent\'s account could not be ended after the run, so nothing was published; it may still be running on the runner\'s machine');
       log('error', `handoff ${job.handoff_id}: a process of the agent's account outlived every attempt to end it; nothing was published`);
       return result;
     }
@@ -3245,6 +3460,11 @@ async function handleJob(config, job) {
         result.evidence.abandoned_process = true;
         log('warn', `handoff ${job.handoff_id}: a process outlived the kill and the pipes stayed open; reported anyway`);
       }
+      recordFailure(
+        result,
+        'timeout',
+        `the agent was stopped after SRE_RUN_TIMEOUT_SECONDS (${config.runTimeoutSeconds} seconds)${agent.abandoned ? '; a process it started did not exit and may still be running' : ''}`
+      );
       return result;
     }
 
@@ -3267,6 +3487,11 @@ async function handleJob(config, job) {
       // opencode's own log is where its error sentence points: the count of
       // forwarded lines tells the operator how much of it the log group holds.
       if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+      // The provider's own error names the cause best; the tail of what the
+      // process printed stands in when it sent none.
+      const how = agent.code === null || agent.code === undefined ? 'opencode could not be started or was stopped by a signal' : `opencode exited ${agent.code}`;
+      const why = agent.errors.length > 0 ? agent.errors.join('; ') : agent.stderr.trim().slice(-300);
+      recordFailure(result, 'agent_exit', why ? `${how}: ${why}` : how);
       return result;
     }
     if (isDecline(agent.finalMessage)) {
@@ -3284,6 +3509,7 @@ async function handleJob(config, job) {
     const { changed, flagged, memoryCopies, embedded } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
+      recordFailure(result, 'no_changes', 'the agent left the working tree unchanged and did not decline, so there was nothing to publish');
       return result;
     }
     result.evidence.changed_files = changed;
@@ -3305,6 +3531,10 @@ async function handleJob(config, job) {
     }
 
     const { title, body: prose } = resolveTitle(job, agent.finalMessage, path.basename(workspace.branch));
+    // The last point before anything leaves this machine. Past it the push and
+    // the pull request run to their end: a pull request opened after the job was
+    // taken carries the request's marker, which is how SRE Agent finds it.
+    stillHeld(signal);
     result.pr_url = await publish(config, workspace, prose, brief, result, title);
     result.actions.push(`opened ${result.pr_url}`);
     // The outcome stays not_validated and carries the pull request. The
@@ -3315,16 +3545,28 @@ async function handleJob(config, job) {
     result.summary = `${result.summary}\n\nThis is an unmerged pull request, ${result.pr_url}. Nothing has verified the change in a running system.`;
     log('info', `opened ${result.pr_url} for handoff ${job.handoff_id}`);
   } catch (error) {
-    result.summary = `The runner could not complete this request: ${redact(error.message)}`;
-    result.evidence.error = redact(error.message);
-    log('error', `handoff ${job.handoff_id} failed: ${redact(error.message)}`);
+    if (!error.takenOver) {
+      result.summary = `The runner could not complete this request: ${redact(error.message)}`;
+      result.evidence.error = redact(error.message);
+      recordFailure(result, 'runner_error', error.message);
+      log('error', `handoff ${job.handoff_id} failed: ${redact(error.message)}`);
+    }
   } finally {
     // The lease is released with the save when the run got that far; this is
     // the backstop for everything that can stop it earlier, before the
     // mirror and the report spend their time under it.
     releaseLock(lease);
     await mirrorMemory(config, result);
-    await report(job, result);
+    // Stopped before the report, so no beat lands on a handoff the report
+    // closes, and a job that was taken is not reported: the platform has
+    // already given it to someone else.
+    heartbeat.stop();
+    if (signal && signal.aborted) {
+      const opened = result.pr_url ? `, though ${result.pr_url} was opened before it was` : '';
+      log('warn', `handoff ${job.handoff_id} was taken from this runner (${signal.reason}), so it is not reported${opened}`);
+    } else {
+      await report(job, result);
+    }
     jobSecret = null;
   }
   return result;
@@ -3399,7 +3641,7 @@ async function syncMemory(config) {
 // One request: a restore that has not succeeded is tried again first (before
 // the brief is fetched, so the platform's clock for the request is not spent
 // on it more than once), then the request.
-async function serveJob(config, job) {
+async function serveJob(config, job, options = {}) {
   const settings = bucketSettings(config);
   if (settings) {
     try {
@@ -3409,7 +3651,7 @@ async function serveJob(config, job) {
     }
     await syncMemory(config);
   }
-  return handleJob(config, job);
+  return handleJob(config, job, options);
 }
 
 async function main() {
@@ -3453,8 +3695,9 @@ async function main() {
 
   for (;;) {
     let jobs = [];
+    let heartbeatSeconds = null;
     try {
-      jobs = await poll(config);
+      ({ jobs, heartbeatSeconds } = await poll(config));
     } catch (error) {
       if (error.fatal) throw error;
       log('error', error.message);
@@ -3471,7 +3714,15 @@ async function main() {
       log('info', `the queue answered with ${jobs.length} requests; taking one and polling again for the rest`);
     }
     if (jobs.length > 0) {
-      await serveJob(config, jobs[0]);
+      // From the moment the job is held, which on a platform with heartbeats
+      // is the poll that handed it over: the restore retry in serveJob can
+      // take minutes before the brief is fetched.
+      const heartbeat = startHeartbeat(config, jobs[0], heartbeatSeconds);
+      try {
+        await serveJob(config, jobs[0], { heartbeat });
+      } finally {
+        heartbeat.stop();
+      }
     }
     if (config.once) return;
   }

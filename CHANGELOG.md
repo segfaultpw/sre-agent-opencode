@@ -2,6 +2,18 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.2.0
+
+The runner tells SRE Agent it is still working, stops when the job was taken back, and says what failed.
+
+A heartbeat while a job is held. Every poll now says the runner beats (`"heartbeat": true`) and names its version (`"version": "v2.2.0"`). When the queue's answer names an interval (`heartbeat_seconds`), the runner calls `POST /api/handoffs/<id>/heartbeat` with the handoff token and its instance id at that interval, from the poll that handed the job over until the report is on its way, at most every 60 seconds apart. A platform that reads heartbeats then leases the job for three minutes rather than 45, so a runner that dies mid-run is noticed in minutes and its request moved on, while a long run that keeps beating keeps its job. A beat answered 5xx, not at all, or 404 by a platform task that has no heartbeat route is logged and the job goes on; a platform that names no interval gets no beats.
+
+A stop when SRE Agent took the job back. A beat answered `{"continue": false}` (reason `taken_over` or `time_limit`), or the handoff endpoints' own `{"error": "not found"}` twice in a row (what a token gets once SRE Agent has taken the request back and replaced it; one alone ends nothing), stops the agent the way `SRE_RUN_TIMEOUT_SECONDS` does, ends its processes, keeps its notes, publishes nothing and sends no report. A test job is beaten and stopped the same way. A push and a pull request already under way when the answer arrives run to their end, and the log says so.
+
+A `failure` key in the report. A fix request that did not finish now reports `failure: {kind, detail}` beside the evidence, with the kind `timeout`, `agent_exit`, `runner_error`, `busy_repository`, `no_changes` or `processes_survived`, and a one-line redacted detail of at most 500 bytes. A pull request, a decline, a protected path refusal and a diagnosis carry none. The evidence keys are unchanged, so a platform that reads them still can.
+
+What a customer must change on upgrade: nothing. The wire contract only grows (two poll keys, one report key, one endpoint the runner calls only when the platform names an interval), and an older platform ignores all of it.
+
 ## v2.1.0
 
 The pull request title is the request's own, or the model's, a Conventional Commits header of at most 72 characters.

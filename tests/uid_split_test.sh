@@ -666,6 +666,7 @@ prove_survivor() {
   local report
   report="$(jq -c 'select(.path | endswith("/h-'"$label"'/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
   if [ "$rc" -eq 0 ] && jq -e '.evidence.agent_processes_survived == true and (.summary | test("could not be ended")) and (has("pr_url") | not)' <<<"$report" >/dev/null; then echo "ok   $label: the report says a process could not be ended and carries no pull request"; else echo "FAIL $label: rc=$rc report=$report"; fail=1; fi
+  if jq -e '.failure.kind == "processes_survived" and (.failure.detail | test("could not be ended"))' <<<"$report" >/dev/null; then echo "ok   $label: the report's failure names the survivors"; else echo "FAIL $label: failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
   if grep -q 'could not be ended after 20 attempts' "$out"; then echo "ok   $label: the log names it"; else echo "FAIL $label: $(grep -c '' "$out") lines: $(tail -n 4 "$out")"; fail=1; fi
   if ! "$real_git" -c safe.directory='*' --git-dir="$remote" rev-parse --verify --quiet "refs/heads/sre-agent/h-$label" >/dev/null 2>&1; then echo "ok   $label: nothing was pushed"; else echo "FAIL $label: the branch exists in the repository"; fail=1; fi
 }
