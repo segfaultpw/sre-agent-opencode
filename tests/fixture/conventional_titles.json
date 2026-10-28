@@ -1,8 +1,8 @@
 [
  {
   "name": "a valid header is kept",
-  "input": "feat(sso): add AbrahamRivera to Analysts-BI",
-  "expected": "feat(sso): add AbrahamRivera to Analysts-BI"
+  "input": "feat(sso): add JaneDoe to Analysts-Reporting",
+  "expected": "feat(sso): add JaneDoe to Analysts-Reporting"
  },
  {
   "name": "every listed type is kept",
