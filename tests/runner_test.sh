@@ -669,13 +669,6 @@ PATH="$refuse_dir:$real_path" run_once d_refused_ci
 export STUB_OPENCODE_MODE=fix
 if [ "$rc" -eq 0 ] && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && grep -qxF '## CI configuration' "$gh_body" && ! grep -qF 'opens as a draft' "$gh_body" && grep -qF 'a person should review these files before it merges' "$gh_body" && grep -qF "$marker" "$gh_body" && grep -qF "$stamp" "$gh_body"; then echo "ok   a CI change on a repository that refuses drafts opens ready with a body that does not claim to be a draft, and says a person must review the files"; else echo "FAIL refused CI draft: rc=$rc gh calls: $(cat "$gh_log") body: $(cat "$gh_body")"; fail=1; fi
 stop_fixture
-start_fixture d_protected_unicode
-queue_one h-d-protected-unicode acme/app "" '{"draft": false}'
-export STUB_OPENCODE_MODE=protected_unicode
-run_once d_protected_unicode
-export STUB_OPENCODE_MODE=fix
-if [ "$rc" -eq 0 ] && [ ! -s "$gh_log" ] && ! grep -q ' push ' "$git_log" && jq -e '.summary | test("protected paths gate refuses")' <<<"$report" >/dev/null; then echo "ok   a protected file with a non-ASCII name is refused by the gate: nothing is pushed and no pull request is opened"; else echo "FAIL protected unicode: rc=$rc gh: $(cat "$gh_log") git: $(cat "$git_log") report: $report"; fail=1; fi
-stop_fixture
 start_fixture d_refused_ready
 queue_one h-d-refused-ready acme/app "" '{"draft": false}'
 PATH="$refuse_dir:$real_path" run_once d_refused_ready
@@ -734,6 +727,20 @@ if [ "$(jq -r '.outcome' <<<"$report")" = "not_validated" ]; then echo "ok   a r
 if ! grep -q ' push ' "$git_log"; then echo "ok   a refused change pushes nothing"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
 if [ ! -s "$gh_log" ]; then echo "ok   a refused change opens no pull request"; else echo "FAIL gh was called: $(cat "$gh_log")"; fail=1; fi
 if ! branch_exists sre-agent/h-gated; then echo "ok   no branch reaches the repository"; else echo "FAIL sre-agent/h-gated exists"; fail=1; fi
+stop_fixture
+
+echo "--- 7b. a protected file whose name holds a non-ASCII character is refused too ---"
+start_fixture gated_unicode
+queue_one h-gated-unicode acme/app
+export STUB_OPENCODE_MODE=protected_unicode
+run_once gated_unicode
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ]; then echo "ok   a refused change with a non-ASCII name exits 0, having reported"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if jq -e '.evidence.flagged_paths | index(".github/workflows/caf\u00e9.yml")' <<<"$report" >/dev/null; then echo "ok   the report names the real file name, not git's quoted form"; else echo "FAIL evidence: $report"; fail=1; fi
+if jq -e '.summary | test("protected paths gate")' <<<"$report" >/dev/null; then echo "ok   the summary says why nothing was published"; else echo "FAIL summary: $report"; fail=1; fi
+if ! grep -q ' push ' "$git_log"; then echo "ok   nothing is pushed"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
+if [ ! -s "$gh_log" ]; then echo "ok   no pull request is opened"; else echo "FAIL gh was called: $(cat "$gh_log")"; fail=1; fi
+if ! branch_exists sre-agent/h-gated-unicode; then echo "ok   no branch reaches the repository"; else echo "FAIL sre-agent/h-gated-unicode exists"; fail=1; fi
 stop_fixture
 
 echo "--- 8. a run past SRE_RUN_TIMEOUT_SECONDS is killed and reported ---"
