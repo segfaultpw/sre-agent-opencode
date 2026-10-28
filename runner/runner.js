@@ -55,6 +55,8 @@ const RUNNER_DISABLED_CODE = 'runner_disabled';
 const HEARTBEAT_MAX_SECONDS = 60;
 // How many of the handoff endpoints' own 404s in a row end a held job.
 const HEARTBEAT_NOT_FOUND_LIMIT = 2;
+// A beat that renewed nothing is sent again after this fraction of the interval.
+const HEARTBEAT_RETRY_DIVISOR = 5;
 // What the platform keeps of a report's failure detail, in bytes.
 const FAILURE_DETAIL_MAX_BYTES = 500;
 
@@ -955,14 +957,22 @@ async function poll(config) {
 //                    (`not_found`). Two, so one stray answer from something in
 //                    between ends nothing.
 //
-// Everything else changes nothing and the next beat is sent on time: a 5xx, no
-// answer at all, and a 404 that is not the handoff endpoints' own, such as an
-// older platform task without the heartbeat route (its router answers
-// {"errors": ...}), which a rolling deploy can route a beat to. The run's own
-// SRE_RUN_TIMEOUT_SECONDS stays the backstop. Answers an inert handle when the
-// platform named no interval.
+// Everything else ends nothing: a 5xx, no answer at all, and a 404 that is not
+// the handoff endpoints' own, such as an older platform task without the
+// heartbeat route (its router answers {"errors": ...}), which a rolling deploy
+// can route a beat to. Only a `continue: true` renews the platform's lease,
+// which runs out after three intervals, so a beat that renewed nothing is sent
+// again after a fifth of the interval (12 s at 60) until one does, and a few
+// unlucky answers in a row cost seconds rather than the lease. The run's own
+// SRE_RUN_TIMEOUT_SECONDS stays the backstop.
+//
+// The handle's reporting() is called just before the report: the beats go on
+// until the report has returned (a slow report must not outlive the lease), but
+// their answers end nothing any more, since a report that closes the handoff
+// makes the next beat answer taken_over. stop() ends the beats. Answers an
+// inert handle when the platform named no interval.
 function startHeartbeat(config, job, seconds) {
-  const inert = { signal: null, stop() {} };
+  const inert = { signal: null, reporting() {}, stop() {} };
   if (!seconds || !job || !job.token || typeof job.report_url !== 'string') return inert;
   let url;
   try {
@@ -974,83 +984,96 @@ function startHeartbeat(config, job, seconds) {
   }
   const controller = new AbortController();
   const body = JSON.stringify({ instance: config.instance });
+  const intervalSeconds = seconds;
+  const retrySeconds = Math.max(1, Math.round(seconds / HEARTBEAT_RETRY_DIVISOR));
   let stopped = false;
-  let inFlight = false;
+  let reporting = false;
   let timer = null;
   // The handoff endpoints' own 404s, in a row.
   let handoffMisses = 0;
 
+  // One beat; answers whether it renewed the lease.
   const beat = async () => {
-    // One beat at a time: a slow answer is not stacked under the next one.
-    if (stopped || inFlight) return;
-    inFlight = true;
+    let response;
     try {
-      let response;
-      try {
-        response = await httpRequest(url, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${job.token}`,
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body,
-          timeoutMs: Math.min(HTTP_TIMEOUT_MS, seconds * 1000),
-        });
-      } catch (error) {
-        handoffMisses = 0;
-        if (!stopped) log('warn', `the heartbeat for handoff ${job.handoff_id} could not be sent (${error.message}); the job goes on and the next beat is in ${seconds} s`);
-        return;
-      }
-      if (stopped) return;
-      let answer = null;
-      try {
-        answer = JSON.parse(response.body);
-      } catch {
-        answer = null;
-      }
-      const end = (reason, why) => {
-        log('warn', `${why}: the job is no longer this runner's, so the agent is stopped and nothing is published or reported`);
-        stopped = true;
-        clearInterval(timer);
-        controller.abort(reason);
-      };
-      if (response.status === 404 && answer && answer.error === 'not found') {
-        handoffMisses += 1;
-        if (handoffMisses >= HEARTBEAT_NOT_FOUND_LIMIT) {
-          end('not_found', `SRE Agent answered ${handoffMisses} heartbeats in a row for handoff ${job.handoff_id} with not found`);
-          return;
-        }
-        log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with not found; one more in a row and the job is taken as no longer this runner's`);
-        return;
-      }
+      response = await httpRequest(url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${job.token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body,
+        timeoutMs: Math.min(HTTP_TIMEOUT_MS, intervalSeconds * 1000),
+      });
+    } catch (error) {
       handoffMisses = 0;
-      if (response.status === 200 && answer && answer.continue === false) {
-        const reason = typeof answer.reason === 'string' && /^[a-z_]{1,40}$/.test(answer.reason) ? answer.reason : 'unknown';
-        end(reason, `SRE Agent answered the heartbeat for handoff ${job.handoff_id} with continue false (${reason})`);
-        return;
-      }
-      if (response.status === 200 && answer && answer.continue === true) {
-        log('debug', `heartbeat for handoff ${job.handoff_id}: continue`);
-        return;
-      }
-      const what = response.status === 200 ? 'a body that is not a heartbeat answer' : `HTTP ${response.status}`;
-      log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with ${what}; the job goes on and the next beat is in ${seconds} s`);
-    } finally {
-      inFlight = false;
+      if (!stopped) log('warn', `the heartbeat for handoff ${job.handoff_id} could not be sent (${error.message}); the job goes on and the next beat is in ${retrySeconds} s`);
+      return false;
     }
+    if (stopped) return false;
+    let answer = null;
+    try {
+      answer = JSON.parse(response.body);
+    } catch {
+      answer = null;
+    }
+    const renewed = response.status === 200 && Boolean(answer) && answer.continue === true;
+    if (reporting) {
+      log('debug', `heartbeat for handoff ${job.handoff_id} while its report is sent: HTTP ${response.status}`);
+      return renewed;
+    }
+    const end = (reason, why) => {
+      log('warn', `${why}: the job is no longer this runner's, so the agent is stopped and nothing is published or reported`);
+      stopped = true;
+      clearTimeout(timer);
+      controller.abort(reason);
+    };
+    if (response.status === 404 && answer && answer.error === 'not found') {
+      handoffMisses += 1;
+      if (handoffMisses >= HEARTBEAT_NOT_FOUND_LIMIT) {
+        end('not_found', `SRE Agent answered ${handoffMisses} heartbeats in a row for handoff ${job.handoff_id} with not found`);
+        return false;
+      }
+      log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with not found; one more in a row and the job is taken as no longer this runner's, and the next beat is in ${retrySeconds} s`);
+      return false;
+    }
+    handoffMisses = 0;
+    if (response.status === 200 && answer && answer.continue === false) {
+      const reason = typeof answer.reason === 'string' && /^[a-z_]{1,40}$/.test(answer.reason) ? answer.reason : 'unknown';
+      end(reason, `SRE Agent answered the heartbeat for handoff ${job.handoff_id} with continue false (${reason})`);
+      return false;
+    }
+    if (renewed) {
+      log('debug', `heartbeat for handoff ${job.handoff_id}: continue`);
+      return true;
+    }
+    const what = response.status === 200 ? 'a body that is not a heartbeat answer' : `HTTP ${response.status}`;
+    log('warn', `the heartbeat for handoff ${job.handoff_id} was answered with ${what}; the job goes on and the next beat is in ${retrySeconds} s`);
+    return false;
   };
 
-  timer = setInterval(() => {
-    beat();
-  }, seconds * 1000);
-  timer.unref();
-  log('info', `beating for handoff ${job.handoff_id} every ${seconds} s while this runner holds it`);
+  // The next beat is scheduled when this one has its answer, so beats never
+  // overlap, and how soon depends on whether it renewed.
+  const schedule = (delaySeconds) => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      const renewed = await beat();
+      schedule(renewed ? intervalSeconds : retrySeconds);
+    }, delaySeconds * 1000);
+    timer.unref();
+  };
+
+  schedule(intervalSeconds);
+  log('info', `beating for handoff ${job.handoff_id} every ${intervalSeconds} s while this runner holds it (every ${retrySeconds} s after a beat that renewed nothing)`);
   return {
     signal: controller.signal,
+    reporting() {
+      reporting = true;
+    },
     stop() {
       stopped = true;
-      clearInterval(timer);
+      clearTimeout(timer);
     },
   };
 }
@@ -3297,12 +3320,19 @@ async function runTestJob(config, job, heartbeat) {
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
     result.actions.push('ran the test job: no fix was run and nothing was pushed');
     result.summary = testSummary(config, result.test, failed);
-    // Stopped before the report, so no beat lands on a handoff the report closes.
-    heartbeat.stop();
+    // Read and switched with no await between, so no beat can end the job
+    // after the decision to report it; the beats go on, ignored, until the
+    // report has returned.
     if (signal && signal.aborted) {
+      heartbeat.stop();
       log('warn', `test job ${job.handoff_id} was taken from this runner (${signal.reason}), so it is not reported`);
     } else {
-      await report(job, result);
+      heartbeat.reporting();
+      try {
+        await report(job, result);
+      } finally {
+        heartbeat.stop();
+      }
     }
     jobSecret = null;
     await mirrorMemory(config, result);
@@ -3314,7 +3344,7 @@ async function runTestJob(config, job, heartbeat) {
 // none: a caller that beats nothing (a platform without heartbeats, a test that
 // drives one job) gets the behaviour of every release before heartbeats.
 async function handleJob(config, job, options = {}) {
-  const heartbeat = options.heartbeat || { signal: null, stop() {} };
+  const heartbeat = options.heartbeat || { signal: null, reporting() {}, stop() {} };
   const signal = heartbeat.signal;
   identity = config.identity || NO_IDENTITY;
   settleRunnerHome();
@@ -3558,15 +3588,21 @@ async function handleJob(config, job, options = {}) {
     // mirror and the report spend their time under it.
     releaseLock(lease);
     await mirrorMemory(config, result);
-    // Stopped before the report, so no beat lands on a handoff the report
-    // closes, and a job that was taken is not reported: the platform has
-    // already given it to someone else.
-    heartbeat.stop();
+    // A job that was taken is not reported: the platform has already given it
+    // to someone else. Read and switched with no await between, so no beat can
+    // end the job after the decision to report it; the beats go on, ignored,
+    // until the report has returned, so a slow report keeps the lease.
     if (signal && signal.aborted) {
+      heartbeat.stop();
       const opened = result.pr_url ? `, though ${result.pr_url} was opened before it was` : '';
       log('warn', `handoff ${job.handoff_id} was taken from this runner (${signal.reason}), so it is not reported${opened}`);
     } else {
-      await report(job, result);
+      heartbeat.reporting();
+      try {
+        await report(job, result);
+      } finally {
+        heartbeat.stop();
+      }
     }
     jobSecret = null;
   }
@@ -3751,6 +3787,7 @@ module.exports = {
     releaseLock,
     readHeldLock,
     repoLockPath,
+    runProcess,
     setIdentity: (value) => {
       identity = value;
     },

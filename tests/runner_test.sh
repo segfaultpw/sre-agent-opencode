@@ -2108,6 +2108,14 @@ stop_fixture
 # per label, and the report each posted is the last /report body in it.
 report_in() { jq -c 'select(.path | endswith("/report")) | .body' "$work/$1.requests.jsonl" | tail -n 1; }
 paths_in() { jq -r '.path' "$work/$1.requests.jsonl"; }
+# Beats that arrived more than half a second after the report was answered: a
+# beat sent before the runner read the answer can cross it, one sent after it
+# is the bug.
+beats_after_report() {
+  local answered
+  answered="$(jq -r 'select(.path | endswith("/report#answered")) | .answered_at' "$work/$1.requests.jsonl" | tail -n 1)"
+  jq -r --argjson t "${answered:-0}" 'select((.path | endswith("/heartbeat")) and .at > ($t + 500)) | .at' "$work/$1.requests.jsonl" | grep -c '' || true
+}
 
 echo "--- 67. a platform that names heartbeat_seconds is beaten while the job is held, and never after the report ---"
 export FIXTURE_HEARTBEAT_SECONDS=1
@@ -2124,9 +2132,7 @@ if [ "$beats" -ge 2 ]; then echo "ok   a four second run at one second is beaten
 if [ "$(auth_for /heartbeat)" = "Bearer $handoff_token" ] && ! jq -r 'select(.path | endswith("/heartbeat")) | .authorization' "$fixture_log" | grep -qF "$api_key"; then echo "ok   the beat carries the handoff credential and never the API key"; else echo "FAIL heartbeat authorization: $(auth_for /heartbeat)"; fail=1; fi
 beat_instances="$(jq -r 'select(.path | endswith("/heartbeat")) | .body.instance' "$fixture_log" | sort -u)"
 if [ "$beat_instances" = "$(jq -r '.instance' <<<"$poll_body")" ]; then echo "ok   every beat names the instance the poll named"; else echo "FAIL beat instances: $beat_instances poll: $poll_body"; fail=1; fi
-last_beat="$(paths_in beating | grep -n '/heartbeat$' | tail -n 1 | cut -d: -f1)"
-report_line="$(paths_in beating | grep -n '/report$' | tail -n 1 | cut -d: -f1)"
-if [ -n "$report_line" ] && [ -n "$last_beat" ] && [ "$last_beat" -lt "$report_line" ]; then echo "ok   no beat is sent once the report is on its way"; else echo "FAIL order: last beat line $last_beat, report line $report_line"; fail=1; fi
+if [ "$(beats_after_report beating)" -eq 0 ]; then echo "ok   no beat is sent once the report has its answer"; else echo "FAIL beats after the report's answer: $(beats_after_report beating)"; fail=1; fi
 if jq -e --arg pr "$pr_url" '.pr_url == $pr and (has("failure") | not)' <<<"$report" >/dev/null; then echo "ok   the beaten job ends in its pull request, and a pull request carries no failure"; else echo "FAIL report: $report"; fail=1; fi
 if grep -q 'beating for handoff h-beating every 1 s' "$out"; then echo "ok   the log says the job is beaten, and how often"; else echo "FAIL out: $(tail -n 5 "$out")"; fail=1; fi
 stop_fixture
@@ -2237,6 +2243,46 @@ run_once long_failure
 export STUB_OPENCODE_MODE=fix
 detail_bytes="$(jq -j '.failure.detail' <<<"$report" | wc -c)"
 if jq -e '.failure.kind == "agent_exit"' <<<"$report" >/dev/null && [ "$detail_bytes" -le 500 ] && [ "$detail_bytes" -ge 400 ]; then echo "ok   a long failure detail is cut at the 500 bytes the platform keeps ($detail_bytes bytes)"; else echo "FAIL detail of $detail_bytes bytes: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 73. a beat that renewed nothing is sent again after a fifth of the interval, until one renews ---"
+export FIXTURE_HEARTBEAT_SECONDS=5 FIXTURE_HEARTBEAT_ANSWERS=route404,503,route404,continue
+start_fixture rebeat
+queue_one h-rebeat acme/app
+export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=12
+run_once rebeat
+unset STUB_OPENCODE_SLEEP FIXTURE_HEARTBEAT_ANSWERS
+export STUB_OPENCODE_MODE=fix FIXTURE_HEARTBEAT_SECONDS=1
+beat_times="$(jq -r 'select(.path | endswith("/heartbeat")) | "\(.at) \(.answer)"' "$fixture_log")"
+# The gaps after each of the three misses, and the one after the renewal.
+gaps="$(awk 'NR > 1 { printf "%d:%s ", $1 - prev, prev_answer } { prev = $1; prev_answer = $2 }' <<<"$beat_times")"
+miss_gaps_ok="$(awk '{ ok = 1; n = 0; for (i = 1; i <= NF; i++) { split($i, g, ":"); if (g[2] != "continue") { n++; if (g[1] < 700 || g[1] > 2500) ok = 0 } else if (g[1] < 4500) ok = 0 } print (ok && n == 3) ? "yes" : "no" }' <<<"$gaps")"
+if [ "$miss_gaps_ok" = "yes" ]; then echo "ok   at a five second interval the beat after each of three misses comes about a second later, and the one after the renewal five seconds later (gap:previous answer, ms: $gaps)"; else echo "FAIL gaps: $gaps"; fail=1; fi
+if grep -q 'every 5 s while this runner holds it (every 1 s after a beat that renewed nothing)' "$out" && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the misses ended nothing: the run kept its job and reported its pull request"; else echo "FAIL out: $(grep beating "$out") report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 74. beats go on while a slow report is in flight, and stop once it has its answer ---"
+export FIXTURE_REPORT_DELAY_MS=3500
+start_fixture slow_report
+queue_one h-slow-report acme/app
+run_once slow_report
+unset FIXTURE_REPORT_DELAY_MS
+report_at="$(jq -r 'select(.path | endswith("/report")) | .at' "$fixture_log" | tail -n 1)"
+during="$(jq -r --argjson t "${report_at:-0}" 'select((.path | endswith("/heartbeat")) and .at > $t) | .at' "$fixture_log" | grep -c '' || true)"
+if [ "$during" -ge 2 ]; then echo "ok   the job is beaten while its report waits for an answer ($during beats)"; else echo "FAIL beats during the report: $during"; fail=1; fi
+if [ "$(beats_after_report slow_report)" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   no beat follows the report's answer, and the report stands"; else echo "FAIL after: $(beats_after_report slow_report) report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 75. a stop that lands before the agent starts runs no agent, publishes nothing and reports nothing ---"
+rm -f "$work/early.pid"
+export FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_BRIEF_DELAY_MS=2500
+start_fixture early_stop
+queue_one h-early-stop acme/app
+export STUB_OPENCODE_PIDFILE="$work/early.pid"
+run_once early_stop
+unset FIXTURE_HEARTBEAT_ANSWERS FIXTURE_BRIEF_DELAY_MS STUB_OPENCODE_PIDFILE FIXTURE_HEARTBEAT_SECONDS
+if [ "$rc" -eq 0 ] && [ ! -e "$work/early.pid" ] && [ "$(count_path /report)" -eq 0 ]; then echo "ok   the stop answered while the brief was on its way starts no agent and sends no report"; else echo "FAIL rc=$rc pid file: $(cat "$work/early.pid" 2>/dev/null) reports: $(count_path /report)"; fail=1; fi
+if ! grep -q ' push ' "$git_log" && [ ! -s "$gh_log" ] && ! branch_exists sre-agent/h-early-stop && grep -q 'h-early-stop was taken from this runner (taken_over), so it is not reported' "$out"; then echo "ok   nothing is pushed or opened, and the log says why"; else echo "FAIL git: $(grep ' push ' "$git_log") out: $(grep -E 'taken|continue false' "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

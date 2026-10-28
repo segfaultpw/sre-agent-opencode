@@ -30,6 +30,10 @@
 //                          heartbeat route answers), or another status such
 //                          as 503 (default: continue). Each beat's
 //                          answer is in its log entry, as `answer`.
+//   FIXTURE_BRIEF_DELAY_MS  how long to hold the brief's answer
+//   FIXTURE_REPORT_DELAY_MS how long to hold the report's answer; the moment it
+//                          is sent is logged as its own entry, `answered_at`
+//   Every entry carries `at`, the milliseconds it arrived.
 //   FIXTURE_HEARTBEAT_AFTER_FILE  when set, every beat is answered continue
 //                          until this file exists, and the list above starts
 //                          from there: a case can wait for its agent to start
@@ -47,6 +51,8 @@ const briefStatus = Number.parseInt(process.env.FIXTURE_BRIEF_STATUS || '200', 1
 const heartbeatSeconds = process.env.FIXTURE_HEARTBEAT_SECONDS ? Number(process.env.FIXTURE_HEARTBEAT_SECONDS) : null;
 const heartbeatAnswers = (process.env.FIXTURE_HEARTBEAT_ANSWERS || 'continue').split(',');
 const heartbeatAfterFile = process.env.FIXTURE_HEARTBEAT_AFTER_FILE || '';
+const briefDelayMs = Number.parseInt(process.env.FIXTURE_BRIEF_DELAY_MS || '0', 10);
+const reportDelayMs = Number.parseInt(process.env.FIXTURE_REPORT_DELAY_MS || '0', 10);
 
 let queueCalls = 0;
 let queueServed = false;
@@ -94,7 +100,7 @@ const server = http.createServer((request, response) => {
     }
     const beat = request.method === 'POST' && url.pathname.endsWith('/heartbeat') && authorization === `Bearer ${handoffToken}`;
     const beatAnswer = beat ? nextHeartbeatAnswer() : undefined;
-    record({ method: request.method, path: url.pathname, authorization, body, ...(beat ? { answer: beatAnswer } : {}) });
+    record({ method: request.method, path: url.pathname, authorization, body, at: Date.now(), ...(beat ? { answer: beatAnswer } : {}) });
 
     if (url.pathname === '/api/fix-runner/queue') {
       const status = statuses[Math.min(queueCalls, statuses.length - 1)];
@@ -130,7 +136,8 @@ const server = http.createServer((request, response) => {
         send(response, briefStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
         return;
       }
-      send(response, 200, 'text/markdown', briefFile ? fs.readFileSync(briefFile, 'utf8') : 'no brief');
+      const brief = briefFile ? fs.readFileSync(briefFile, 'utf8') : 'no brief';
+      setTimeout(() => send(response, 200, 'text/markdown', brief), briefDelayMs);
       return;
     }
 
@@ -151,7 +158,10 @@ const server = http.createServer((request, response) => {
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/report')) {
-      send(response, 201, 'application/json', JSON.stringify({ data: { status: 'reported' } }));
+      setTimeout(() => {
+        send(response, 201, 'application/json', JSON.stringify({ data: { status: 'reported' } }));
+        record({ method: 'ANSWERED', path: `${url.pathname}#answered`, answered_at: Date.now() });
+      }, reportDelayMs);
       return;
     }
 

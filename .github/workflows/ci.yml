@@ -49,6 +49,7 @@ jobs:
       - run: node tests/bundle_test.js
       - run: node tests/agent_home_test.js
       - run: node tests/github_app_test.js
+      - run: node tests/run_process_test.js
       - run: bash tests/runner_test.sh
       - run: bash tests/bucket_test.sh
       - run: bash tests/secret_trim_test.sh
