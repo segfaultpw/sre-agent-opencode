@@ -2221,6 +2221,15 @@ export STUB_OPENCODE_MODE=nochange
 run_once unchanged
 if jq -e '.failure.kind == "no_changes" and (has("pr_url") | not)' <<<"$report" >/dev/null; then echo "ok   a tree left unchanged without a decline is the no_changes failure"; else echo "FAIL report: $report"; fail=1; fi
 stop_fixture
+start_fixture stderr_secret
+queue_one h-stderr-secret acme/app
+export STUB_OPENCODE_MODE=stderr_secret STUB_OPENCODE_LEAK="$github_token"
+run_once stderr_secret
+unset STUB_OPENCODE_LEAK
+export STUB_OPENCODE_MODE=fix
+token_tail="${github_token: -20}"
+if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*\\[redacted\\]z+$"))' <<<"$report" >/dev/null && ! grep -qF "$token_tail" "$work/stderr_secret.requests.jsonl"; then echo "ok   a secret the 300 character cut of stderr would halve is redacted whole before the cut"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report" | sed -e "s#$token_tail#[token tail]#g")"; fail=1; fi
+stop_fixture
 start_fixture long_failure
 queue_one h-long-failure acme/app
 export STUB_OPENCODE_MODE=provider_error_long

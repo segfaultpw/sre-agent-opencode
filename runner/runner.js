@@ -3488,9 +3488,10 @@ async function handleJob(config, job, options = {}) {
       // forwarded lines tells the operator how much of it the log group holds.
       if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       // The provider's own error names the cause best; the tail of what the
-      // process printed stands in when it sent none.
+      // process printed stands in when it sent none. Redacted before the cut:
+      // a secret the cut halved is no longer a string redact() can find.
       const how = agent.code === null || agent.code === undefined ? 'opencode could not be started or was stopped by a signal' : `opencode exited ${agent.code}`;
-      const why = agent.errors.length > 0 ? agent.errors.join('; ') : agent.stderr.trim().slice(-300);
+      const why = agent.errors.length > 0 ? agent.errors.join('; ') : redact(agent.stderr).trim().slice(-300);
       recordFailure(result, 'agent_exit', why ? `${how}: ${why}` : how);
       return result;
     }

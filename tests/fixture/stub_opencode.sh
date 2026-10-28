@@ -338,6 +338,13 @@ case "$mode" in
   silent)
     # Exits cleanly having said nothing: a model that returned no text.
     ;;
+  stderr_secret)
+    # Exits non-zero with no error event, its last words a secret followed by
+    # 280 characters, so a cut of the last 300 falls inside the secret.
+    printf 'the provider said %s' "${STUB_OPENCODE_LEAK:-nothing}" >&2
+    head -c 280 /dev/zero | tr '\0' 'z' >&2
+    exit 3
+    ;;
   nochange)
     emit "Read the brief and the repository and found the behaviour already correct on this branch."
     ;;
