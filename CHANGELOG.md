@@ -12,6 +12,8 @@ A stop when SRE Agent took the job back. A beat answered `{"continue": false}` (
 
 A `failure` key in the report. A fix request that did not finish now reports `failure: {kind, detail}` beside the evidence, with the kind `timeout`, `agent_exit`, `runner_error`, `busy_repository`, `no_changes` or `processes_survived`, and a one-line redacted detail of at most 500 bytes. A pull request, a decline, a protected path refusal and a diagnosis carry none. The evidence keys are unchanged, so a platform that reads them still can.
 
+A fix to the protected paths gate. The changed files were listed by `git diff --cached --name-only`, and git quotes a name that holds a non-ASCII or special character (`".github/workflows/caf\303\251.yml"`). A quoted name begins with a quote, so the gate's `.github/` and `.sre-agent-memory/` prefix rules did not match it, and a workflow file with such a name passed the gate. The runner now lists the names NUL separated and unquoted (`core.quotePath=false`, `-z`, `--no-renames`), so the gate judges the real name, and a rename's old name is judged too. A runner older than this release has the gap: update it. The pull request that reached a repository this way still needed a person to review it, and a token without the Workflows permission cannot push a workflow file.
+
 What a customer must change on upgrade: nothing. The wire contract only grows (two poll keys, one report key, one endpoint the runner calls only when the platform names an interval), and an older platform ignores all of it.
 
 ## v2.1.0

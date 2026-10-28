@@ -295,6 +295,13 @@ case "$mode" in
     printf 'a line the fix added\n' >> README.md
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
+  protected_unicode)
+    # The same under .github/, with a non-ASCII character in the name: git quotes such a name unless it is asked not to, and a
+    # quoted name does not match the gate's .github/ prefix rule, so the gate must be handed the real name.
+    mkdir -p .github/workflows
+    printf 'on: push\n' > ".github/workflows/caf$(printf '\303\251').yml"
+    emit "Added a workflow that publishes the build."
+    ;;
   slowfix)
     # The same fix after a while, long enough for the runner to beat in between.
     sleep "${STUB_OPENCODE_SLEEP:-3}"

@@ -2673,9 +2673,13 @@ async function stageAndGate(workspace, memoryBlobs) {
   if (embedded.length > 0) return { changed: embedded, flagged: embedded, memoryCopies: [], embedded };
 
   await gitIn(workspace, ['add', '-A']);
-  const staged = (await gitIn(workspace, ['diff', '--cached', '--name-only']))
-    .split('\n')
-    .map((line) => line.trim())
+  // NUL separated and unquoted: git's default quoting wraps a name that holds a
+  // non-ASCII or special character in double quotes with octal escapes, and a
+  // quoted name does not match the protected paths gate's prefix rules
+  // (.github/, .sre-agent-memory/). --no-renames lists both ends of a rename, so
+  // neither can hide behind the other.
+  const staged = (await gitIn(workspace, ['-c', 'core.quotePath=false', 'diff', '--cached', '--name-only', '-z', '--no-renames']))
+    .split('\0')
     .filter(Boolean);
 
   if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [] };

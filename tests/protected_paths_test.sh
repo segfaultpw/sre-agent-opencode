@@ -66,4 +66,23 @@ rc=0
 got="$(printf 'src/app.ex\n.sre-agent-memory/NOTES.md\n' | bash "$script" 2>&1)" || rc=$?
 if [ "$rc" -eq 1 ] && [ "$got" = ".sre-agent-memory/NOTES.md" ]; then echo "ok   a staged .sre-agent-memory path is refused"; else echo "FAIL .sre-agent-memory list: exit $rc, '$got'"; fail=1; fi
 
+# The list the gate judges is built by git, and git's default listing QUOTES a name that holds a non-ASCII or
+# special character ("\"...\\303\\251...\""), which begins with a quote and so matches no prefix rule: a workflow file with
+# such a name passed the gate. The runner lists staged names with core.quotePath=false and -z; this proves, in a
+# scratch repository, that the real name reaches the gate and is refused, and that the default listing is the one
+# that would have slipped through (so the runner must not go back to it).
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+git -C "$scratch" init -q .
+mkdir -p "$scratch/.github/workflows" "$scratch/src"
+printf 'on: push\n' > "$scratch/.github/workflows/caf$(printf '\303\251').yml"
+printf 'x\n' > "$scratch/src/app.ex"
+git -C "$scratch" add -A
+rc=0
+got="$(git -C "$scratch" diff --cached --name-only | bash "$script")" || rc=$?
+if [ "$rc" -eq 0 ]; then echo "ok   the default listing quotes the name and the gate's .github/ rule does not see it (the hole the runner's listing closes)"; else echo "FAIL the default listing no longer hides the name: exit $rc, '$got'"; fail=1; fi
+rc=0
+got="$(git -C "$scratch" -c core.quotePath=false diff --cached --name-only -z --no-renames | tr '\0' '\n' | bash "$script")" || rc=$?
+if [ "$rc" -eq 1 ] && [ "$got" = ".github/workflows/caf$(printf '\303\251').yml" ]; then echo "ok   the runner's listing (-z, quotePath off) hands the gate the real name, which it refuses"; else echo "FAIL runner listing: exit $rc, '$got'"; fail=1; fi
+
 exit $fail

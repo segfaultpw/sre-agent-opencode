@@ -635,6 +635,20 @@ if [ ! -s "$gh_log" ]; then echo "ok   a refused change opens no pull request"; 
 if ! branch_exists sre-agent/h-gated; then echo "ok   no branch reaches the repository"; else echo "FAIL sre-agent/h-gated exists"; fail=1; fi
 stop_fixture
 
+echo "--- 7b. a protected file whose name holds a non-ASCII character is refused too ---"
+start_fixture gated_unicode
+queue_one h-gated-unicode acme/app
+export STUB_OPENCODE_MODE=protected_unicode
+run_once gated_unicode
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ]; then echo "ok   a refused change with a non-ASCII name exits 0, having reported"; else echo "FAIL exited $rc: $(cat "$out")"; fail=1; fi
+if jq -e '.evidence.flagged_paths | index(".github/workflows/caf\u00e9.yml")' <<<"$report" >/dev/null; then echo "ok   the report names the real file name, not git's quoted form"; else echo "FAIL evidence: $report"; fail=1; fi
+if jq -e '.summary | test("protected paths gate")' <<<"$report" >/dev/null; then echo "ok   the summary says why nothing was published"; else echo "FAIL summary: $report"; fail=1; fi
+if ! grep -q ' push ' "$git_log"; then echo "ok   nothing is pushed"; else echo "FAIL git pushed: $(cat "$git_log")"; fail=1; fi
+if [ ! -s "$gh_log" ]; then echo "ok   no pull request is opened"; else echo "FAIL gh was called: $(cat "$gh_log")"; fail=1; fi
+if ! branch_exists sre-agent/h-gated-unicode; then echo "ok   no branch reaches the repository"; else echo "FAIL sre-agent/h-gated-unicode exists"; fail=1; fi
+stop_fixture
+
 echo "--- 8. a run past SRE_RUN_TIMEOUT_SECONDS is killed and reported ---"
 start_fixture timeout
 queue_one h-timeout acme/app
