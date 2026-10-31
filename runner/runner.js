@@ -60,6 +60,22 @@ const HEARTBEAT_NOT_FOUND_LIMIT = 2;
 const HEARTBEAT_RETRY_DIVISOR = 5;
 // What the platform keeps of a report's failure detail, in bytes.
 const FAILURE_DETAIL_MAX_BYTES = 500;
+// What this runner can do beyond a fix request, named to the platform in every
+// poll. A job kind is offered only to a runner that declares it, so a platform
+// release that adds one is inert against the runners that predate it.
+const CAPABILITIES = ['pr_change'];
+// The replacement call: SRE Agent decides, so the runner asks, and a route that
+// answers 404 or 5xx is tried three times over about thirty seconds (the first
+// attempt, then one after each pause) before the change is reported as not
+// having been claimed.
+const REPLACEMENT_ATTEMPTS = 3;
+let replacementRetryMs = 15_000;
+// The bounds of the replacement request (the wire contract).
+const REPLACEMENT_PATHS_MAX = 100;
+const REPLACEMENT_PATH_MAX = 300;
+const REPLACEMENT_SUMMARY_MAX = 500;
+const REPLACEMENT_ANALYSIS_MAX = 20_000;
+const PUSH_MESSAGE_MAX = 300;
 
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
@@ -879,11 +895,13 @@ async function poll(config) {
   const url = `${config.serverUrl}/api/fix-runner/queue`;
   // The poll names this runner's instance, so the platform can lease the job to
   // this instance alone; says it will beat while it holds a job, so a platform
-  // that reads heartbeats leases for minutes rather than for 45 of them; and
-  // names its version, a label the platform shows beside the instance. A GET
-  // with a body is what the wire contract says, and the length is spelled out
-  // so the body is framed whatever the platform reads it with.
-  const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}` });
+  // that reads heartbeats leases for minutes rather than for 45 of them;
+  // names its version, a label the platform shows beside the instance; and
+  // declares what it can do beyond a fix (capabilities), so a kind of job it
+  // does not know is never handed to it. A GET with a body is what the wire
+  // contract says, and the length is spelled out so the body is framed whatever
+  // the platform reads it with.
+  const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}`, capabilities: CAPABILITIES });
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
     let failure = '';
@@ -1949,11 +1967,41 @@ async function settleWorkspace(config) {
   if (closed.code !== 0) throw new Error(`the memory directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
 }
 
+async function refExists(workspace, ref) {
+  const found = await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { env: gitEnv() });
+  return found.code === 0;
+}
+
+// The pull request's head ref, which GitHub keeps for as long as the pull
+// request exists, fork or not: the commit a replacement of a fork's pull request
+// starts from, since the runner never pushes to a fork. Answers the ref it was
+// fetched to, or null when GitHub has none.
+async function fetchPullHead(workspace, token, number) {
+  const target = `refs/remotes/origin/sre-agent-pull-${number}`;
+  const fetched = await runProcess(
+    'git',
+    [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'fetch', workspace.cleanUrl, `+refs/pull/${number}/head:${target}`],
+    { env: gitAuthEnv(token), cwd: workspace.dir }
+  );
+  return fetched.code === 0 ? target : null;
+}
+
 // Step 3. Prepare the workspace. The credential reaches the calls that need it
 // through their environment (gitAuthEnv) and every URL is the clean one, so a
 // token is on no command line and never written into .git/config where a later
 // run, or the operator, would find it.
-async function prepareCheckout(config, job, repo) {
+//
+// A change on a pull request passes `options`. Push mode names the pull
+// request's branch (`headRef`): it is checked out under its own name, so the
+// commit that follows is pushed back onto it. A branch that is the default
+// branch, or that is gone, refuses the change (a ChangeRefusal); when the change
+// can still become a replacement (`replaceable`) the checkout is cut from
+// somewhere a replacement can start instead (the default branch, or the pull
+// request's own head ref), and `workspace.refusal` carries the reason the
+// replacement call is made with. Replace mode names the commit to cut from
+// (`startSha`), which is fetched from the pull request's head ref when the pull
+// request is a fork's, and is a runner error when it is not there.
+async function prepareCheckout(config, job, repo, options = {}) {
   if (!hasGithubCredential(config)) {
     throw new Error(
       'this request names a repository and the runner has no GitHub credential to reach it with: set SRE_GITHUB_TOKEN, or SRE_GITHUB_APP_ID and SRE_GITHUB_APP_PRIVATE_KEY together (a GitHub App)'
@@ -2021,12 +2069,42 @@ async function prepareCheckout(config, job, repo) {
   }
   resetGitDir(gitdir, cleanUrl);
 
-  const branch = `sre-agent/${job.handoff_id}`;
-  workspace.branch = branch;
+  let branch = `sre-agent/${job.handoff_id}`;
+  let startRef = `refs/remotes/origin/${defaultBranch}`;
   workspace.defaultBranch = defaultBranch;
+  if (options.headRef) {
+    const remoteHead = `refs/remotes/origin/${options.headRef}`;
+    let refusal = null;
+    if (options.headRef === defaultBranch) refusal = { kind: 'default_branch' };
+    else if (!(await refExists(workspace, remoteHead))) refusal = { kind: 'branch_gone' };
+    if (!refusal) {
+      branch = options.headRef;
+      startRef = remoteHead;
+    } else if (!options.replaceable) {
+      throw changeRefusal(refusal);
+    } else if (refusal.kind === 'branch_gone') {
+      // The pull request's branch was deleted (a merge that deletes its branch,
+      // a person): its head ref is still on GitHub, and it is the commit a
+      // replacement starts from.
+      startRef = await fetchPullHead(workspace, token, options.number);
+      if (!startRef) throw changeRefusal(refusal);
+      workspace.refusal = refusal;
+    } else {
+      workspace.refusal = refusal;
+    }
+  } else if (options.startSha) {
+    if (options.number) await fetchPullHead(workspace, token, options.number);
+    const present = await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, 'cat-file', '-e', `${options.startSha}^{commit}`], { env: gitEnv() });
+    if (present.code !== 0) {
+      throw new Error(`the commit ${options.startSha} this change starts from is not in ${repo.fullName}, so nothing could be made on it`);
+    }
+    startRef = options.startSha;
+    if (options.baseRef) workspace.defaultBranch = options.baseRef;
+  }
+  workspace.branch = branch;
   // -f discards whatever a previous run left behind, so one abandoned run
   // cannot put its changes into the next request's pull request.
-  await gitIn(workspace, ['checkout', '-f', '-B', branch, `refs/remotes/origin/${defaultBranch}`]);
+  await gitIn(workspace, ['checkout', '-f', '-B', branch, startRef]);
   // -x as well, twice: ignored files (a build directory, a cache, a planted
   // script) are the other half of what a request leaves for the next one, and
   // the second f takes a nested repository with it.
@@ -2730,13 +2808,13 @@ async function stageAndGate(workspace, memoryBlobs) {
 // It is handed no card key, because neither the queue's job nor the brief
 // carries one, so no key-shaped word is taken off the title here. With nothing
 // usable the handoff id is what the title names.
-function pullRequestTitle(message, handoffId) {
+function pullRequestTitle(message, handoffId, what = 'fix') {
   const line = message
     .split('\n')
     .map((candidate) => candidate.trim())
     .find((candidate) => candidate && !candidate.startsWith('<!--'));
   const cleaned = (line || '').replace(/^#+\s*/, '').replace(/^[-*]\s+/, '');
-  return runnerTitle(cleaned, `apply the requested fix (${handoffId})`);
+  return runnerTitle(cleaned, `apply the requested ${what} (${handoffId})`);
 }
 
 // A string key of the job that holds text; null, a blank string and any other
@@ -2890,24 +2968,31 @@ function pullRequestBody(message, brief, version, reason) {
   return tail ? `${text}\n\n${tail}` : `${text}\n`;
 }
 
+// The identity is set on the command rather than in the repository, because a
+// service account has no git identity of its own and "empty ident name" after
+// the agent has already done its work is exactly the failure setting the
+// identity here prevents.
+const RUNNER_IDENTITY = ['-c', 'user.name=sre-agent-fix-runner', '-c', 'user.email=sre-agent-fix-runner@users.noreply.github.com'];
+
+// What a gh call is given: the runner's own token for the repository in
+// GH_TOKEN (never an argument), the work tree's git directory so gh finds the
+// repository it is asked about, and no prompt.
+function ghEnvFor(workspace, token) {
+  return {
+    ...gitEnv(),
+    GIT_DIR: workspace.gitdir,
+    GIT_WORK_TREE: workspace.dir,
+    GH_TOKEN: token,
+    GH_PROMPT_DISABLED: '1',
+  };
+}
+
 // Step 6. Publish, and only now: the tree changed, the gate passed, and the
 // agent did not decline.
 async function publish(config, workspace, message, brief, result, title, draft) {
-  const { dir, gitdir, repo, branch, defaultBranch, cleanUrl } = workspace;
+  const { dir, repo, branch, defaultBranch, cleanUrl } = workspace;
 
-  // The identity is set on the command rather than in the repository, because
-  // a service account has no git identity of its own and "empty ident name"
-  // after the agent has already done its work is exactly the failure setting
-  // the identity here prevents.
-  await gitIn(workspace, [
-    '-c',
-    'user.name=sre-agent-fix-runner',
-    '-c',
-    'user.email=sre-agent-fix-runner@users.noreply.github.com',
-    'commit',
-    '-m',
-    title,
-  ]);
+  await gitIn(workspace, [...RUNNER_IDENTITY, 'commit', '-m', title]);
   // The push and the pull request carry the runner's credential for this
   // repository: the static token, or the installation token minted for its
   // owner (the provider re-mints it here if the cached one is near expiry).
@@ -2918,13 +3003,7 @@ async function publish(config, workspace, message, brief, result, title, draft) 
   const body = writePullRequestBody(pullRequestBody(message, brief, config.version, draft.reason));
   const bodyPath = body.file;
 
-  const ghEnv = {
-    ...gitEnv(),
-    GIT_DIR: gitdir,
-    GIT_WORK_TREE: dir,
-    GH_TOKEN: runnerToken,
-    GH_PROMPT_DISABLED: '1',
-  };
+  const ghEnv = ghEnvFor(workspace, runnerToken);
   const base = [
     'pr',
     'create',
@@ -2983,6 +3062,375 @@ async function publish(config, workspace, message, brief, result, title, draft) 
     throw new Error('gh opened the pull request but printed no URL for it');
   }
   return url;
+}
+
+// A change on a pull request (a job of kind "pr_change"). SRE Agent decides what
+// is to be changed and where; this runner makes the change with its own
+// credentials and says what became of it in the report's `change` key. It
+// either pushes one commit onto the pull request's own branch (push mode), or
+// builds the commit on a new branch and opens a pull request that replaces the
+// old one (replace mode, and a push that GitHub refuses on a change SRE Agent
+// may replace). It never opens a pull request of its own for a push, never
+// forces a push, and deletes only a branch it pushed in the same run.
+
+const HEX40 = /^[0-9a-f]{40}$/;
+const TRAILER_LINE = /^SRE-Agent-Change: \S+$/;
+
+// What a branch name may be. git's own rules, so that a name from a job can
+// never be read as an option or leave refs/heads/.
+function validRefName(name) {
+  if (typeof name !== 'string' || name.length < 1 || name.length > 255) return false;
+  if (name.startsWith('-') || name.startsWith('/') || name.endsWith('/') || name.endsWith('.')) return false;
+  if (name === '@' || name.includes('..') || name.includes('//') || name.includes('@{')) return false;
+  if (/[\p{Cc}\s~^:?*[\\]/u.test(name)) return false;
+  return !name.split('/').some((part) => part.startsWith('.') || part.endsWith('.lock'));
+}
+
+// The job's `change` object, read once into what the run needs. A job of this
+// kind without a usable one is a runner error with the reason, never a guess.
+function changeFromJob(job) {
+  const raw = job && job.change;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('the job is a pull request change but carries no change object, so there is nothing to act on');
+  }
+  if (raw.mode !== 'push' && raw.mode !== 'replace') {
+    throw new Error(`the change names the mode ${JSON.stringify(raw.mode)}; this runner knows push and replace`);
+  }
+  const repo = parseRepo(typeof raw.repo_full_name === 'string' ? raw.repo_full_name : '');
+  if (!Number.isInteger(raw.number) || raw.number < 1) throw new Error('the change names no pull request number');
+  if (!validRefName(raw.base_ref)) throw new Error('the change names no usable base_ref');
+  if (typeof raw.commit_body !== 'string' || !raw.commit_body.trim()) throw new Error('the change carries no commit_body');
+  let replacementUrl = null;
+  try {
+    replacementUrl = new URL(raw.replacement_url);
+  } catch {
+    replacementUrl = null;
+  }
+  if (!replacementUrl || !/^https?:$/.test(replacementUrl.protocol)) throw new Error('the change carries no usable replacement_url');
+
+  const change = {
+    mode: raw.mode,
+    repo,
+    number: raw.number,
+    baseRef: raw.base_ref,
+    commitBody: raw.commit_body,
+    trailer: raw.commit_body.split('\n').map((line) => line.trim()).filter((line) => TRAILER_LINE.test(line)).pop() || null,
+    replaceable: raw.replaceable === true,
+    headRef: null,
+    headSha: null,
+    startSha: null,
+    startOn: null,
+  };
+  if (raw.mode === 'push') {
+    if (!validRefName(raw.head_ref)) throw new Error('a push change names no usable head_ref');
+    change.headRef = raw.head_ref;
+    change.headSha = typeof raw.head_sha === 'string' && HEX40.test(raw.head_sha) ? raw.head_sha : null;
+  } else {
+    if (typeof raw.start_sha !== 'string' || !HEX40.test(raw.start_sha)) throw new Error('a replace change names no usable start_sha');
+    if (raw.start_on !== 'head' && raw.start_on !== 'base') throw new Error('a replace change names no usable start_on');
+    change.startSha = raw.start_sha;
+    change.startOn = raw.start_on;
+  }
+  return change;
+}
+
+// What prepareCheckout is told about the change.
+function checkoutOptions(change) {
+  if (change.mode === 'push') return { headRef: change.headRef, replaceable: change.replaceable, number: change.number };
+  return { startSha: change.startSha, number: change.number, baseRef: change.baseRef };
+}
+
+// The change's title and the agent's prose. The title is the model's valid
+// `Title:` line, else the first line of what it said, typed and cut at 72
+// characters; the job carries none of its own (a change has no pull request
+// title to set), so a `title` or `requested_title` key is not read.
+function changeTitle(job, message) {
+  const { title: proposed, body } = modelTitle(message);
+  return { title: proposed || pullRequestTitle(body, job.handoff_id, 'change'), body };
+}
+
+function changeCommitMessage(title, commitBody) {
+  return `${title}\n\n${commitBody}`;
+}
+
+class ChangeRefusal extends Error {}
+
+function changeRefusal(refusal) {
+  const error = new ChangeRefusal(`the change was refused: ${refusal.kind}`);
+  error.refusal = refusal;
+  return error;
+}
+
+// A refusal in a sentence the person who reads the card understands.
+function refusalSentence(refusal, change) {
+  const where = `${change.repo.fullName}#${change.number}`;
+  switch (refusal.kind) {
+    case 'default_branch':
+      return `${where} is on the repository's default branch, which this runner does not push to`;
+    case 'branch_gone':
+      return `the branch of ${where} does not exist on the remote`;
+    case 'not_open':
+      return `${where} is closed`;
+    case 'merged':
+      return `${where} is merged`;
+    case 'fork':
+      return `${where} comes from a fork, which this runner does not push to`;
+    case 'auto_merge_on':
+      return `${where} has auto-merge on and the change edits CI configuration, so a push could merge it before a person looked`;
+    case 'push_refused':
+      return `GitHub refused the push to ${where}${refusal.message ? `: ${refusal.message}` : ''}`;
+    case 'branch_moved':
+      return `the branch of ${where} moved while the change was being made`;
+    default:
+      return `the change to ${where} was refused (${refusal.kind})`;
+  }
+}
+
+// How a refusal is told in the report's `change` key.
+function refusalReport(refusal) {
+  if (refusal.kind === 'branch_moved') return { result: 'branch_moved', head_sha: refusal.sha };
+  if (refusal.kind === 'push_refused') return { result: 'refused', reason: 'push_refused', ...(refusal.message ? { message: refusal.message } : {}) };
+  return { result: 'refused', reason: refusal.kind };
+}
+
+// Whether the checked out head already carries this change's trailer line, which
+// is how a push the runner made before is recognised.
+async function headCarries(workspace, trailer) {
+  const message = await gitIn(workspace, ['log', '-1', '--format=%B', 'HEAD']);
+  return message.split('\n').some((line) => line.trim() === trailer);
+}
+
+async function commitChange(workspace, title, commitBody) {
+  await gitIn(workspace, [...RUNNER_IDENTITY, 'commit', '-m', changeCommitMessage(title, commitBody)]);
+  return (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
+}
+
+// git's `remote:` lines when it has them (a protected branch says why there),
+// else what it printed; on one line, redacted, at most 300 characters.
+function pushRefusalMessage(text) {
+  const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
+  const remote = lines.filter((line) => line.startsWith('remote:')).map((line) => line.replace(/^remote:\s*/, ''));
+  return oneLine(redact((remote.length > 0 ? remote : lines).join(' ')), PUSH_MESSAGE_MAX);
+}
+
+// A push of `source` to `target` in the checkout, never forced. Answers the
+// process's result, whatever it was: the callers read a refusal as an answer.
+async function pushRaw(config, workspace, source, target) {
+  const token = await runnerGitToken(config, workspace.repo);
+  return runProcess(
+    'git',
+    [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'push', workspace.cleanUrl, `${source}:${target}`],
+    { env: gitAuthEnv(token), cwd: workspace.dir }
+  );
+}
+
+// Push mode's push: the commit onto the pull request's own branch. Answers
+// {result: 'pushed', commit_sha}, or the refusal as the replacement call and the
+// report name it: {kind: 'branch_moved', sha} when somebody pushed to the branch
+// first (the remote's head is read, and the push is never forced over it),
+// {kind: 'branch_gone'} when the branch was deleted meanwhile, and otherwise
+// {kind: 'push_refused', message}.
+async function pushChange(config, workspace) {
+  const pushed = await pushRaw(config, workspace, 'HEAD', `refs/heads/${workspace.branch}`);
+  const sha = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
+  if (pushed.code === 0) return { result: 'pushed', commit_sha: sha };
+  const text = pushed.stderr || pushed.stdout;
+  if (/\[rejected\]/.test(text) && /non-fast-forward|fetch first/.test(text)) {
+    const token = await runnerGitToken(config, workspace.repo);
+    const listed = await runProcess('git', [...GIT_HARDENING, 'ls-remote', workspace.cleanUrl, `refs/heads/${workspace.branch}`], { env: gitAuthEnv(token) });
+    if (listed.code === 0) {
+      const head = (/^([0-9a-f]{40})\s/m.exec(listed.stdout) || [])[1];
+      if (!head) return { kind: 'branch_gone' };
+      if (head !== workspace.baseSha) return { kind: 'branch_moved', sha: head };
+    }
+  }
+  return { kind: 'push_refused', message: pushRefusalMessage(text) };
+}
+
+// The pull request as GitHub has it right now, which decides whether a push may
+// go onto it at all.
+async function readPullRequest(config, workspace, change) {
+  const token = await runnerGitToken(config, workspace.repo);
+  const viewed = await runProcess(
+    'gh',
+    ['pr', 'view', String(change.number), '--repo', change.repo.fullName, '--json', 'state,isCrossRepository,autoMergeRequest'],
+    { cwd: workspace.dir, env: ghEnvFor(workspace, token) }
+  );
+  let info = null;
+  try {
+    info = viewed.code === 0 ? JSON.parse(viewed.stdout) : null;
+  } catch {
+    info = null;
+  }
+  if (!info || typeof info !== 'object') {
+    throw new Error(`the pull request ${change.repo.fullName}#${change.number} could not be read: ${redact(viewed.stderr || viewed.stdout).trim() || 'gh printed nothing usable'}`);
+  }
+  return info;
+}
+
+function refusalOf(info, changed) {
+  if (info.state === 'MERGED') return { kind: 'merged' };
+  if (info.state !== 'OPEN') return { kind: 'not_open' };
+  if (info.isCrossRepository === true) return { kind: 'fork' };
+  if (info.autoMergeRequest && ciPaths(changed).length > 0) return { kind: 'auto_merge_on' };
+  return null;
+}
+
+// The replacement request of the wire contract, every field cut to its bound.
+function replacementRequest(instance, fields) {
+  const cut = (text, max) => Array.from(String(text)).slice(0, max).join('');
+  const reason = fields.reason || null;
+  return {
+    instance,
+    commit_sha: fields.commit_sha,
+    made_on: fields.made_on,
+    paths: fields.changed.slice(0, REPLACEMENT_PATHS_MAX).map((entry) => cut(entry, REPLACEMENT_PATH_MAX)),
+    summary: oneLine(fields.summary, REPLACEMENT_SUMMARY_MAX),
+    analysis: cut(fields.analysis, REPLACEMENT_ANALYSIS_MAX),
+    reason: reason
+      ? {
+          kind: reason.kind,
+          ...(reason.kind === 'branch_moved' ? { sha: reason.sha } : {}),
+          ...(reason.kind === 'push_refused' ? { message: cut(reason.message || '', PUSH_MESSAGE_MAX) } : {}),
+        }
+      : null,
+  };
+}
+
+// SRE Agent's answer to the replacement call, read for what the runner will act
+// on: a replace answer is checked field by field (the branch name goes into a
+// refspec and a command line, and the pull request closed is the change's own),
+// and one that fails the check is no answer.
+function readDecision(text, change) {
+  let answer = null;
+  try {
+    answer = JSON.parse(text);
+  } catch {
+    answer = null;
+  }
+  if (!answer || typeof answer !== 'object') return { detail: 'the answer is not JSON' };
+  if (answer.decision === 'report') return { answer };
+  if (answer.decision === 'stopped') return { answer };
+  if (answer.decision !== 'replace') return { detail: `the answer names the decision ${JSON.stringify(answer.decision)}` };
+  if (!validRefName(answer.branch)) return { detail: 'the replace answer names no usable branch' };
+  if (!validRefName(answer.base_ref)) return { detail: 'the replace answer names no usable base_ref' };
+  if (typeof answer.start_sha !== 'string' || !HEX40.test(answer.start_sha)) return { detail: 'the replace answer names no usable start_sha' };
+  if (answer.number !== change.number) return { detail: `the replace answer names pull request ${answer.number}, not the change's ${change.number}` };
+  if (typeof answer.closing !== 'boolean' || typeof answer.draft !== 'boolean') return { detail: 'the replace answer does not say whether to close and whether to draft' };
+  if (typeof answer.title !== 'string' || answer.title.length === 0 || typeof answer.body !== 'string') return { detail: 'the replace answer carries no usable title and body' };
+  return { answer };
+}
+
+// POST the replacement route with the handoff token. Answers the parsed
+// decision ({decision: 'replace' | 'report' | 'stopped', ...}), or
+// {decision: 'unreachable', detail} when no answer could be had: the route not
+// found or failing three times over about thirty seconds, a request SRE Agent
+// calls malformed, or an answer that cannot be acted on. A 409 means the job is
+// no longer this machine's and answers stopped. `signal` ends the wait when the
+// job is taken from this runner.
+async function askReplacement(config, job, body, signal = null) {
+  const change = job.change;
+  const payload = JSON.stringify(body);
+  let failure = 'no response';
+  for (let attempt = 1; attempt <= REPLACEMENT_ATTEMPTS; attempt += 1) {
+    stillHeld(signal);
+    let response = null;
+    try {
+      response = await httpRequest(change.replacement_url, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${job.token}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: payload,
+      });
+    } catch (error) {
+      failure = error.message;
+    }
+    if (response) {
+      if (response.status === 200) {
+        const read = readDecision(response.body, change);
+        return read.answer || { decision: 'unreachable', detail: read.detail };
+      }
+      if (response.status === 409) return { decision: 'stopped', conflict: true };
+      if (response.status === 422) return { decision: 'unreachable', detail: 'SRE Agent answered the replacement request with HTTP 422, as malformed' };
+      failure = `HTTP ${response.status}`;
+      if (response.status !== 404 && response.status < 500) return { decision: 'unreachable', detail: `SRE Agent answered the replacement request with ${failure}` };
+    }
+    if (attempt < REPLACEMENT_ATTEMPTS) await sleep(replacementRetryMs);
+  }
+  return { decision: 'unreachable', detail: `SRE Agent did not answer the replacement request (${failure}) after ${REPLACEMENT_ATTEMPTS} attempts` };
+}
+
+// The end of a change run, once the agent's work has passed the gate: the work
+// is committed, and what became of it is settled the way the mode says and
+// recorded in result.change. A push lands on the pull request's own branch. A
+// refusal (GitHub's state of the pull request, or a push GitHub turns away) is
+// reported as it is, unless SRE Agent may replace the pull request, in which
+// case it is asked first and its decision followed. Replace mode always asks.
+async function finishChange(config, job, change, workspace, run, result) {
+  const { message, changed, signal } = run;
+  const { title, body: prose } = changeTitle(job, message);
+  const where = `${change.repo.fullName}#${change.number}`;
+  const madeOn = workspace.baseSha;
+  stillHeld(signal);
+  const sha = await commitChange(workspace, title, change.commitBody);
+  result.actions.push(`committed ${sha.slice(0, 12)} on ${workspace.branch}: ${title}`);
+  if (change.headSha && change.headSha !== madeOn) {
+    result.summary = `${result.summary}\n\nThe branch had moved since the change was asked (it was at ${change.headSha.slice(0, 12)}), so the change was made on ${madeOn.slice(0, 12)}.`;
+  }
+
+  let refusal = workspace.refusal || null;
+  if (change.mode === 'push' && !refusal) {
+    refusal = refusalOf(await readPullRequest(config, workspace, change), changed);
+    if (!refusal) {
+      stillHeld(signal);
+      const pushed = await pushChange(config, workspace);
+      if (pushed.result === 'pushed') {
+        result.change = pushed;
+        result.actions.push(`pushed ${sha.slice(0, 12)} to ${workspace.branch} of ${change.repo.fullName}`);
+        result.summary = `${result.summary}\n\nThis change was pushed onto ${where}. Nothing has verified it in a running system.`;
+        log('info', `pushed ${sha.slice(0, 12)} onto ${where} for handoff ${job.handoff_id}`);
+        return;
+      }
+      refusal = pushed;
+    }
+  }
+
+  const refuse = () => {
+    result.change = refusalReport(refusal);
+    result.summary = `${result.summary}\n\nNothing was pushed: ${refusalSentence(refusal, change)}.`;
+    result.actions.push(`did not push: ${refusal.kind}`);
+    log('info', `handoff ${job.handoff_id} pushed nothing: ${refusal.kind}`);
+  };
+  if (refusal && !change.replaceable) {
+    refuse();
+    return;
+  }
+
+  stillHeld(signal);
+  const answer = await askReplacement(
+    config,
+    job,
+    replacementRequest(config.instance, { commit_sha: sha, made_on: madeOn, changed, summary: prose, analysis: prose, reason: refusal }),
+    signal
+  );
+  if (answer.decision === 'stopped') {
+    result.ended = answer.conflict ? 'the handoff is no longer this runner\'s' : 'the change was ended';
+    return;
+  }
+  if (answer.decision === 'replace') {
+    throw new Error('this build of the runner cannot yet carry out a replacement');
+  }
+  if (refusal) {
+    refuse();
+    return;
+  }
+  const detail = answer.detail || 'SRE Agent decided no replacement';
+  result.change = { result: 'replace_failed', stage: 'claim', message: oneLine(redact(detail), PUSH_MESSAGE_MAX) };
+  result.summary = `${result.summary}\n\nNothing was pushed and no pull request was opened: ${detail}.`;
+  result.actions.push('the replacement was not claimed, so nothing was pushed or opened');
 }
 
 // The report's two optional keys (the wire contract). An older platform reads
@@ -3052,6 +3500,7 @@ async function report(job, result) {
     actions: result.actions,
     evidence: result.evidence,
     ...(result.pr_url ? { pr_url: result.pr_url } : {}),
+    ...(result.change ? { change: result.change } : {}),
     ...(result.failure ? { failure: result.failure } : {}),
     ...memoryReport(result),
     ...testReport(result),
@@ -3423,10 +3872,12 @@ async function handleJob(config, job, options = {}) {
   }
 
   jobSecret = job.token;
-  log('info', job.test === true ? 'collected a test job' : 'collected a fix request', {
+  const isChange = job.kind === 'pr_change';
+  const named = isChange && job.change && typeof job.change.repo_full_name === 'string' ? job.change.repo_full_name : null;
+  log('info', job.test === true ? 'collected a test job' : isChange ? 'collected a pull request change' : 'collected a fix request', {
     handoff_id: job.handoff_id,
     subject_id: job.subject_id || null,
-    repo_full_name: job.repo_full_name || null,
+    repo_full_name: job.repo_full_name || named || null,
   });
 
   if (job.test === true) return runTestJob(config, job, heartbeat);
@@ -3436,14 +3887,16 @@ async function handleJob(config, job, options = {}) {
   // run's cleanup: null outside a pool, and a busy object when another
   // instance holds the repository's lock past the bound.
   let lease = null;
+  let change = null;
 
   try {
     stillHeld(signal);
+    change = isChange ? changeFromJob(job) : null;
     const brief = await fetchBrief(job);
     result.actions.push('fetched the brief');
     log('info', `fetched the brief for handoff ${job.handoff_id}`, { bytes: Buffer.byteLength(brief) });
 
-    const repo = job.repo_full_name ? parseRepo(job.repo_full_name) : null;
+    const repo = change ? change.repo : job.repo_full_name ? parseRepo(job.repo_full_name) : null;
     lease = await acquireRepoLease(config, repo);
     stillHeld(signal);
     if (lease && lease.busy) {
@@ -3457,8 +3910,21 @@ async function handleJob(config, job, options = {}) {
       recordFailure(result, 'busy_repository', `${subject} is being worked on by another runner instance (${lease.busy.instance || 'unknown'})`);
       return result;
     }
-    const workspace = repo ? await prepareCheckout(config, job, repo) : prepareScratch(config);
-    if (repo) {
+    const workspace = repo ? await prepareCheckout(config, job, repo, change ? checkoutOptions(change) : {}) : prepareScratch(config);
+    if (change) {
+      result.evidence.repository = repo.fullName;
+      result.evidence.branch = workspace.branch;
+      result.evidence.pull_request = `${repo.fullName}#${change.number}`;
+      result.evidence.change_mode = change.mode;
+      result.evidence.made_on = workspace.baseSha;
+      result.actions.push(`checked out ${repo.fullName} at ${workspace.baseSha.slice(0, 12)} on ${workspace.branch}, to change ${repo.fullName}#${change.number}`);
+      if (change.mode === 'push' && change.trailer && !workspace.refusal && (await headCarries(workspace, change.trailer))) {
+        result.change = { result: 'pushed', commit_sha: workspace.baseSha };
+        result.summary = `This change is already on ${repo.fullName}#${change.number}: the branch's head ${workspace.baseSha.slice(0, 12)} carries ${change.trailer}, so nothing was run and nothing was pushed again.`;
+        result.actions.push('the branch head already carries this change, so nothing was run or pushed');
+        return result;
+      }
+    } else if (repo) {
       result.evidence.repository = repo.fullName;
       result.evidence.branch = workspace.branch;
       result.actions.push(`checked out ${repo.fullName} at ${workspace.defaultBranch} on ${workspace.branch}`);
@@ -3629,6 +4095,11 @@ async function handleJob(config, job, options = {}) {
       return result;
     }
 
+    if (change) {
+      await finishChange(config, job, change, workspace, { message: agent.finalMessage, changed, signal }, result);
+      return result;
+    }
+
     const { title, body: prose } = resolveTitle(job, agent.finalMessage, path.basename(workspace.branch));
     // The last point before anything leaves this machine. Past it the push and
     // the pull request run to their end: a pull request opened after the job was
@@ -3644,7 +4115,12 @@ async function handleJob(config, job, options = {}) {
     result.summary = `${result.summary}\n\nThis is an unmerged pull request, ${result.pr_url}. Nothing has verified the change in a running system.`;
     log('info', `opened ${result.pr_url} for handoff ${job.handoff_id}`);
   } catch (error) {
-    if (!error.takenOver) {
+    if (error.refusal) {
+      result.change = refusalReport(error.refusal);
+      result.summary = `Nothing was pushed: ${refusalSentence(error.refusal, change)}.`;
+      result.actions.push(`refused: ${error.refusal.kind}`);
+      log('info', `handoff ${job.handoff_id} was refused: ${error.refusal.kind}`);
+    } else if (!error.takenOver) {
       result.summary = `The runner could not complete this request: ${redact(error.message)}`;
       result.evidence.error = redact(error.message);
       recordFailure(result, 'runner_error', error.message);
@@ -3664,6 +4140,9 @@ async function handleJob(config, job, options = {}) {
       heartbeat.stop();
       const opened = result.pr_url ? `, though ${result.pr_url} was opened before it was` : '';
       log('warn', `handoff ${job.handoff_id} was taken from this runner (${signal.reason}), so it is not reported${opened}`);
+    } else if (result.ended) {
+      heartbeat.stop();
+      log('info', `handoff ${job.handoff_id} was ended by SRE Agent (${result.ended}), so it is not reported`);
     } else {
       heartbeat.reporting();
       try {
@@ -3863,6 +4342,15 @@ module.exports = {
     setGithubApiBase: (value) => {
       githubApiBase = value;
     },
+    // The pause between the replacement call's attempts, for the tests.
+    setReplacementRetryMs: (value) => {
+      replacementRetryMs = value;
+    },
+    changeFromJob,
+    changeTitle,
+    changeCommitMessage,
+    askReplacement,
+    replacementRequest,
   },
 };
 

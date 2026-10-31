@@ -295,6 +295,22 @@ case "$mode" in
     printf 'a line the fix added\n' >> README.md
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
+  fix_moves)
+    # The fix, while somebody else pushes to the pull request's branch: the
+    # remote branch named in STUB_BRANCH gains a commit before this run ends, so
+    # the runner's push is a non-fast-forward.
+    printf 'a line the fix added\n' >> README.md
+    git="${STUB_PROBE_GIT:?}"
+    mover="$(mktemp -d)"
+    "$git" clone -q "${STUB_REMOTE:?}" "$mover/clone"
+    "$git" -C "$mover/clone" checkout -q "${STUB_BRANCH:?}"
+    printf 'a colleague was here\n' > "$mover/clone/colleague.txt"
+    "$git" -C "$mover/clone" add colleague.txt
+    "$git" -C "$mover/clone" -c user.name=colleague -c user.email=colleague@example.invalid -c commit.gpgsign=false commit -q -m "a colleague's commit"
+    "$git" -C "$mover/clone" push -q origin "${STUB_BRANCH}"
+    rm -rf "$mover"
+    emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
+    ;;
   ci)
     # A fix that also changes CI configuration the repository's CI system reads.
     printf 'a line the fix added\n' >> README.md

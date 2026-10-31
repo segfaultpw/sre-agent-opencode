@@ -30,6 +30,10 @@
 //                          heartbeat route answers), or another status such
 //                          as 503 (default: continue). Each beat's
 //                          answer is in its log entry, as `answer`.
+//   FIXTURE_REPLACEMENT_FILE  a JSON array of {status, body} answers to the
+//                          replacement call (POST /api/handoffs/<id>/replacement),
+//                          in order, the last one repeating; without it the call
+//                          is answered 404 like any route the fixture does not know
 //   FIXTURE_BRIEF_DELAY_MS  how long to hold the brief's answer
 //   FIXTURE_REPORT_DELAY_MS how long to hold the report's answer; the moment it
 //                          is sent is logged as its own entry, `answered_at`
@@ -57,6 +61,7 @@ const reportDelayMs = Number.parseInt(process.env.FIXTURE_REPORT_DELAY_MS || '0'
 let queueCalls = 0;
 let queueServed = false;
 let heartbeatCalls = 0;
+let replacementCalls = 0;
 
 function record(entry) {
   fs.appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
@@ -154,6 +159,14 @@ const server = http.createServer((request, response) => {
       } else {
         send(response, Number.parseInt(answer, 10), 'application/json', JSON.stringify({ error: 'fixture' }));
       }
+      return;
+    }
+
+    if (request.method === 'POST' && url.pathname.endsWith('/replacement') && process.env.FIXTURE_REPLACEMENT_FILE) {
+      const answers = JSON.parse(fs.readFileSync(process.env.FIXTURE_REPLACEMENT_FILE, 'utf8'));
+      const answer = answers[Math.min(replacementCalls, answers.length - 1)];
+      replacementCalls += 1;
+      send(response, answer.status, 'application/json', JSON.stringify(answer.body));
       return;
     }
 
