@@ -3083,6 +3083,27 @@ run_once change_before_asked
 if jq -e '.change.result == "pushed" and .change.commit_sha != "'"$sha_before"'"' <<<"$report" >/dev/null && [ "$(remote_git rev-parse "$(head_of feature/before-asked)^")" = "$sha_asked" ] && ! no_agent_ran; then echo "ok   the older trailer is ignored: the agent runs and a new commit lands on the asked head"; else echo "FAIL report: $report"; fail=1; fi
 stop_fixture
 
+echo "--- 115. a change the replacement call cannot carry (more than 100 files, or a path over 255 characters) is never cut: the call is not made and nothing is pushed or opened ---"
+fork_sha="$(fork_head fork-tmp-bounds)"
+for spec in "many_files:STUB_FILE_COUNT=100:through" "many_files:STUB_FILE_COUNT=101:ended" "long_path:STUB_PATH_LEN=255:through" "long_path:STUB_PATH_LEN=256:ended"; do
+  mode="${spec%%:*}"; rest="${spec#*:}"; knob="${rest%%:*}"; outcome="${rest#*:}"
+  answers '[{"status": 200, "body": {"decision": "report"}}]'
+  start_fixture "replace_bounds"
+  queue_change "h-replace-bounds" "$(replace_change "$fork_sha")"
+  export STUB_OPENCODE_MODE="$mode" "$knob"
+  run_once "replace_bounds"
+  export STUB_OPENCODE_MODE=fix
+  unset "${knob%%=*}"
+  call="$(jq -c 'select(.path | endswith("/replacement")) | .body' "$fixture_log" | head -n 1)"
+  if [ "$outcome" = through ]; then
+    if [ "$(count_path /replacement)" -eq 1 ] && jq -e --argjson n "$([ "$mode" = many_files ] && echo 100 || echo 1)" '(.paths | length) == $n and all(.paths[]; (explode | length) <= 255)' <<<"$call" >/dev/null; then echo "ok   $knob: the replacement call is made with every path, unchanged"; else echo "FAIL $knob: calls=$(count_path /replacement) call: $(cut -c1-200 <<<"$call")"; fail=1; fi
+  else
+    if [ "$(count_path /replacement)" -eq 0 ] && jq -e '.change.result == "replace_failed" and .change.stage == "claim" and (.change.message | contains("cannot be replaced from here")) and (has("pr_url") | not)' <<<"$report" >/dev/null && no_push && [ ! -s "$gh_log" ]; then echo "ok   $knob: no call, replace_failed at the claim with a plain message, nothing pushed, closed or opened"; else echo "FAIL $knob: calls=$(count_path /replacement) report: $(cut -c1-400 <<<"$report")"; fail=1; fi
+  fi
+  stop_fixture
+done
+remote_git update-ref -d refs/pull/7/head
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

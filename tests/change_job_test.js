@@ -254,24 +254,36 @@ async function main() {
     }
   });
 
-  await check('the replacement request body is bounded: at most 100 paths of 300 characters, a 500 summary, a 20,000 analysis, a 300 push message', () => {
-    const body = internals.replacementRequest(
-      'alpha',
-      {
-        commit_sha: SHA,
-        made_on: SHA,
-        changed: Array.from({ length: 150 }, (_, index) => `${'p'.repeat(400)}${index}`),
-        summary: 's'.repeat(900),
-        analysis: 'a'.repeat(30000),
-        reason: { kind: 'push_refused', message: 'm'.repeat(900) },
-      }
-    );
-    assert.equal(body.paths.length, 100);
-    assert.ok(body.paths.every((entry) => Array.from(entry).length <= 300));
+  await check('the replacement request cuts its free text to the bounds and carries every path unchanged, at most 100 of at most 255 characters', () => {
+    const paths = Array.from({ length: 100 }, (_, index) => `${'p'.repeat(250)}${String(index).padStart(5, '0')}`);
+    assert.ok(paths.every((entry) => Array.from(entry).length === 255));
+    const body = internals.replacementRequest('alpha', {
+      commit_sha: SHA,
+      made_on: SHA,
+      changed: paths,
+      summary: 's'.repeat(900),
+      analysis: 'a'.repeat(30000),
+      reason: { kind: 'push_refused', message: 'm'.repeat(900) },
+    });
+    assert.deepEqual(body.paths, paths);
     assert.ok(Array.from(body.summary).length <= 500);
     assert.ok(Array.from(body.analysis).length <= 20000);
     assert.ok(Array.from(body.reason.message).length <= 300);
     assert.equal(body.instance, 'alpha');
+  });
+
+  await check('a path list over 100 entries, or with a path over 255 characters (code points), does not fit and is never cut', () => {
+    const fits = (changed) => internals.replacementPathsFit(changed);
+    assert.equal(fits(Array.from({ length: 100 }, (_, index) => `f${index}`)), true);
+    assert.equal(fits(Array.from({ length: 101 }, (_, index) => `f${index}`)), false);
+    assert.equal(fits(['p'.repeat(255)]), true);
+    assert.equal(fits(['p'.repeat(256)]), false);
+    assert.equal(fits(['\u00e9'.repeat(255)]), true);
+    assert.equal(fits(['\u{1F600}'.repeat(255)]), true);
+    assert.equal(fits(['\u{1F600}'.repeat(256)]), false);
+    const request = (changed) => internals.replacementRequest('alpha', { commit_sha: SHA, made_on: SHA, changed, summary: 's', analysis: 'a', reason: null });
+    assert.throws(() => request(Array.from({ length: 101 }, (_, index) => `f${index}`)), /more paths/);
+    assert.throws(() => request(['p'.repeat(256)]), /more paths/);
   });
 
   await check('the pull request gh prints is taken from its last URL line and must be a pull request of the change\'s own repository', () => {

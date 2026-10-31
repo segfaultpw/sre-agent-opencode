@@ -72,7 +72,7 @@ const REPLACEMENT_ATTEMPTS = 3;
 let replacementRetryMs = 15_000;
 // The bounds of the replacement request (the wire contract).
 const REPLACEMENT_PATHS_MAX = 100;
-const REPLACEMENT_PATH_MAX = 300;
+const REPLACEMENT_PATH_MAX = 255;
 const REPLACEMENT_SUMMARY_MAX = 500;
 const REPLACEMENT_ANALYSIS_MAX = 20_000;
 const CHANGE_MESSAGE_MAX = 300;
@@ -3316,15 +3316,25 @@ function refusalOf(info, changed, change) {
   return null;
 }
 
-// The replacement request of the wire contract, every field cut to its bound.
+// Whether every path the change touches fits the replacement request. SRE Agent
+// checks the write fence and the base comparison over the paths it is sent, so a
+// list that is cut would let it judge less than the commit holds: it is never cut,
+// and a change that does not fit is not asked for.
+function replacementPathsFit(changed) {
+  return changed.length <= REPLACEMENT_PATHS_MAX && changed.every((entry) => Array.from(entry).length <= REPLACEMENT_PATH_MAX);
+}
+
+// The replacement request of the wire contract. The free text is cut to its
+// bound; the paths never are (replacementPathsFit decides before this is built).
 function replacementRequest(instance, fields) {
   const cut = (text, max) => Array.from(String(text)).slice(0, max).join('');
   const reason = fields.reason || null;
+  if (!replacementPathsFit(fields.changed)) throw new Error('the change touches more paths than a replacement request carries');
   return {
     instance,
     commit_sha: fields.commit_sha,
     made_on: fields.made_on,
-    paths: fields.changed.slice(0, REPLACEMENT_PATHS_MAX).map((entry) => cut(entry, REPLACEMENT_PATH_MAX)),
+    paths: fields.changed,
     summary: oneLine(fields.summary, REPLACEMENT_SUMMARY_MAX),
     analysis: cut(fields.analysis, REPLACEMENT_ANALYSIS_MAX),
     reason: reason
@@ -3621,6 +3631,15 @@ async function finishChange(config, job, change, workspace, run, result) {
   };
   if (refusal && !change.replaceable) {
     refuse();
+    return;
+  }
+
+  if (!replacementPathsFit(changed)) {
+    const message = `the change touches more than ${REPLACEMENT_PATHS_MAX} files or a path longer than ${REPLACEMENT_PATH_MAX} characters, so it cannot be replaced from here`;
+    result.change = { result: 'replace_failed', stage: 'claim', message };
+    result.summary = `${result.summary}\n\nNothing was pushed and no pull request was opened: ${message}.`;
+    result.actions.push('the change is too large to ask for a replacement, so nothing was pushed or opened');
+    log('info', `handoff ${job.handoff_id}: ${message}`);
     return;
   }
 
@@ -4578,6 +4597,7 @@ module.exports = {
     createdPullRequest,
     listedPullRequest,
     pushRefusalMessage,
+    replacementPathsFit,
     changeTitle,
     changeCommitMessage,
     askReplacement,

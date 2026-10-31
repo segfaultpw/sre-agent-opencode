@@ -295,6 +295,20 @@ case "$mode" in
     printf 'a line the fix added\n' >> README.md
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
+  many_files)
+    # STUB_FILE_COUNT new files, so a change can touch exactly as many files as a case needs.
+    mkdir -p many
+    for number in $(seq 1 "${STUB_FILE_COUNT:?}"); do printf 'x\n' > "many/file-$number.txt"; done
+    emit "Added ${STUB_FILE_COUNT} files under many/. Ran bash test.sh and it passed."
+    ;;
+  long_path)
+    # One new file whose path is exactly STUB_PATH_LEN characters.
+    length="${STUB_PATH_LEN:?}"
+    name="$(head -c "$((length - 5))" /dev/zero | tr '\0' 'n')"
+    mkdir -p long
+    printf 'x\n' > "long/$name"
+    emit "Added a file under long/. Ran bash test.sh and it passed."
+    ;;
   fix_moves)
     # The fix, while somebody else pushes to the pull request's branch: the
     # remote branch named in STUB_BRANCH gains a commit before this run ends, so
