@@ -147,6 +147,7 @@ fi
 # lines a protected branch gives (the control file holds the refspec pattern).
 if [ "\$sub" = push ]; then
   if [ -e "$work/ctl/take_on_push" ]; then touch "\$(cat "$work/ctl/take_on_push")"; sleep 3; fi
+  if [ -s "$work/ctl/silent_push_fail" ] && printf '%s' "\$*" | grep -qE -- "\$(cat "$work/ctl/silent_push_fail")"; then exit 1; fi
   if [ -s "$work/ctl/reject_push" ] && printf '%s' "\$*" | grep -qE -- "\$(cat "$work/ctl/reject_push")"; then
     printf 'remote: error: GH006: Protected branch update failed for refs/heads/x.\nremote: error: Required status checks are expected.\n! [remote rejected] HEAD -> x (protected branch hook declined)\nerror: failed to push some refs\n' >&2
     exit 1
@@ -203,22 +204,27 @@ env | cut -d= -f1 | grep -E '^(SRE_API|SRE_MODEL|AWS_|ECS_|OPENROUTER|ANTHROPIC)
 # GitHub refuses, and a close that takes long enough for a heartbeat to land.
 case "\${1:-} \${2:-}" in
   "pr view")
-    if [ -s "$work/ctl/pr_view" ]; then cat "$work/ctl/pr_view"; else printf '{"state":"OPEN","isCrossRepository":false,"autoMergeRequest":null}\n'; fi
+    # The pull request's head branch is the one the queued change job names, unless the control file says otherwise.
+    head_ref="\$(jq -r '.[0].change.head_ref // empty' "$queue_file" 2>/dev/null || true)"
+    if [ -s "$work/ctl/pr_view" ]; then jq -c --arg h "\$head_ref" '{headRefName: \$h} + .' "$work/ctl/pr_view"; else jq -nc --arg h "\$head_ref" '{state: "OPEN", isCrossRepository: false, autoMergeRequest: null, headRefName: \$h}'; fi
     exit 0 ;;
   "pr list")
     if [ -s "$work/ctl/pr_list" ]; then cat "$work/ctl/pr_list"; else printf '[]\n'; fi
     exit 0 ;;
   "pr close")
     if [ -e "$work/ctl/take_on_close" ]; then touch "\$(cat "$work/ctl/take_on_close")"; sleep 3; fi
+    if [ -e "$work/ctl/break_tmp" ]; then mv "\$(cat "$work/ctl/break_tmp")" "\$(cat "$work/ctl/break_tmp").moved"; : > "\$(cat "$work/ctl/break_tmp")"; fi
     if [ -e "$work/ctl/fail_close" ]; then echo 'GraphQL: Resource not accessible by personal access token (closePullRequest)' >&2; exit 1; fi
     exit 0 ;;
 esac
+all_args=" \$* "
 body=""
 while [ \$# -gt 0 ]; do
   if [ "\$1" = "--body-file" ]; then body="\$2"; fi
   shift
 done
 if [ -n "\$body" ]; then cp "\$body" "$gh_body"; fi
+if [ -e "$work/ctl/fail_draft" ] && [[ "\$all_args" == *" --draft "* ]]; then echo 'Draft pull requests are not supported in this repository.' >&2; exit 1; fi
 if [ -e "$work/ctl/create_exists" ]; then
   printf 'a pull request for branch "x" into branch "main" already exists:\nhttps://github.com/acme/app/pull/12\n' >&2
   exit 1
@@ -2521,7 +2527,7 @@ if [ "$head1" != "$sha0" ] && [ "$(remote_git rev-list --count "$sha0..$head1")"
 message="$(remote_git log -1 --format=%B "$head1")"
 if [ "$(remote_git log -1 --format=%s "$head1")" = "fix: Raised the connection pool ceiling in README.md so the service" ] && grep -qxF "Asked for by Jane on acme/app#7." <<<"$message" && [ "$(sed '/^$/d' <<<"$message" | tail -n 1)" = "$change_trailer" ]; then echo "ok   the commit is the conventional title, a blank line and the job's commit_body, which ends with the change trailer"; else echo "FAIL commit message: $message"; fail=1; fi
 if [ "$(remote_git show "$head1:README.md" | tail -n 1)" = "a line the fix added" ]; then echo "ok   the agent's edit is in the pushed commit"; else echo "FAIL README.md: $(remote_git show "$head1:README.md" | tail -n 2)"; fail=1; fi
-if ! grep -qE 'pr (create|close|merge)' "$gh_log" && grep -qxF "pr view 7 --repo acme/app --json state,isCrossRepository,autoMergeRequest" "$gh_log"; then echo "ok   no pull request is opened or closed; the runner only reads the pull request's state"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if ! grep -qE 'pr (create|close|merge)' "$gh_log" && grep -qxF "pr view 7 --repo acme/app --json state,isCrossRepository,autoMergeRequest,headRefName" "$gh_log"; then echo "ok   no pull request is opened or closed; the runner only reads the pull request's state"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
 if grep -qF "push https://github.com/acme/app.git HEAD:refs/heads/feature/lb" "$git_log" && ! grep -qE 'push.*( --force| -f |\+| --delete)' "$git_log"; then echo "ok   the push names the pull request's branch and is never forced"; else echo "FAIL git pushes: $(grep ' push ' "$git_log")"; fail=1; fi
 if grep -qF "user.name=sre-agent-fix-runner" "$git_log"; then echo "ok   the commit carries the runner's identity"; else echo "FAIL git calls: $(cat "$git_log")"; fail=1; fi
 if ! branch_exists sre-agent/h-change-push; then echo "ok   no branch of the runner's own reaches the repository"; else echo "FAIL sre-agent/h-change-push exists"; fail=1; fi
@@ -2822,13 +2828,13 @@ stop_fixture
 echo "--- 96. a pull request GitHub already has for the branch is reported replaced with that one ---"
 branch_f="sre-agent/manual_request-exists"
 touch "$work/ctl/create_exists"
-printf '%s\n' '[{"number":12,"url":"https://github.com/acme/app/pull/12"}]' > "$work/ctl/pr_list"
+printf '%s\n' '[{"number":3,"url":"https://github.com/acme/app/pull/3","isCrossRepository":true},{"number":12,"url":"https://github.com/acme/app/pull/12","isCrossRepository":false}]' > "$work/ctl/pr_list"
 replace_answer "$branch_f" "$fork_sha" true false
 start_fixture replace_exists
 queue_change h-replace-exists "$(replace_change "$fork_sha")"
 run_once replace_exists
 rm -f "$work/ctl/create_exists" "$work/ctl/pr_list"
-if jq -e '.change == {result: "replaced", pr_url: "https://github.com/acme/app/pull/12", pr_number: 12}' <<<"$report" >/dev/null && grep -qF -- "pr list --repo acme/app --head $branch_f --json number,url" "$gh_log"; then echo "ok   the pull request found for the head branch is the one reported"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+if jq -e '.change == {result: "replaced", pr_url: "https://github.com/acme/app/pull/12", pr_number: 12}' <<<"$report" >/dev/null && grep -qF -- "pr list --repo acme/app --head $branch_f --json number,url,isCrossRepository" "$gh_log"; then echo "ok   the pull request found for the head branch is the first one with its head in the repository, not a fork's of the same branch name"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
 stop_fixture
 
 echo "--- 97. any other refusal to open reports replace_failed open and keeps the branch ---"
@@ -2861,7 +2867,7 @@ queue_change h-replace-taken-close "$(replace_change "$fork_sha")"
 run_once replace_taken_close
 rm -f "$work/ctl/take_on_push"
 unset FIXTURE_HEARTBEAT_SECONDS FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE
-if [ "$rc" -eq 0 ] && ! grep -qE 'pr (close|create)' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-close was taken from this runner (taken_over), so it is not reported' "$out"; then echo "ok   nothing was closed or opened, nothing is reported, and the log says why"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
+if [ "$rc" -eq 0 ] && ! grep -qE 'pr (close|create)' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-close was taken from this runner (taken_over), so it is not reported' "$out" && ! branch_exists "$branch_h"; then echo "ok   nothing was closed or opened, the branch this run pushed is deleted again, nothing is reported, and the log says why"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 99b. a heartbeat answered taken_over between the close and the open stops the run before the open ---"
@@ -2875,7 +2881,7 @@ queue_change h-replace-taken-open "$(replace_change "$fork_sha")"
 run_once replace_taken_open
 rm -f "$work/ctl/take_on_close"
 unset FIXTURE_HEARTBEAT_SECONDS FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE
-if [ "$rc" -eq 0 ] && ! grep -qF 'pr create' "$gh_log" && grep -qF 'pr close 7 --repo acme/app' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-open was taken from this runner (taken_over), so it is not reported' "$out"; then echo "ok   no pull request is opened after the answer, and nothing is reported"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
+if [ "$rc" -eq 0 ] && ! grep -qF 'pr create' "$gh_log" && grep -qF 'pr close 7 --repo acme/app' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-open was taken from this runner (taken_over), so it is not reported' "$out" && branch_exists "$branch_i"; then echo "ok   no pull request is opened after the answer, nothing is reported, and the branch stays because the old pull request is already closed"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 100. closing false opens without closing, and draft true opens a draft ---"
@@ -2885,6 +2891,158 @@ start_fixture replace_noclose
 queue_change h-replace-noclose "$(replace_change "$fork_sha")"
 run_once replace_noclose
 if jq -e '.change.result == "replaced"' <<<"$report" >/dev/null && ! grep -qF 'pr close' "$gh_log" && grep -qF -- "--head $branch_j --base main --title fix: raise the connection pool ceiling --body-file" "$gh_log" && grep -qF -- '--draft' "$gh_log"; then echo "ok   no close is attempted for a merged pull request, and the draft the answer asks for is a draft"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/pull/7/head
+
+echo "--- 101. a replace answer may name only a branch of SRE Agent's own that is not on the remote, and the change's own base ---"
+fork_sha="$(fork_head fork-tmp-h1)"
+colleague_sha="$(make_branch sre-agent/colleague-work)"
+main_before="$(head_of main)"
+for spec in "main:main" "feature/other:main" "sre-agent/colleague-work:main" "sre-agent/h1-fresh:release-y"; do
+  named="${spec%%:*}"; base="${spec#*:}"
+  replace_answer "$named" "$fork_sha" true false "$base"
+  start_fixture "replace_h1"
+  queue_change "h-replace-h1" "$(replace_change "$fork_sha")"
+  run_once "replace_h1"
+  if jq -e '.change.result == "replace_failed" and .change.stage == "branch" and (.change.message | length > 0)' <<<"$report" >/dev/null && no_push && [ ! -s "$gh_log" ] && [ "$(head_of main)" = "$main_before" ] && [ "$(head_of sre-agent/colleague-work)" = "$colleague_sha" ] && ! branch_exists sre-agent/h1-fresh; then echo "ok   branch $named with base $base: replace_failed at the branch step, nothing pushed, nothing closed, nothing opened"; else echo "FAIL $named/$base: report: $report git: $(grep ' push ' "$git_log") gh: $(cat "$gh_log")"; fail=1; fi
+  stop_fixture
+done
+own="$(make_branch sre-agent/own-head)"
+printf '%s\n' '{"state":"CLOSED","isCrossRepository":false,"autoMergeRequest":null}' > "$work/ctl/pr_view"
+replace_answer sre-agent/own-head "$own" true false
+start_fixture replace_h1_own
+queue_change h-replace-h1-own "$(push_change sre-agent/own-head "$own" '{"replaceable": true}')"
+run_once replace_h1_own
+rm -f "$work/ctl/pr_view"
+if jq -e '.change.result == "replace_failed" and .change.stage == "branch" and (.change.message | contains("head"))' <<<"$report" >/dev/null && no_push && [ "$(head_of sre-agent/own-head)" = "$own" ]; then echo "ok   the pull request's own head branch is never the replacement's"; else echo "FAIL own head: report: $report"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/pull/7/head
+
+echo "--- 102. a draft GitHub refuses is opened as a normal pull request, after the close ---"
+fork_sha="$(fork_head fork-tmp-m1)"
+touch "$work/ctl/fail_draft"
+replace_answer sre-agent/manual_request-draftfall "$fork_sha" true true
+start_fixture replace_draftfall
+queue_change h-replace-draftfall "$(replace_change "$fork_sha")"
+run_once replace_draftfall
+rm -f "$work/ctl/fail_draft"
+if jq -e '.change.result == "replaced"' <<<"$report" >/dev/null && [ "$(grep -c 'pr create' "$gh_log")" -eq 2 ] && [ "$(grep -c -- '--draft' "$gh_log")" -eq 1 ] && [ "$(grep -n 'pr close' "$gh_log" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'pr create' "$gh_log" | head -n 1 | cut -d: -f1)" ]; then echo "ok   the draft is tried once, refused, and the pull request opens as a normal one"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 103. a push that fails without a word is reported with how it ended, in a refusal and in a replacement ---"
+sha_silent="$(make_branch feature/silent)"
+printf '%s' 'refs/heads/feature/silent' > "$work/ctl/silent_push_fail"
+start_fixture change_silent
+queue_change h-change-silent "$(push_change feature/silent "$sha_silent")"
+run_once change_silent
+if jq -e '.change == {result: "refused", reason: "push_refused", message: "git push exited 1"}' <<<"$report" >/dev/null; then echo "ok   a silent push failure is push_refused with git push exited 1, never an empty message"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+printf '%s' 'refs/heads/sre-agent/manual_request-silent' > "$work/ctl/silent_push_fail"
+replace_answer sre-agent/manual_request-silent "$fork_sha" true false
+start_fixture replace_silent
+queue_change h-replace-silent "$(replace_change "$fork_sha")"
+run_once replace_silent
+rm -f "$work/ctl/silent_push_fail"
+if jq -e '.change == {result: "replace_failed", stage: "branch", message: "git push exited 1"}' <<<"$report" >/dev/null && ! grep -qE 'pr (close|create)' "$gh_log"; then echo "ok   a silent branch push failure is replace_failed at the branch with how it ended"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/pull/7/head
+
+echo "--- 104. a pull request whose head branch is not the one the change was made on is refused ---"
+sha_head="$(make_branch feature/head-mismatch)"
+printf '%s\n' '{"state":"OPEN","isCrossRepository":false,"autoMergeRequest":null,"headRefName":"feature/somewhere-else"}' > "$work/ctl/pr_view"
+start_fixture change_head_mismatch
+queue_change h-change-head-mismatch "$(push_change feature/head-mismatch "$sha_head")"
+run_once change_head_mismatch
+rm -f "$work/ctl/pr_view"
+if jq -e '.change == {result: "refused", reason: "branch_gone"}' <<<"$report" >/dev/null && [ "$(head_of feature/head-mismatch)" = "$sha_head" ] && no_push; then echo "ok   a head branch that differs is refused as branch_gone and nothing is pushed"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 105. a step that throws after a GitHub write is that step's replace_failed ---"
+fork_sha="$(fork_head fork-tmp-l1)"
+mkdir -p "$work/tmp"
+printf '%s' "$work/tmp" > "$work/ctl/break_tmp"
+replace_answer sre-agent/manual_request-throws "$fork_sha" true false
+start_fixture replace_throws
+queue_change h-replace-throws "$(replace_change "$fork_sha")"
+TMPDIR="$work/tmp" run_once replace_throws
+rm -f "$work/tmp" "$work/ctl/break_tmp"
+if jq -e '.change.result == "replace_failed" and .change.stage == "open" and (.change.message | length > 0) and (has("failure") | not)' <<<"$report" >/dev/null && grep -qF 'pr close 7 --repo acme/app' "$gh_log" && branch_exists sre-agent/manual_request-throws; then echo "ok   a throw after the close is replace_failed at the open step, not a runner error, and the branch stays for SRE Agent"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/pull/7/head
+
+echo "--- 106. a stale local branch of one name does not stop a change on a branch of the name below it ---"
+sha_foo="$(make_branch col-foo)"
+start_fixture change_foo
+queue_change h-change-foo "$(push_change col-foo "$sha_foo")"
+run_once change_foo
+if jq -e '.change.result == "pushed"' <<<"$report" >/dev/null; then echo "ok   the change on col-foo is pushed"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/heads/col-foo
+git_seed branch -q -D col-foo
+sha_bar="$(make_branch col-foo/bar)"
+start_fixture change_foo_bar
+queue_change h-change-foo-bar "$(push_change col-foo/bar "$sha_bar")"
+run_once change_foo_bar
+if jq -e '.change.result == "pushed"' <<<"$report" >/dev/null && [ "$(head_of col-foo/bar)" != "$sha_bar" ]; then echo "ok   the change on col-foo/bar is pushed after it: no local branch of the pull request's name is made"; else echo "FAIL report: $report out: $(tail -n 5 "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 107. a push the runner made before is recognised even when somebody pushed on top of it ---"
+sha_t="$(make_branch feature/ontop "$(printf 'fix: the change from before\n\nAsked for by Jane on acme/app#7.\n\n%s' "$change_trailer")")"
+sha_t_parent="$(remote_git rev-parse "$sha_t^")"
+sha_top="$(advance_branch feature/ontop)"
+for asked in "$sha_t_parent" "$(printf 'f%.0s' $(seq 1 40))"; do
+  start_fixture change_ontop
+  queue_change h-change-ontop "$(push_change feature/ontop "$asked")"
+  run_once change_ontop
+  if jq -e --arg sha "$sha_t" '.change == {result: "pushed", commit_sha: $sha}' <<<"$report" >/dev/null && [ "$(head_of feature/ontop)" = "$sha_top" ] && no_push && no_agent_ran; then echo "ok   asked on ${asked:0:7}: reported pushed with the commit that carries the trailer, nothing run and nothing pushed"; else echo "FAIL asked on ${asked:0:7}: report: $report"; fail=1; fi
+  stop_fixture
+done
+
+echo "--- 108. a push GitHub refuses on a change that cannot be replaced is reported push_refused with GitHub's words ---"
+sha_prot="$(make_branch feature/protected)"
+printf '%s' 'refs/heads/feature/protected' > "$work/ctl/reject_push"
+start_fixture change_protected
+queue_change h-change-protected "$(push_change feature/protected "$sha_prot")"
+run_once change_protected
+rm -f "$work/ctl/reject_push"
+if jq -e '.change.result == "refused" and .change.reason == "push_refused" and (.change.message | contains("Protected branch update failed") and length <= 300)' <<<"$report" >/dev/null && [ "$(head_of feature/protected)" = "$sha_prot" ]; then echo "ok   push_refused with the remote's lines, and the branch is untouched"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 109. an unreachable answer on a refusal of a replaceable change reports the refusal ---"
+sha_unr="$(make_branch feature/unreachable)"
+printf '%s\n' '{"state":"CLOSED","isCrossRepository":false,"autoMergeRequest":null}' > "$work/ctl/pr_view"
+answers '[{"status": 422, "body": {"error": "bad body"}}]'
+start_fixture change_unreachable
+queue_change h-change-unreachable "$(push_change feature/unreachable "$sha_unr" '{"replaceable": true}')"
+run_once change_unreachable
+rm -f "$work/ctl/pr_view"
+if [ "$(count_path /replacement)" -eq 1 ] && jq -e '.change == {result: "refused", reason: "not_open"}' <<<"$report" >/dev/null && no_push; then echo "ok   the replacement call was unreachable, so the refusal is reported and nothing is pushed"; else echo "FAIL replacement calls: $(count_path /replacement) report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 110. a change that does not apply on the starting commit is replace_failed at the branch, with nothing pushed ---"
+fork_sha="$(fork_head fork-tmp-conflict)"
+git_seed checkout -q -B conflict-base main
+printf 'a different last line\n' >> "$work/seed/README.md"
+git_seed add -A
+git_seed commit -q -m "conflicting base"
+git_seed push -q "$remote" conflict-base
+conflict_sha="$(git_seed rev-parse HEAD)"
+git_seed checkout -q main
+replace_answer sre-agent/manual_request-conflict "$conflict_sha" true false
+start_fixture replace_conflict
+queue_change h-replace-conflict "$(replace_change "$fork_sha")"
+run_once replace_conflict
+if jq -e '.change.result == "replace_failed" and .change.stage == "branch" and (.change.message | contains("does not apply"))' <<<"$report" >/dev/null && no_push && [ ! -s "$gh_log" ] && ! branch_exists sre-agent/manual_request-conflict; then echo "ok   a conflict is replace_failed at the branch; nothing was pushed, closed or opened"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+remote_git update-ref -d refs/pull/7/head
+
+echo "--- 111. a 409 on the replacement call ends the run with no report ---"
+fork_sha="$(fork_head fork-tmp-409)"
+answers '[{"status": 409, "body": {"error": "conflict"}}]'
+start_fixture replace_409
+queue_change h-replace-409 "$(replace_change "$fork_sha")"
+run_once replace_409
+if [ "$rc" -eq 0 ] && [ "$(count_path /replacement)" -eq 1 ] && [ "$(count_path /report)" -eq 0 ] && no_push; then echo "ok   the handoff is no longer this runner's, so nothing is reported and nothing is pushed"; else echo "FAIL rc=$rc replacement=$(count_path /replacement) reports=$(count_path /report)"; fail=1; fi
 stop_fixture
 remote_git update-ref -d refs/pull/7/head
 

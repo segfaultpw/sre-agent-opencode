@@ -2069,16 +2069,22 @@ async function prepareCheckout(config, job, repo, options = {}) {
   }
   resetGitDir(gitdir, cleanUrl);
 
-  let branch = `sre-agent/${job.handoff_id}`;
+  // A change is checked out under a local name of its own, not the pull
+  // request's: a stale local branch `foo` left by an earlier change would
+  // otherwise make `foo/bar` impossible to create (and the reverse). The
+  // remote name it is pushed to is workspace.remoteBranch.
+  const isChange = Boolean(options.headRef || options.startSha);
+  let branch = isChange ? `sre-agent-change-${job.handoff_id}` : `sre-agent/${job.handoff_id}`;
   let startRef = `refs/remotes/origin/${defaultBranch}`;
   workspace.defaultBranch = defaultBranch;
+  workspace.remoteDefaultBranch = defaultBranch;
   if (options.headRef) {
+    workspace.remoteBranch = options.headRef;
     const remoteHead = `refs/remotes/origin/${options.headRef}`;
     let refusal = null;
     if (options.headRef === defaultBranch) refusal = { kind: 'default_branch' };
     else if (!(await refExists(workspace, remoteHead))) refusal = { kind: 'branch_gone' };
     if (!refusal) {
-      branch = options.headRef;
       startRef = remoteHead;
     } else if (!options.replaceable) {
       throw changeRefusal(refusal);
@@ -2102,6 +2108,7 @@ async function prepareCheckout(config, job, repo, options = {}) {
     if (options.baseRef) workspace.defaultBranch = options.baseRef;
   }
   workspace.branch = branch;
+  workspace.handoffId = job.handoff_id;
   // -f discards whatever a previous run left behind, so one abandoned run
   // cannot put its changes into the next request's pull request.
   await gitIn(workspace, ['checkout', '-f', '-B', branch, startRef]);
@@ -3193,11 +3200,28 @@ function refusalReport(refusal) {
   return { result: 'refused', reason: refusal.kind };
 }
 
-// Whether the checked out head already carries this change's trailer line, which
-// is how a push the runner made before is recognised.
-async function headCarries(workspace, trailer) {
-  const message = await gitIn(workspace, ['log', '-1', '--format=%B', 'HEAD']);
-  return message.split('\n').some((line) => line.trim() === trailer);
+// The commit, among the ones on the branch from the head the change was asked
+// on (itself included) to the branch's head (else the last 200), that carries this change's trailer line: how a push
+// the runner made before is recognised, even when somebody pushed on top of it
+// since. Answers its sha, or null.
+const TRAILER_SCAN_COMMITS = 200;
+async function commitCarrying(workspace, trailer, askedOn) {
+  const scan = async (range) => {
+    const listing = await gitIn(workspace, ['log', '-n', String(TRAILER_SCAN_COMMITS), '--format=%x01%H%n%B', ...range]);
+    for (const entry of listing.split('\u0001').filter(Boolean)) {
+      const [sha, ...lines] = entry.split('\n');
+      if (lines.some((line) => line.trim() === trailer)) return sha.trim();
+    }
+    return null;
+  };
+  if (askedOn) {
+    try {
+      return await scan(['HEAD', '--not', `${askedOn}^@`]);
+    } catch {
+      // The head it was asked on is not in the history any more (a force push): the last commits are the next best.
+    }
+  }
+  return scan(['HEAD']);
 }
 
 async function commitChange(workspace, title, commitBody) {
@@ -3207,10 +3231,18 @@ async function commitChange(workspace, title, commitBody) {
 
 // git's `remote:` lines when it has them (a protected branch says why there),
 // else what it printed; on one line, redacted, at most 300 characters.
-function pushRefusalMessage(text) {
+function pushRefusalMessage(text, result = null) {
   const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
   const remote = lines.filter((line) => line.startsWith('remote:')).map((line) => line.replace(/^remote:\s*/, ''));
-  return oneLine(redact((remote.length > 0 ? remote : lines).join(' ')), CHANGE_MESSAGE_MAX);
+  const said = oneLine(redact((remote.length > 0 ? remote : lines).join(' ')), CHANGE_MESSAGE_MAX);
+  return said || exitText('git push', result);
+}
+
+// What to say of a command that printed nothing: how it ended.
+function exitText(command, result) {
+  if (!result || result.timedOut) return `${command} timed out`;
+  if (result.code === null || result.code === undefined) return `${command} did not finish${result.signal ? ` (${result.signal})` : ''}`;
+  return `${command} exited ${result.code}`;
 }
 
 // A push of `source` to `target` in the checkout, never forced. Answers the
@@ -3231,20 +3263,20 @@ async function pushRaw(config, workspace, source, target) {
 // {kind: 'branch_gone'} when the branch was deleted meanwhile, and otherwise
 // {kind: 'push_refused', message}.
 async function pushChange(config, workspace) {
-  const pushed = await pushRaw(config, workspace, 'HEAD', `refs/heads/${workspace.branch}`);
+  const pushed = await pushRaw(config, workspace, 'HEAD', `refs/heads/${workspace.remoteBranch}`);
   const sha = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
   if (pushed.code === 0) return { result: 'pushed', commit_sha: sha };
   const text = pushed.stderr || pushed.stdout;
   if (/\[rejected\]/.test(text) && /non-fast-forward|fetch first/.test(text)) {
     const token = await runnerGitToken(config, workspace.repo);
-    const listed = await runProcess('git', [...GIT_HARDENING, 'ls-remote', workspace.cleanUrl, `refs/heads/${workspace.branch}`], { env: gitAuthEnv(token) });
+    const listed = await runProcess('git', [...GIT_HARDENING, 'ls-remote', workspace.cleanUrl, `refs/heads/${workspace.remoteBranch}`], { env: gitAuthEnv(token) });
     if (listed.code === 0) {
       const head = (/^([0-9a-f]{40})\s/m.exec(listed.stdout) || [])[1];
       if (!head) return { kind: 'branch_gone' };
       if (head !== workspace.baseSha) return { kind: 'branch_moved', sha: head };
     }
   }
-  return { kind: 'push_refused', message: pushRefusalMessage(text) };
+  return { kind: 'push_refused', message: pushRefusalMessage(text, pushed) };
 }
 
 // The pull request as GitHub has it right now, which decides whether a push may
@@ -3253,7 +3285,7 @@ async function readPullRequest(config, workspace, change) {
   const token = await runnerGitToken(config, workspace.repo);
   const viewed = await runProcess(
     'gh',
-    ['pr', 'view', String(change.number), '--repo', change.repo.fullName, '--json', 'state,isCrossRepository,autoMergeRequest'],
+    ['pr', 'view', String(change.number), '--repo', change.repo.fullName, '--json', 'state,isCrossRepository,autoMergeRequest,headRefName'],
     { cwd: workspace.dir, env: ghEnvFor(workspace, token) }
   );
   let info = null;
@@ -3268,10 +3300,15 @@ async function readPullRequest(config, workspace, change) {
   return info;
 }
 
-function refusalOf(info, changed) {
+// A pull request whose head branch is not the one the change was checked out
+// on is not the pull request the change is for, so the branch the change was
+// made on is, as far as this change goes, gone from it (branch_gone, the
+// nearest of the wire contract's reasons).
+function refusalOf(info, changed, change) {
   if (info.state === 'MERGED') return { kind: 'merged' };
   if (info.state !== 'OPEN') return { kind: 'not_open' };
   if (info.isCrossRepository === true) return { kind: 'fork' };
+  if (info.headRefName !== change.headRef) return { kind: 'branch_gone' };
   if (info.autoMergeRequest && ciPaths(changed).length > 0) return { kind: 'auto_merge_on' };
   return null;
 }
@@ -3378,7 +3415,8 @@ function createdPullRequest(stdout, repo) {
 }
 
 // The pull request `gh pr list` found for a branch, the first that belongs to
-// the repository.
+// the repository and has its head in it: a fork's pull request from a branch of
+// the same name is not the one that was opened.
 function listedPullRequest(stdout, repo) {
   let listed = null;
   try {
@@ -3388,23 +3426,35 @@ function listedPullRequest(stdout, repo) {
   }
   if (!Array.isArray(listed)) return null;
   for (const entry of listed) {
-    const found = entry && typeof entry.url === 'string' ? createdPullRequest(entry.url, repo) : null;
+    const found = entry && entry.isCrossRepository === false && typeof entry.url === 'string' ? createdPullRequest(entry.url, repo) : null;
     if (found) return found;
   }
   return null;
 }
 
-// Whether the checkout has the commit, and if it does not, whether fetching the
-// repository's branches brings it.
-async function haveCommit(config, workspace, sha) {
-  const present = async () => {
-    const found = await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, 'cat-file', '-e', `${sha}^{commit}`], { env: gitEnv() });
-    return found.code === 0;
-  };
-  if (await present()) return true;
+// Whether the checkout has the commit.
+async function haveCommit(workspace, sha) {
+  const found = await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, 'cat-file', '-e', `${sha}^{commit}`], { env: gitEnv() });
+  return found.code === 0;
+}
+
+// Why a replace answer may not push to the branch it names, or null. The
+// answer comes from SRE Agent, and what it names is a branch of this
+// customer's repository, so the runner holds it to the one kind of branch it
+// may create: its own (sre-agent/...), which is neither the default branch, nor
+// the base the new pull request targets, nor the branch of the pull request
+// being replaced, nor any branch that is already on the remote (a colleague's
+// work, or an earlier attempt's). The base must be the change's own.
+async function branchRefusal(config, workspace, change, answer) {
+  const named = answer.branch;
+  if (!named.startsWith('sre-agent/')) return `the replacement branch ${named} is not one of SRE Agent's own (sre-agent/...)`;
+  const taken = [workspace.remoteDefaultBranch, workspace.defaultBranch, change.baseRef, answer.base_ref, change.headRef];
+  if (taken.includes(named)) return `the replacement branch ${named} is the default, base or head branch of the pull request`;
+  if (answer.base_ref !== change.baseRef) return `the replacement targets ${answer.base_ref}, not the change's base ${change.baseRef}`;
   const token = await runnerGitToken(config, workspace.repo);
-  await gitIn(workspace, ['fetch', workspace.cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], token);
-  return present();
+  await gitIn(workspace, ['fetch', '--prune', workspace.cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], token);
+  if (await refExists(workspace, `refs/remotes/origin/${named}`)) return `the replacement branch ${named} already exists on the remote`;
+  return null;
 }
 
 // SRE Agent decided a replacement: the commit made in this checkout becomes a
@@ -3413,83 +3463,116 @@ async function haveCommit(config, workspace, sha) {
 // the order that leaves the least behind when one is refused, and the heartbeat
 // is asked immediately before each of the two that change a pull request:
 //
-//   branch  the commit, cherry-picked onto the answer's starting commit when it
-//           is not the one it was made on, pushed (never forced) as the answer's
-//           branch. Refused: nothing else was touched.
+//   branch  the answer's branch is checked (branchRefusal; nothing is pushed
+//           when it fails), the commit is cherry-picked onto the answer's
+//           starting commit when it is not the one it was made on, and pushed
+//           (never forced) as that branch. Refused: nothing else was touched.
 //   close   the old pull request. Refused: the branch pushed above is deleted
 //           again, so the failed replacement leaves nothing on the remote.
-//   open    the new pull request. GitHub's "already exists" is the pull request
-//           that was wanted, found by its head branch; any other refusal leaves
-//           the branch and the closed pull request for SRE Agent to find.
+//   open    the new pull request, as a draft or not as the answer says; a draft
+//           GitHub refuses opens as a normal pull request, as a fix's does.
+//           GitHub's "already exists" is the pull request that was wanted,
+//           found by its head branch; any other refusal leaves the branch and
+//           the closed pull request for SRE Agent to find.
 //
+// A step that throws is that step's failure, and a job taken from this runner
+// or a failure before the close takes the branch this run pushed with it.
 // Answers the report's change: replaced, or replace_failed with the step.
-async function carryOutReplacement(config, workspace, answer, signal) {
+async function carryOutReplacement(config, workspace, change, answer, signal) {
   const { repo } = workspace;
   const failed = (stage, message) => ({ result: 'replace_failed', stage, message: oneLine(redact(message), CHANGE_MESSAGE_MAX) });
-  const commit = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
-
-  if (answer.start_sha !== workspace.baseSha) {
-    if (!(await haveCommit(config, workspace, answer.start_sha))) {
-      return failed('branch', `the starting commit ${answer.start_sha.slice(0, 12)} is not in ${repo.fullName}`);
-    }
-    await gitIn(workspace, ['checkout', '-f', '-B', answer.branch, answer.start_sha]);
-    const picked = await runProcess(
-      'git',
-      [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...RUNNER_IDENTITY, 'cherry-pick', commit],
-      { env: gitEnv(), cwd: workspace.dir }
-    );
-    if (picked.code !== 0) {
-      await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'cherry-pick', '--abort'], { env: gitEnv(), cwd: workspace.dir });
-      return failed('branch', `the change does not apply on ${answer.start_sha.slice(0, 12)}: ${redact(picked.stderr || picked.stdout)}`);
-    }
-  }
-
-  stillHeld(signal);
   const target = `refs/heads/${answer.branch}`;
-  const pushed = await pushRaw(config, workspace, 'HEAD', target);
-  if (pushed.code !== 0) return failed('branch', pushRefusalMessage(pushed.stderr || pushed.stdout));
-
   const token = await runnerGitToken(config, repo);
-  const ghEnv = ghEnvFor(workspace, token);
-  if (answer.closing) {
-    stillHeld(signal);
-    const closed = await runProcess('gh', ['pr', 'close', String(answer.number), '--repo', repo.fullName], { cwd: workspace.dir, env: ghEnv });
-    if (closed.code !== 0) {
-      await runProcess(
-        'git',
-        [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'push', workspace.cleanUrl, '--delete', target],
-        { env: gitAuthEnv(token), cwd: workspace.dir }
-      );
-      return failed('close', `the pull request ${repo.fullName}#${answer.number} could not be closed: ${redact(closed.stderr || closed.stdout).trim()}`);
-    }
-  }
+  let stage = 'branch';
+  let pushedBranch = false;
+  let closed = false;
 
-  stillHeld(signal);
-  const body = writePullRequestBody(answer.body);
-  let created;
-  try {
-    created = await runProcess(
-      'gh',
-      [
-        'pr', 'create', '--repo', repo.fullName, '--head', answer.branch, '--base', answer.base_ref,
-        '--title', answer.title, '--body-file', body.file, ...(answer.draft ? ['--draft'] : []),
-      ],
-      { cwd: workspace.dir, env: ghEnv }
+  const dropBranch = async () => {
+    await runProcess(
+      'git',
+      [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'push', workspace.cleanUrl, '--delete', target],
+      { env: gitAuthEnv(token), cwd: workspace.dir }
     );
-  } finally {
-    fs.rmSync(body.dir, { recursive: true, force: true });
+  };
+
+  try {
+    const refusal = await branchRefusal(config, workspace, change, answer);
+    if (refusal) return failed('branch', refusal);
+
+    const commit = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
+    if (answer.start_sha !== workspace.baseSha) {
+      if (!(await haveCommit(workspace, answer.start_sha))) {
+        return failed('branch', `the starting commit ${answer.start_sha.slice(0, 12)} is not in ${repo.fullName}`);
+      }
+      await gitIn(workspace, ['checkout', '-f', '-B', `sre-agent-change-${workspace.handoffId}`, answer.start_sha]);
+      const picked = await runProcess(
+        'git',
+        [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...RUNNER_IDENTITY, 'cherry-pick', commit],
+        { env: gitEnv(), cwd: workspace.dir }
+      );
+      if (picked.code !== 0) {
+        await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'cherry-pick', '--abort'], { env: gitEnv(), cwd: workspace.dir });
+        return failed('branch', `the change does not apply on ${answer.start_sha.slice(0, 12)}: ${redact(picked.stderr || picked.stdout) || exitText('git cherry-pick', picked)}`);
+      }
+    }
+
+    stillHeld(signal);
+    const pushed = await pushRaw(config, workspace, 'HEAD', target);
+    if (pushed.code !== 0) return failed('branch', pushRefusalMessage(pushed.stderr || pushed.stdout, pushed));
+    pushedBranch = true;
+
+    const ghEnv = ghEnvFor(workspace, token);
+    if (answer.closing) {
+      stage = 'close';
+      stillHeld(signal);
+      const closing = await runProcess('gh', ['pr', 'close', String(answer.number), '--repo', repo.fullName], { cwd: workspace.dir, env: ghEnv });
+      if (closing.code !== 0) {
+        await dropBranch();
+        return failed('close', `the pull request ${repo.fullName}#${answer.number} could not be closed: ${redact(closing.stderr || closing.stdout).trim() || exitText('gh pr close', closing)}`);
+      }
+      closed = true;
+    }
+
+    stage = 'open';
+    stillHeld(signal);
+    const body = writePullRequestBody(answer.body);
+    let created;
+    try {
+      const create = (draft) =>
+        runProcess(
+          'gh',
+          [
+            'pr', 'create', '--repo', repo.fullName, '--head', answer.branch, '--base', answer.base_ref,
+            '--title', answer.title, '--body-file', body.file, ...(draft ? ['--draft'] : []),
+          ],
+          { cwd: workspace.dir, env: ghEnv }
+        );
+      created = await create(answer.draft);
+      if (created.code !== 0 && answer.draft && !/already exists/i.test(created.stderr || created.stdout)) {
+        // Draft pull requests need a plan that supports them. The old pull request is closed by now, so
+        // not opening the new one at all would leave the work where nobody looks for it.
+        log('warn', 'the draft pull request was refused; opening it as a normal pull request instead');
+        created = await create(false);
+      }
+    } finally {
+      fs.rmSync(body.dir, { recursive: true, force: true });
+    }
+    const refused = redact(created.stderr || created.stdout).trim();
+    if (created.code === 0) {
+      const opened = createdPullRequest(created.stdout, repo);
+      return opened ? { result: 'replaced', pr_url: opened.url, pr_number: opened.number } : failed('open', 'gh opened the pull request but printed no URL for it in this repository');
+    }
+    if (/already exists/i.test(refused)) {
+      const listed = await runProcess('gh', ['pr', 'list', '--repo', repo.fullName, '--head', answer.branch, '--json', 'number,url,isCrossRepository'], { cwd: workspace.dir, env: ghEnv });
+      const existing = listed.code === 0 ? listedPullRequest(listed.stdout, repo) : null;
+      if (existing) return { result: 'replaced', pr_url: existing.url, pr_number: existing.number };
+    }
+    return failed('open', `the pull request could not be opened: ${refused || exitText('gh pr create', created)}`);
+  } catch (error) {
+    if (pushedBranch && !closed) await dropBranch().catch(() => {});
+    if (error.takenOver) throw error;
+    return failed(stage, error.message);
   }
-  const refusal = redact(created.stderr || created.stdout).trim();
-  if (created.code === 0) {
-    const opened = createdPullRequest(created.stdout, repo);
-    return opened ? { result: 'replaced', pr_url: opened.url, pr_number: opened.number } : failed('open', 'gh opened the pull request but printed no URL for it in this repository');
-  }
-  if (/already exists/i.test(refusal)) {
-    const listed = await runProcess('gh', ['pr', 'list', '--repo', repo.fullName, '--head', answer.branch, '--json', 'number,url'], { cwd: workspace.dir, env: ghEnv });
-    const existing = listed.code === 0 ? listedPullRequest(listed.stdout, repo) : null;
-    if (existing) return { result: 'replaced', pr_url: existing.url, pr_number: existing.number };
-  }
-  return failed('open', `the pull request could not be opened: ${refusal}`);
 }
 
 // The end of a change run, once the agent's work has passed the gate: the work
@@ -3505,20 +3588,20 @@ async function finishChange(config, job, change, workspace, run, result) {
   const madeOn = workspace.baseSha;
   stillHeld(signal);
   const sha = await commitChange(workspace, title, change.commitBody);
-  result.actions.push(`committed ${sha.slice(0, 12)} on ${workspace.branch}: ${title}`);
+  result.actions.push(`committed ${sha.slice(0, 12)} on ${workspace.remoteBranch || workspace.branch}: ${title}`);
   if (change.headSha && change.headSha !== madeOn) {
     result.summary = `${result.summary}\n\nThe branch had moved since the change was asked (it was at ${change.headSha.slice(0, 12)}), so the change was made on ${madeOn.slice(0, 12)}.`;
   }
 
   let refusal = workspace.refusal || null;
   if (change.mode === 'push' && !refusal) {
-    refusal = refusalOf(await readPullRequest(config, workspace, change), changed);
+    refusal = refusalOf(await readPullRequest(config, workspace, change), changed, change);
     if (!refusal) {
       stillHeld(signal);
       const pushed = await pushChange(config, workspace);
       if (pushed.result === 'pushed') {
         result.change = pushed;
-        result.actions.push(`pushed ${sha.slice(0, 12)} to ${workspace.branch} of ${change.repo.fullName}`);
+        result.actions.push(`pushed ${sha.slice(0, 12)} to ${workspace.remoteBranch} of ${change.repo.fullName}`);
         result.summary = `${result.summary}\n\nThis change was pushed onto ${where}. Nothing has verified it in a running system.`;
         log('info', `pushed ${sha.slice(0, 12)} onto ${where} for handoff ${job.handoff_id}`);
         return;
@@ -3550,7 +3633,7 @@ async function finishChange(config, job, change, workspace, run, result) {
     return;
   }
   if (answer.decision === 'replace') {
-    const outcome = await carryOutReplacement(config, workspace, answer, signal);
+    const outcome = await carryOutReplacement(config, workspace, change, answer, signal);
     result.change = outcome;
     result.evidence.replacement_branch = answer.branch;
     if (outcome.result === 'replaced') {
@@ -4054,15 +4137,16 @@ async function handleJob(config, job, options = {}) {
     const workspace = repo ? await prepareCheckout(config, job, repo, change ? checkoutOptions(change) : {}) : prepareScratch(config);
     if (change) {
       result.evidence.repository = repo.fullName;
-      result.evidence.branch = workspace.branch;
+      result.evidence.branch = workspace.remoteBranch || workspace.branch;
       result.evidence.pull_request = `${repo.fullName}#${change.number}`;
       result.evidence.change_mode = change.mode;
       result.evidence.made_on = workspace.baseSha;
-      result.actions.push(`checked out ${repo.fullName} at ${workspace.baseSha.slice(0, 12)} on ${workspace.branch}, to change ${repo.fullName}#${change.number}`);
-      if (change.mode === 'push' && change.trailer && !workspace.refusal && (await headCarries(workspace, change.trailer))) {
-        result.change = { result: 'pushed', commit_sha: workspace.baseSha };
-        result.summary = `This change is already on ${repo.fullName}#${change.number}: the branch's head ${workspace.baseSha.slice(0, 12)} carries ${change.trailer}, so nothing was run and nothing was pushed again.`;
-        result.actions.push('the branch head already carries this change, so nothing was run or pushed');
+      result.actions.push(`checked out ${repo.fullName} at ${workspace.baseSha.slice(0, 12)} on ${workspace.remoteBranch || workspace.branch}, to change ${repo.fullName}#${change.number}`);
+      const earlier = change.mode === 'push' && change.trailer && !workspace.refusal ? await commitCarrying(workspace, change.trailer, change.headSha) : null;
+      if (earlier) {
+        result.change = { result: 'pushed', commit_sha: earlier };
+        result.summary = `This change is already on ${repo.fullName}#${change.number}: the commit ${earlier.slice(0, 12)} on the branch carries ${change.trailer}, so nothing was run and nothing was pushed again.`;
+        result.actions.push('the branch already carries this change, so nothing was run or pushed');
         return result;
       }
     } else if (repo) {
@@ -4490,6 +4574,7 @@ module.exports = {
     changeFromJob,
     createdPullRequest,
     listedPullRequest,
+    pushRefusalMessage,
     changeTitle,
     changeCommitMessage,
     askReplacement,

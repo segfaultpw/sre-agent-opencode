@@ -288,15 +288,26 @@ async function main() {
     assert.equal(internals.createdPullRequest('', repo), null);
   });
 
-  await check('a pull request found for the head branch is the first one that belongs to the repository', () => {
+  await check('a pull request found for the head branch is the first one in the repository whose head is in it (one from a fork of the same branch name is skipped)', () => {
     const repo = { fullName: 'acme/app' };
     const listed = JSON.stringify([
-      { number: 3, url: 'https://github.com/globex/web/pull/3' },
-      { number: 12, url: 'https://github.com/acme/app/pull/12' },
+      { number: 3, url: 'https://github.com/globex/web/pull/3', isCrossRepository: false },
+      { number: 4, url: 'https://github.com/acme/app/pull/4', isCrossRepository: true },
+      { number: 5, url: 'https://github.com/acme/app/pull/5' },
+      { number: 12, url: 'https://github.com/acme/app/pull/12', isCrossRepository: false },
     ]);
     assert.deepEqual(internals.listedPullRequest(listed, repo), { url: 'https://github.com/acme/app/pull/12', number: 12 });
     assert.equal(internals.listedPullRequest('[]', repo), null);
     assert.equal(internals.listedPullRequest('not json', repo), null);
+  });
+
+  await check('a push that said nothing is described by how it ended: its exit code, a timeout, or that it never finished', () => {
+    assert.equal(internals.pushRefusalMessage('', { code: 1, timedOut: false }), 'git push exited 1');
+    assert.equal(internals.pushRefusalMessage('\n  \n', { code: 128, timedOut: false }), 'git push exited 128');
+    assert.equal(internals.pushRefusalMessage('', { code: null, timedOut: true }), 'git push timed out');
+    assert.equal(internals.pushRefusalMessage('', { code: null, timedOut: false, signal: 'SIGKILL' }), 'git push did not finish (SIGKILL)');
+    assert.equal(internals.pushRefusalMessage('remote: error: GH006: Protected branch update failed.\n! [remote rejected] x', { code: 1 }), 'error: GH006: Protected branch update failed.');
+    assert.equal(internals.pushRefusalMessage('fatal: unable to access', { code: 128 }), 'fatal: unable to access');
   });
 
   if (failed > 0) {
