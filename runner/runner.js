@@ -75,7 +75,7 @@ const REPLACEMENT_PATHS_MAX = 100;
 const REPLACEMENT_PATH_MAX = 300;
 const REPLACEMENT_SUMMARY_MAX = 500;
 const REPLACEMENT_ANALYSIS_MAX = 20_000;
-const PUSH_MESSAGE_MAX = 300;
+const CHANGE_MESSAGE_MAX = 300;
 
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
@@ -3210,7 +3210,7 @@ async function commitChange(workspace, title, commitBody) {
 function pushRefusalMessage(text) {
   const lines = String(text).split('\n').map((line) => line.trim()).filter(Boolean);
   const remote = lines.filter((line) => line.startsWith('remote:')).map((line) => line.replace(/^remote:\s*/, ''));
-  return oneLine(redact((remote.length > 0 ? remote : lines).join(' ')), PUSH_MESSAGE_MAX);
+  return oneLine(redact((remote.length > 0 ? remote : lines).join(' ')), CHANGE_MESSAGE_MAX);
 }
 
 // A push of `source` to `target` in the checkout, never forced. Answers the
@@ -3291,7 +3291,7 @@ function replacementRequest(instance, fields) {
       ? {
           kind: reason.kind,
           ...(reason.kind === 'branch_moved' ? { sha: reason.sha } : {}),
-          ...(reason.kind === 'push_refused' ? { message: cut(reason.message || '', PUSH_MESSAGE_MAX) } : {}),
+          ...(reason.kind === 'push_refused' ? { message: cut(reason.message || '', CHANGE_MESSAGE_MAX) } : {}),
         }
       : null,
   };
@@ -3363,6 +3363,135 @@ async function askReplacement(config, job, body, signal = null) {
   return { decision: 'unreachable', detail: `SRE Agent did not answer the replacement request (${failure}) after ${REPLACEMENT_ATTEMPTS} attempts` };
 }
 
+// The pull request URL gh prints (its last URL line), when it is a pull request
+// of this repository: a URL for anything else is no pull request of the change's.
+function createdPullRequest(stdout, repo) {
+  const url = String(stdout)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('http'))
+    .pop();
+  if (!url) return null;
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/(\d+)$/.exec(url);
+  if (!match || `${match[1]}/${match[2]}`.toLowerCase() !== repo.fullName.toLowerCase()) return null;
+  return { url, number: Number(match[3]) };
+}
+
+// The pull request `gh pr list` found for a branch, the first that belongs to
+// the repository.
+function listedPullRequest(stdout, repo) {
+  let listed = null;
+  try {
+    listed = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(listed)) return null;
+  for (const entry of listed) {
+    const found = entry && typeof entry.url === 'string' ? createdPullRequest(entry.url, repo) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
+// Whether the checkout has the commit, and if it does not, whether fetching the
+// repository's branches brings it.
+async function haveCommit(config, workspace, sha) {
+  const present = async () => {
+    const found = await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, 'cat-file', '-e', `${sha}^{commit}`], { env: gitEnv() });
+    return found.code === 0;
+  };
+  if (await present()) return true;
+  const token = await runnerGitToken(config, workspace.repo);
+  await gitIn(workspace, ['fetch', workspace.cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], token);
+  return present();
+}
+
+// SRE Agent decided a replacement: the commit made in this checkout becomes a
+// new branch, the old pull request is closed (when the answer says to), and the
+// new one is opened with the title and body the answer gives. The steps are in
+// the order that leaves the least behind when one is refused, and the heartbeat
+// is asked immediately before each of the two that change a pull request:
+//
+//   branch  the commit, cherry-picked onto the answer's starting commit when it
+//           is not the one it was made on, pushed (never forced) as the answer's
+//           branch. Refused: nothing else was touched.
+//   close   the old pull request. Refused: the branch pushed above is deleted
+//           again, so the failed replacement leaves nothing on the remote.
+//   open    the new pull request. GitHub's "already exists" is the pull request
+//           that was wanted, found by its head branch; any other refusal leaves
+//           the branch and the closed pull request for SRE Agent to find.
+//
+// Answers the report's change: replaced, or replace_failed with the step.
+async function carryOutReplacement(config, workspace, answer, signal) {
+  const { repo } = workspace;
+  const failed = (stage, message) => ({ result: 'replace_failed', stage, message: oneLine(redact(message), CHANGE_MESSAGE_MAX) });
+  const commit = (await gitIn(workspace, ['rev-parse', 'HEAD'])).trim();
+
+  if (answer.start_sha !== workspace.baseSha) {
+    if (!(await haveCommit(config, workspace, answer.start_sha))) {
+      return failed('branch', `the starting commit ${answer.start_sha.slice(0, 12)} is not in ${repo.fullName}`);
+    }
+    await gitIn(workspace, ['checkout', '-f', '-B', answer.branch, answer.start_sha]);
+    const picked = await runProcess(
+      'git',
+      [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, ...RUNNER_IDENTITY, 'cherry-pick', commit],
+      { env: gitEnv(), cwd: workspace.dir }
+    );
+    if (picked.code !== 0) {
+      await runProcess('git', [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'cherry-pick', '--abort'], { env: gitEnv(), cwd: workspace.dir });
+      return failed('branch', `the change does not apply on ${answer.start_sha.slice(0, 12)}: ${redact(picked.stderr || picked.stdout)}`);
+    }
+  }
+
+  stillHeld(signal);
+  const target = `refs/heads/${answer.branch}`;
+  const pushed = await pushRaw(config, workspace, 'HEAD', target);
+  if (pushed.code !== 0) return failed('branch', pushRefusalMessage(pushed.stderr || pushed.stdout));
+
+  const token = await runnerGitToken(config, repo);
+  const ghEnv = ghEnvFor(workspace, token);
+  if (answer.closing) {
+    stillHeld(signal);
+    const closed = await runProcess('gh', ['pr', 'close', String(answer.number), '--repo', repo.fullName], { cwd: workspace.dir, env: ghEnv });
+    if (closed.code !== 0) {
+      await runProcess(
+        'git',
+        [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'push', workspace.cleanUrl, '--delete', target],
+        { env: gitAuthEnv(token), cwd: workspace.dir }
+      );
+      return failed('close', `the pull request ${repo.fullName}#${answer.number} could not be closed: ${redact(closed.stderr || closed.stdout).trim()}`);
+    }
+  }
+
+  stillHeld(signal);
+  const body = writePullRequestBody(answer.body);
+  let created;
+  try {
+    created = await runProcess(
+      'gh',
+      [
+        'pr', 'create', '--repo', repo.fullName, '--head', answer.branch, '--base', answer.base_ref,
+        '--title', answer.title, '--body-file', body.file, ...(answer.draft ? ['--draft'] : []),
+      ],
+      { cwd: workspace.dir, env: ghEnv }
+    );
+  } finally {
+    fs.rmSync(body.dir, { recursive: true, force: true });
+  }
+  const refusal = redact(created.stderr || created.stdout).trim();
+  if (created.code === 0) {
+    const opened = createdPullRequest(created.stdout, repo);
+    return opened ? { result: 'replaced', pr_url: opened.url, pr_number: opened.number } : failed('open', 'gh opened the pull request but printed no URL for it in this repository');
+  }
+  if (/already exists/i.test(refusal)) {
+    const listed = await runProcess('gh', ['pr', 'list', '--repo', repo.fullName, '--head', answer.branch, '--json', 'number,url'], { cwd: workspace.dir, env: ghEnv });
+    const existing = listed.code === 0 ? listedPullRequest(listed.stdout, repo) : null;
+    if (existing) return { result: 'replaced', pr_url: existing.url, pr_number: existing.number };
+  }
+  return failed('open', `the pull request could not be opened: ${refusal}`);
+}
+
 // The end of a change run, once the agent's work has passed the gate: the work
 // is committed, and what became of it is settled the way the mode says and
 // recorded in result.change. A push lands on the pull request's own branch. A
@@ -3421,14 +3550,26 @@ async function finishChange(config, job, change, workspace, run, result) {
     return;
   }
   if (answer.decision === 'replace') {
-    throw new Error('this build of the runner cannot yet carry out a replacement');
+    const outcome = await carryOutReplacement(config, workspace, answer, signal);
+    result.change = outcome;
+    result.evidence.replacement_branch = answer.branch;
+    if (outcome.result === 'replaced') {
+      result.actions.push(`opened ${outcome.pr_url} from ${answer.branch}${answer.closing ? ` and closed ${where}` : ''}`);
+      result.summary = `${result.summary}\n\nThis change was opened as ${outcome.pr_url}, replacing ${where}. Nothing has verified it in a running system.`;
+      log('info', `opened ${outcome.pr_url} replacing ${where} for handoff ${job.handoff_id}`);
+    } else {
+      result.actions.push(`the replacement stopped at the ${outcome.stage} step`);
+      result.summary = `${result.summary}\n\nThe replacement of ${where} did not complete at the ${outcome.stage} step: ${outcome.message}`;
+      log('warn', `handoff ${job.handoff_id}: the replacement stopped at the ${outcome.stage} step: ${outcome.message}`);
+    }
+    return;
   }
   if (refusal) {
     refuse();
     return;
   }
   const detail = answer.detail || 'SRE Agent decided no replacement';
-  result.change = { result: 'replace_failed', stage: 'claim', message: oneLine(redact(detail), PUSH_MESSAGE_MAX) };
+  result.change = { result: 'replace_failed', stage: 'claim', message: oneLine(redact(detail), CHANGE_MESSAGE_MAX) };
   result.summary = `${result.summary}\n\nNothing was pushed and no pull request was opened: ${detail}.`;
   result.actions.push('the replacement was not claimed, so nothing was pushed or opened');
 }
@@ -4347,6 +4488,8 @@ module.exports = {
       replacementRetryMs = value;
     },
     changeFromJob,
+    createdPullRequest,
+    listedPullRequest,
     changeTitle,
     changeCommitMessage,
     askReplacement,

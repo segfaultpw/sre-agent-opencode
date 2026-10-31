@@ -274,6 +274,31 @@ async function main() {
     assert.equal(body.instance, 'alpha');
   });
 
+  await check('the pull request gh prints is taken from its last URL line and must be a pull request of the change\'s own repository', () => {
+    const repo = { fullName: 'acme/app' };
+    assert.deepEqual(internals.createdPullRequest('Creating pull request\nhttps://github.com/acme/app/pull/12\n', repo), {
+      url: 'https://github.com/acme/app/pull/12',
+      number: 12,
+    });
+    assert.deepEqual(internals.createdPullRequest('https://github.com/ACME/App/pull/12', repo), { url: 'https://github.com/ACME/App/pull/12', number: 12 });
+    assert.equal(internals.createdPullRequest('https://github.com/globex/web/pull/12', repo), null);
+    assert.equal(internals.createdPullRequest('https://github.com/acme/app/issues/12', repo), null);
+    assert.equal(internals.createdPullRequest('https://evil.example/acme/app/pull/12', repo), null);
+    assert.equal(internals.createdPullRequest('https://github.com/acme/app/pull/12/files', repo), null);
+    assert.equal(internals.createdPullRequest('', repo), null);
+  });
+
+  await check('a pull request found for the head branch is the first one that belongs to the repository', () => {
+    const repo = { fullName: 'acme/app' };
+    const listed = JSON.stringify([
+      { number: 3, url: 'https://github.com/globex/web/pull/3' },
+      { number: 12, url: 'https://github.com/acme/app/pull/12' },
+    ]);
+    assert.deepEqual(internals.listedPullRequest(listed, repo), { url: 'https://github.com/acme/app/pull/12', number: 12 });
+    assert.equal(internals.listedPullRequest('[]', repo), null);
+    assert.equal(internals.listedPullRequest('not json', repo), null);
+  });
+
   if (failed > 0) {
     console.log(`${failed} check(s) failed`);
     process.exit(1);

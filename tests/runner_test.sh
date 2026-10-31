@@ -2446,7 +2446,7 @@ stop_fixture
 # targeted cases use, so a push that should not have happened shows up as a
 # branch that moved.
 git_seed() { "$real_git" -C "$work/seed" -c user.name=seed -c user.email=seed@example.invalid -c commit.gpgsign=false "$@"; }
-head_of() { "$real_git" --git-dir="$remote" rev-parse --verify --quiet "refs/heads/$1"; }
+head_of() { "$real_git" --git-dir="$remote" rev-parse --verify --quiet "refs/heads/$1" || true; }
 remote_git() { "$real_git" --git-dir="$remote" "$@"; }
 # A branch on the remote cut from main with one commit; prints its sha.
 make_branch() {
@@ -2687,6 +2687,205 @@ for spec in main:default_branch feature/vanished:branch_gone; do
   if jq -e --arg r "$reason" '.change == {result: "refused", reason: $r}' <<<"$report" >/dev/null && [ "$(head_of main)" = "$main_before" ] && no_push; then echo "ok   $reason: a report answer ends in the refusal and nothing is pushed"; else echo "FAIL $reason: report: $report"; fail=1; fi
   stop_fixture
 done
+remote_git update-ref -d refs/pull/7/head
+
+# A replacement: SRE Agent decides it (the replacement call), the runner carries
+# it out on GitHub with the customer's credentials. The pull request the change
+# is for lives at refs/pull/7/head; the branch a fork's head commit was on is
+# deleted, so only that ref can supply it.
+plain_sha() { printf '%s' "$1" | tr -d '[:space:]'; }
+# A commit that is reachable only through the pull request's head ref, as a
+# fork's head is. Prints its sha.
+fork_head() {
+  local sha
+  sha="$(make_branch "$1")"
+  remote_git update-ref refs/pull/7/head "$sha"
+  remote_git update-ref -d "refs/heads/$1"
+  printf '%s' "$sha"
+}
+# The replacement call's answer: replace, onto $2 as the starting commit.
+# $3 closing, $4 draft, $5 the base branch the new pull request targets.
+replace_answer() {
+  jq -nc --arg b "$1" --arg s "$2" --argjson closing "${3:-true}" --argjson draft "${4:-false}" --arg base "${5:-main}" \
+    '[{status: 200, body: {decision: "replace", branch: $b, base_ref: $base, start_sha: $s, closing: $closing, number: 7,
+       title: "fix: raise the connection pool ceiling",
+       body: "## Summary\n\nRaised the pool ceiling.\n\nSRE-Agent-Change: 11111111-2222-3333-4444-555555555555\n", draft: $draft}}]' > "$replacement_file"
+}
+replace_change() { jq -n --arg sha "$1" --arg on "${2:-head}" --arg base "${3:-main}" '{mode: "replace", head_ref: null, start_sha: $sha, start_on: $on, base_ref: $base, replaceable: true}'; }
+runner_gitdir="$workspace/gitdirs/acme/app"
+order_index() { grep -nF -- "$1" "$work/order.log" | head -n 1 | cut -d: -f1 || true; }
+printf '%s\n' 'https://github.com/acme/app/pull/12' > "$work/ctl/created_url"
+rm -f "$work"/ctl/fail_close "$work"/ctl/fail_create "$work"/ctl/create_exists "$work"/ctl/reject_push "$work"/ctl/take_on_push "$work"/ctl/take_on_close "$work"/ctl/pr_list
+
+echo "--- 90. a replace-mode job starts from the commit it names (a fork's head) and calls the replacement with reason null before it writes anything to GitHub ---"
+fork_sha="$(fork_head fork-tmp-a)"
+answers '[{"status": 200, "body": {"decision": "report"}}]'
+start_fixture replace_call
+queue_change h-replace-call "$(replace_change "$fork_sha")"
+run_once replace_call
+call="$(jq -c 'select(.path | endswith("/replacement")) | .body' "$fixture_log" | head -n 1)"
+if jq -e --arg made "$fork_sha" '.reason == null and .made_on == $made and (.commit_sha | test("^[0-9a-f]{40}$")) and (.paths | index("README.md"))' <<<"$call" >/dev/null; then echo "ok   the call carries reason null, the commit it was made on and the commit"; else echo "FAIL call: $call out: $(tail -n 5 "$out")"; fail=1; fi
+commit_called="$(jq -r '.commit_sha' <<<"$call")"
+if [ "$("$real_git" --git-dir="$runner_gitdir" rev-parse "$commit_called^")" = "$fork_sha" ] && "$real_git" --git-dir="$runner_gitdir" cat-file -e "$commit_called:branch-work.txt"; then echo "ok   the commit sits directly on the fork's head, whose files the agent worked on"; else echo "FAIL the commit's parent: $("$real_git" --git-dir="$runner_gitdir" rev-parse "$commit_called^" 2>&1)"; fail=1; fi
+if no_push && [ ! -s "$gh_log" ]; then echo "ok   nothing was pushed and gh was not called before the answer"; else echo "FAIL git: $(grep ' push ' "$git_log") gh: $(cat "$gh_log")"; fail=1; fi
+if jq -e '.change.result == "replace_failed" and .change.stage == "claim" and (has("pr_url") | not)' <<<"$report" >/dev/null; then echo "ok   a report answer in replace mode is replace_failed at the claim"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 91. after a replace answer it pushes the named branch, closes the old pull request, opens the new one and reports replaced ---"
+branch_a="sre-agent/manual_request-1a2b3c4d"
+replace_answer "$branch_a" "$fork_sha" true false
+start_fixture replace_flow
+queue_change h-replace-flow "$(replace_change "$fork_sha")"
+run_once replace_flow
+new_head="$(head_of "$branch_a")"
+if [ -n "$new_head" ] && [ "$(remote_git rev-parse "$new_head^")" = "$fork_sha" ] && [ "$(remote_git log -1 --format=%s "$new_head")" = "fix: Raised the connection pool ceiling in README.md so the service" ] && [ "$(remote_git log -1 --format=%B "$new_head" | sed '/^$/d' | tail -n 1)" = "$change_trailer" ]; then echo "ok   the named branch holds the commit, one on top of the starting commit, ending with the change trailer"; else echo "FAIL $branch_a: $new_head out: $(tail -n 5 "$out")"; fail=1; fi
+push_at="$(order_index "push https://github.com/acme/app.git HEAD:refs/heads/$branch_a")"
+close_at="$(order_index "gh pr close 7 --repo acme/app")"
+create_at="$(order_index "gh pr create")"
+if [ -n "$push_at" ] && [ -n "$close_at" ] && [ -n "$create_at" ] && [ "$push_at" -lt "$close_at" ] && [ "$close_at" -lt "$create_at" ]; then echo "ok   the order is push, close the old pull request, open the new one"; else echo "FAIL order: push=$push_at close=$close_at create=$create_at: $(cat "$work/order.log" | cut -c1-160)"; fail=1; fi
+if grep -qF -- "pr create --repo acme/app --head $branch_a --base main --title fix: raise the connection pool ceiling --body-file" "$gh_log" && ! grep -qF -- '--draft' "$gh_log"; then echo "ok   the new pull request is opened with the given head, base and title, not as a draft"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+if grep -qF "Raised the pool ceiling." "$gh_body" && grep -qxF "$change_trailer" "$gh_body"; then echo "ok   the body is the one SRE Agent gave"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+if jq -e '.change == {result: "replaced", pr_url: "https://github.com/acme/app/pull/12", pr_number: 12} and (has("pr_url") | not) and (.summary | endswith("This change was opened as https://github.com/acme/app/pull/12, replacing acme/app#7. Nothing has verified it in a running system."))' <<<"$report" >/dev/null; then echo "ok   the report is replaced with the new pull request's url and number, and no top level pr_url"; else echo "FAIL report: $report"; fail=1; fi
+if ! grep -qE 'push.*( --force| -f |\+| --delete)' "$git_log"; then echo "ok   nothing was forced or deleted"; else echo "FAIL pushes: $(grep ' push ' "$git_log")"; fail=1; fi
+stop_fixture
+
+# The replace answer a run writes for itself once it knows the commit somebody
+# else pushed (the stub opencode fills __MOVED__ with it as it pushes).
+moved_answer() {
+  jq -nc --arg b "$1" --arg base "${2:-main}" \
+    '[{status: 200, body: {decision: "replace", branch: $b, base_ref: $base, start_sha: "__MOVED__", closing: true, number: 7,
+       title: "fix: raise the connection pool ceiling", body: "Raised the pool ceiling.\n", draft: false}}]' > "$work/answer.template"
+  export STUB_ANSWER_TEMPLATE="$work/answer.template" STUB_ANSWER_FILE="$replacement_file"
+}
+unset_moved_answer() { unset STUB_ANSWER_TEMPLATE STUB_ANSWER_FILE; }
+
+echo "--- 92. a start commit that differs from the one the change was made on is reached by a cherry-pick ---"
+branch_b="sre-agent/manual_request-5e6f7a8b"
+base_a="$(make_branch release-x)"
+moved_answer "$branch_b" release-x
+export STUB_OPENCODE_MODE=fix_moves STUB_REMOTE="$remote" STUB_BRANCH=release-x
+start_fixture replace_cherry
+queue_change h-replace-cherry "$(replace_change "$base_a" base release-x)"
+run_once replace_cherry
+export STUB_OPENCODE_MODE=fix
+unset_moved_answer
+base_b="$(head_of release-x)"
+new_b="$(head_of "$branch_b")"
+call="$(jq -c 'select(.path | endswith("/replacement")) | .body' "$fixture_log" | head -n 1)"
+if [ "$base_b" != "$base_a" ] && jq -e --arg made "$base_a" '.reason == null and .made_on == $made' <<<"$call" >/dev/null; then echo "ok   the call says the change was made on the commit the job named"; else echo "FAIL call: $call"; fail=1; fi
+if [ -n "$new_b" ] && [ "$(remote_git rev-parse "$new_b^")" = "$base_b" ] && [ "$(remote_git show "$new_b:README.md" | tail -n 1)" = "a line the fix added" ] && remote_git cat-file -e "$new_b:colleague.txt" && [ "$(remote_git log -1 --format=%B "$new_b" | sed '/^$/d' | tail -n 1)" = "$change_trailer" ]; then echo "ok   the pushed commit sits on the newer base commit, carries the change and keeps its trailer"; else echo "FAIL $branch_b: $new_b out: $(tail -n 8 "$out")"; fail=1; fi
+if jq -e '.change.result == "replaced"' <<<"$report" >/dev/null && grep -qF -- "pr create --repo acme/app --head $branch_b --base release-x " "$gh_log"; then echo "ok   it is opened against the base the answer names and reported replaced"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 93. a push refusal on a replaceable push-mode change with a replace answer continues as a replacement in the same run ---"
+branch_c="sre-agent/manual_request-9c8d7e6f"
+sha_c="$(make_branch feature/race-continue)"
+moved_answer "$branch_c" main
+export STUB_OPENCODE_MODE=fix_moves STUB_REMOTE="$remote" STUB_BRANCH=feature/race-continue
+start_fixture replace_continue
+queue_change h-replace-continue "$(push_change feature/race-continue "$sha_c" '{"replaceable": true}')"
+run_once replace_continue
+export STUB_OPENCODE_MODE=fix
+unset_moved_answer
+head_c="$(head_of feature/race-continue)"
+new_c="$(head_of "$branch_c")"
+call="$(jq -c 'select(.path | endswith("/replacement")) | .body' "$fixture_log" | head -n 1)"
+if jq -e --arg sha "$head_c" '.reason == {kind: "branch_moved", sha: $sha}' <<<"$call" >/dev/null && [ "$(grep -c '^argv:' "$opencode_log")" -eq 1 ]; then echo "ok   the refusal is the reason of the call, and the agent ran once"; else echo "FAIL call: $call agent runs: $(grep -c '^argv:' "$opencode_log")"; fail=1; fi
+if [ -n "$new_c" ] && [ "$(remote_git rev-parse "$new_c^")" = "$head_c" ] && jq -e '.change.result == "replaced"' <<<"$report" >/dev/null; then echo "ok   the replacement is cut onto the moved head and reported replaced"; else echo "FAIL $branch_c: $new_c report: $report out: $(tail -n 8 "$out")"; fail=1; fi
+if [ "$(head_of feature/race-continue)" = "$head_c" ]; then echo "ok   the pull request's own branch keeps the colleague's head"; else echo "FAIL feature/race-continue moved"; fail=1; fi
+stop_fixture
+
+echo "--- 94. a refused branch push reports replace_failed branch and closes nothing ---"
+branch_d="sre-agent/manual_request-reject"
+printf '%s' "refs/heads/$branch_d" > "$work/ctl/reject_push"
+replace_answer "$branch_d" "$fork_sha" true false
+start_fixture replace_reject
+queue_change h-replace-reject "$(replace_change "$fork_sha")"
+run_once replace_reject
+rm -f "$work/ctl/reject_push"
+if jq -e '.change.result == "replace_failed" and .change.stage == "branch" and (.change.message | contains("Protected branch update failed") and length <= 300)' <<<"$report" >/dev/null && ! branch_exists "$branch_d"; then echo "ok   replace_failed at the branch step, with GitHub's own words, and no branch exists"; else echo "FAIL report: $report"; fail=1; fi
+if ! grep -qE 'pr (close|create)' "$gh_log"; then echo "ok   the old pull request is not closed and no new one is opened"; else echo "FAIL gh calls: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 95. a refused close deletes the branch it pushed and reports replace_failed close; nothing is opened ---"
+branch_e="sre-agent/manual_request-closefail"
+touch "$work/ctl/fail_close"
+replace_answer "$branch_e" "$fork_sha" true false
+start_fixture replace_closefail
+queue_change h-replace-closefail "$(replace_change "$fork_sha")"
+run_once replace_closefail
+rm -f "$work/ctl/fail_close"
+if jq -e '.change.result == "replace_failed" and .change.stage == "close" and (.change.message | contains("closePullRequest"))' <<<"$report" >/dev/null && ! branch_exists "$branch_e"; then echo "ok   replace_failed at the close step, and the branch it pushed is gone"; else echo "FAIL report: $report exists: $(branch_exists "$branch_e" && echo yes)"; fail=1; fi
+if grep -qF -- "push https://github.com/acme/app.git --delete refs/heads/$branch_e" "$git_log" && ! grep -qF 'pr create' "$gh_log"; then echo "ok   the branch is deleted by name, never forced, and no pull request is opened"; else echo "FAIL git: $(grep ' push ' "$git_log") gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 96. a pull request GitHub already has for the branch is reported replaced with that one ---"
+branch_f="sre-agent/manual_request-exists"
+touch "$work/ctl/create_exists"
+printf '%s\n' '[{"number":12,"url":"https://github.com/acme/app/pull/12"}]' > "$work/ctl/pr_list"
+replace_answer "$branch_f" "$fork_sha" true false
+start_fixture replace_exists
+queue_change h-replace-exists "$(replace_change "$fork_sha")"
+run_once replace_exists
+rm -f "$work/ctl/create_exists" "$work/ctl/pr_list"
+if jq -e '.change == {result: "replaced", pr_url: "https://github.com/acme/app/pull/12", pr_number: 12}' <<<"$report" >/dev/null && grep -qF -- "pr list --repo acme/app --head $branch_f --json number,url" "$gh_log"; then echo "ok   the pull request found for the head branch is the one reported"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 97. any other refusal to open reports replace_failed open and keeps the branch ---"
+branch_g="sre-agent/manual_request-opendenied"
+touch "$work/ctl/fail_create"
+replace_answer "$branch_g" "$fork_sha" true false
+start_fixture replace_opendenied
+queue_change h-replace-opendenied "$(replace_change "$fork_sha")"
+run_once replace_opendenied
+rm -f "$work/ctl/fail_create"
+if jq -e '.change.result == "replace_failed" and .change.stage == "open" and (.change.message | contains("createPullRequest"))' <<<"$report" >/dev/null && branch_exists "$branch_g" && grep -qF -- 'pr close 7 --repo acme/app' "$gh_log"; then echo "ok   replace_failed at the open step; the branch stays for SRE Agent to find, the old pull request was closed"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 98. a replacement call that answers 404 three times reports replace_failed claim with nothing pushed ---"
+answers '[{"status": 404, "body": {"error": "not found"}}]'
+start_fixture replace_unreachable
+queue_change h-replace-unreachable "$(replace_change "$fork_sha")"
+run_once replace_unreachable
+if [ "$(count_path /replacement)" -eq 3 ] && jq -e '.change.result == "replace_failed" and .change.stage == "claim" and (.change.message | length > 0)' <<<"$report" >/dev/null && no_push && [ ! -s "$gh_log" ]; then echo "ok   three attempts, then replace_failed at the claim; nothing was pushed and gh was not called"; else echo "FAIL replacement calls: $(count_path /replacement) report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 99. a heartbeat answered taken_over before the close stops the run: nothing closed, nothing opened, no report ---"
+branch_h="sre-agent/manual_request-takenclose"
+rm -f "$work/take.flag"
+printf '%s' "$work/take.flag" > "$work/ctl/take_on_push"
+export FIXTURE_HEARTBEAT_SECONDS=1 FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_HEARTBEAT_AFTER_FILE="$work/take.flag"
+replace_answer "$branch_h" "$fork_sha" true false
+start_fixture replace_taken_close
+queue_change h-replace-taken-close "$(replace_change "$fork_sha")"
+run_once replace_taken_close
+rm -f "$work/ctl/take_on_push"
+unset FIXTURE_HEARTBEAT_SECONDS FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE
+if [ "$rc" -eq 0 ] && ! grep -qE 'pr (close|create)' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-close was taken from this runner (taken_over), so it is not reported' "$out"; then echo "ok   nothing was closed or opened, nothing is reported, and the log says why"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 99b. a heartbeat answered taken_over between the close and the open stops the run before the open ---"
+branch_i="sre-agent/manual_request-takenopen"
+rm -f "$work/take.flag"
+printf '%s' "$work/take.flag" > "$work/ctl/take_on_close"
+export FIXTURE_HEARTBEAT_SECONDS=1 FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_HEARTBEAT_AFTER_FILE="$work/take.flag"
+replace_answer "$branch_i" "$fork_sha" true false
+start_fixture replace_taken_open
+queue_change h-replace-taken-open "$(replace_change "$fork_sha")"
+run_once replace_taken_open
+rm -f "$work/ctl/take_on_close"
+unset FIXTURE_HEARTBEAT_SECONDS FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE
+if [ "$rc" -eq 0 ] && ! grep -qF 'pr create' "$gh_log" && grep -qF 'pr close 7 --repo acme/app' "$gh_log" && [ "$(count_path /report)" -eq 0 ] && grep -q 'h-replace-taken-open was taken from this runner (taken_over), so it is not reported' "$out"; then echo "ok   no pull request is opened after the answer, and nothing is reported"; else echo "FAIL rc=$rc gh: $(cat "$gh_log") reports: $(count_path /report) out: $(grep -E 'taken' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 100. closing false opens without closing, and draft true opens a draft ---"
+branch_j="sre-agent/manual_request-noclose"
+replace_answer "$branch_j" "$fork_sha" false true
+start_fixture replace_noclose
+queue_change h-replace-noclose "$(replace_change "$fork_sha")"
+run_once replace_noclose
+if jq -e '.change.result == "replaced"' <<<"$report" >/dev/null && ! grep -qF 'pr close' "$gh_log" && grep -qF -- "--head $branch_j --base main --title fix: raise the connection pool ceiling --body-file" "$gh_log" && grep -qF -- '--draft' "$gh_log"; then echo "ok   no close is attempted for a merged pull request, and the draft the answer asks for is a draft"; else echo "FAIL report: $report gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
 remote_git update-ref -d refs/pull/7/head
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

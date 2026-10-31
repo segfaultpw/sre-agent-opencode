@@ -308,6 +308,12 @@ case "$mode" in
     "$git" -C "$mover/clone" add colleague.txt
     "$git" -C "$mover/clone" -c user.name=colleague -c user.email=colleague@example.invalid -c commit.gpgsign=false commit -q -m "a colleague's commit"
     "$git" -C "$mover/clone" push -q origin "${STUB_BRANCH}"
+    # The platform's answer to the replacement call names the commit somebody
+    # else just pushed, which no test knows beforehand: the template carries a
+    # placeholder for it.
+    if [ -n "${STUB_ANSWER_TEMPLATE:-}" ]; then
+      sed "s/__MOVED__/$("$git" -C "$mover/clone" rev-parse HEAD)/" "$STUB_ANSWER_TEMPLATE" > "${STUB_ANSWER_FILE:?}"
+    fi
     rm -rf "$mover"
     emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
     ;;
