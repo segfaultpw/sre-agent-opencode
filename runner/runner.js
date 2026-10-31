@@ -3206,11 +3206,14 @@ function refusalReport(refusal) {
 // since. Answers its sha, or null.
 const TRAILER_SCAN_COMMITS = 200;
 async function commitCarrying(workspace, trailer, askedOn) {
+  // -z ends each commit with a NUL, which no commit message can hold, so a message cannot
+  // forge the start of another record; `--` ends the revisions, so a tracked file named
+  // HEAD (or like the asked head) is never read as a path.
   const scan = async (range) => {
-    const listing = await gitIn(workspace, ['log', '-n', String(TRAILER_SCAN_COMMITS), '--format=%x01%H%n%B', ...range]);
-    for (const entry of listing.split('\u0001').filter(Boolean)) {
+    const listing = await gitIn(workspace, ['log', '-z', '-n', String(TRAILER_SCAN_COMMITS), '--format=%H%n%B', ...range, '--']);
+    for (const entry of listing.split('\0').filter(Boolean)) {
       const [sha, ...lines] = entry.split('\n');
-      if (lines.some((line) => line.trim() === trailer)) return sha.trim();
+      if (HEX40.test(sha.trim()) && lines.some((line) => line.trim() === trailer)) return sha.trim();
     }
     return null;
   };

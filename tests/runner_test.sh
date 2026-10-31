@@ -3046,6 +3046,43 @@ if [ "$rc" -eq 0 ] && [ "$(count_path /replacement)" -eq 1 ] && [ "$(count_path 
 stop_fixture
 remote_git update-ref -d refs/pull/7/head
 
+echo "--- 112. a repository that tracks a root file named HEAD does not break the search for an earlier push ---"
+git_seed checkout -q -B feature/headfile main
+printf 'a file with the name of a revision\n' > "$work/seed/HEAD"
+git_seed add -A
+git_seed commit -q -m "track a file named HEAD"
+git_seed push -q "$remote" feature/headfile
+sha_hf="$(git_seed rev-parse HEAD)"
+git_seed checkout -q main
+for asked in "$sha_hf" "$(printf 'f%.0s' $(seq 1 40))"; do
+  # A second trailer for the second run: the first run's own push is on the branch by then.
+  start_fixture change_headfile
+  queue_change h-change-headfile "$(push_change feature/headfile "$asked" "$(jq -nc --arg b "Asked for by Jane on acme/app#7.
+
+SRE-Agent-Change: ${asked:0:8}-2222-3333-4444-555555555555" '{commit_body: $b}')")"
+  run_once change_headfile
+  if jq -e '.change.result == "pushed"' <<<"$report" >/dev/null && [ "$(head_of feature/headfile)" != "$sha_hf" ] && ! no_agent_ran; then echo "ok   asked on ${asked:0:7}: the search finds no earlier push, the agent runs and the change is pushed"; else echo "FAIL asked on ${asked:0:7}: report: $report"; fail=1; fi
+  stop_fixture
+done
+
+echo "--- 113. a commit message with a control character and a fake record cannot name another commit ---"
+fake_sha="$(printf 'z%.0s' $(seq 1 40))"
+sha_odd="$(make_branch feature/odd-body "$(printf 'fix: an odd body\n\nbody\001%s\n%s' "$fake_sha" "$change_trailer")")"
+start_fixture change_odd_body
+queue_change h-change-odd-body "$(push_change feature/odd-body "$sha_odd")"
+run_once change_odd_body
+if jq -e --arg sha "$sha_odd" '.change == {result: "pushed", commit_sha: $sha}' <<<"$report" >/dev/null && [ "$(head_of feature/odd-body)" = "$sha_odd" ] && no_push && no_agent_ran; then echo "ok   the commit that carries the trailer is reported by its own sha, never the one a message names"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 114. a trailer on a commit before the head the change was asked on is not this run's push ---"
+sha_before="$(make_branch feature/before-asked "$(printf 'fix: an older change\n\n%s' "$change_trailer")")"
+sha_asked="$(advance_branch feature/before-asked)"
+start_fixture change_before_asked
+queue_change h-change-before-asked "$(push_change feature/before-asked "$sha_asked")"
+run_once change_before_asked
+if jq -e '.change.result == "pushed" and .change.commit_sha != "'"$sha_before"'"' <<<"$report" >/dev/null && [ "$(remote_git rev-parse "$(head_of feature/before-asked)^")" = "$sha_asked" ] && ! no_agent_ran; then echo "ok   the older trailer is ignored: the agent runs and a new commit lands on the asked head"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"
