@@ -2,6 +2,23 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.5.0
+
+The runner holds an expiring token instead of the poll key, runs your hooks around every request, reports its progress while it works, can work several requests at once, and tells ECS not to stop its task in the middle of a fix.
+
+What an operator gets. Everything below is optional and off until you set its variable; a runner that sets none of the new variables behaves exactly as v2.4.1, apart from the token exchange described first, which falls back to the key when the platform does not have it.
+
+- Tokens in place of the key. Before its first poll the runner calls `POST /api/fix_runner/token` with `SRE_API_KEY` and polls with the expiring token it gets back (an hour, renewed at 70% of its life, never longer than 24 hours from its first mint). `SRE_API_KEY` may also be a token (`sre_frt_...`) that something else minted, so a host that only runs the runner need not hold the long-lived key; it stops with a sentence when the token reaches its cap. Revoking the key ends its tokens on their next request. A platform without the exchange answers 404 and the runner uses the key exactly as before.
+- Hooks. `SRE_HOOKS_DIR` holds the executables `pre-run`, `credentials` and `post-run`, run as the runner's account (never the agent's) around every fix request, change on a pull request and test job. `pre-run` and `credentials` failing, timing out (`SRE_HOOK_TIMEOUT_SECONDS`, 60 by default) or printing a refused name fail the request with the hook's name; `post-run` runs however the request ended and its failure is only logged. The `NAME=value` lines `credentials` prints become the agent's environment for that request alone and are redacted from every log, report and error. `PATH`, `HOME`, `ENV`, `BASH_ENV`, `NODE_OPTIONS`, `NODE_PATH`, `GH_TOKEN`, `GITHUB_TOKEN` and anything starting `SRE_`, `OPENCODE_` or `GIT_` are refused. The runner refuses to start with a hooks directory on the workspace or one the agent's account could write.
+- A role per request. With `SRE_AGENT_AWS_ROLE_ARN` and `SRE_AGENT_AWS_ACCESS=1` the runner assumes that role for each request (session `sre-` and the first eight characters of the handoff id, one hour) and gives the agent those expiring credentials instead of its own AWS identity.
+- Progress. Every heartbeat carries the phase (`collected`, `cloning`, `agent`, `checks`, `publishing`) and, during the agent's phase, the number of tool calls and the kind of the last one, and a phase change sends one extra beat. Nothing the agent ran or read is sent. A platform that does not read it ignores the key.
+- Several requests at once. `SRE_CONCURRENCY` (1 to 8) starts that many complete runners under a supervisor in one container or on one machine, each with its own instance id (`<name>-<n>`), its own directory under `instances/` and its own heartbeat, restarted when one crashes and stopped together. Plan for about one CPU and 2 GiB per worker. 1 or unset starts the runner itself, as before.
+- ECS task protection. While a worker holds a request the runner turns on ECS scale-in protection for its task (60 minutes at most) and turns it off when none does; workers of one task share it. A task role without `ecs:UpdateTaskProtection` gets one info line and no further calls, and a request never fails on it. `SRE_TASK_PROTECTION=off` disables it.
+
+New variables, all optional: `SRE_HOOKS_DIR`, `SRE_HOOK_TIMEOUT_SECONDS`, `SRE_AGENT_AWS_ROLE_ARN`, `SRE_CONCURRENCY`, `SRE_TASK_PROTECTION`. `SRE_API_KEY` may now be a runner token.
+
+What a customer must change on upgrade: nothing.
+
 ## v2.4.1
 
 opencode's database no longer lives on the workspace volume.
