@@ -142,6 +142,29 @@ elif [ -n "${SRE_AGENT_USER:-}" ]; then
   resolve_account agent "$SRE_AGENT_USER" SRE_AGENT
 fi
 
+# One agent account per worker. With SRE_CONCURRENCY above 1 the workers run in
+# one container, and the agent's account is what keeps one request's agent out of
+# another's (its environment, its checkout and its home) and keeps one worker's
+# cleanup, which ends every process of its agent's account, from ending another
+# worker's run. So worker n gets its own account: the agent account for worker 1
+# and <agent account>-<n> for the rest (the image and the systemd installer make
+# eight), handed to the supervisor as SRE_AGENT_<n>_UID, _GID, _HOME and _USER.
+# A start with fewer accounts than workers is refused, never shared. Without an
+# agent account at all (no split) there is nothing to resolve.
+if [[ "${SRE_CONCURRENCY:-}" =~ ^[2-8]$ ]] && [ -n "${SRE_AGENT_UID:-}" ]; then
+  base_agent_user="${SRE_AGENT_USER:-agent}"
+  for ((worker = 1; worker <= SRE_CONCURRENCY; worker++)); do
+    if [ "$worker" = 1 ]; then worker_user="$base_agent_user"; else worker_user="${base_agent_user}-${worker}"; fi
+    if ! worker_uid="$(id -u "$worker_user" 2>/dev/null)" || ! worker_gid="$(id -g "$worker_user" 2>/dev/null)"; then
+      echo "sre-agent-fix-runner: SRE_CONCURRENCY=${SRE_CONCURRENCY} needs one agent account for each worker, and the account ${worker_user} for worker ${worker} does not exist on this machine; a worker never shares an agent account with another, so create the accounts (the container image and install-runner.sh make ${base_agent_user}-2 to ${base_agent_user}-8) or lower SRE_CONCURRENCY" >&2
+      exit 2
+    fi
+    worker_home="$(getent passwd "$worker_user" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$worker_home" ]; then worker_home="/"; fi
+    export "SRE_AGENT_${worker}_UID=${worker_uid}" "SRE_AGENT_${worker}_GID=${worker_gid}" "SRE_AGENT_${worker}_HOME=${worker_home}" "SRE_AGENT_${worker}_USER=${worker_user}"
+  done
+fi
+
 # An optional setup script of the operator's, for what the image does not carry
 # (system packages, a certificate, a proxy setting). It is a file in the
 # container, mounted or baked into a derived image, and the runner never fetches

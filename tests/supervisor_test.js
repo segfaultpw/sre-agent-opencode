@@ -52,7 +52,7 @@ function stage() {
 const fs = require('node:fs');
 const log = process.env.STUB_LOG;
 const instance = process.env.SRE_RUNNER_INSTANCE;
-fs.appendFileSync(log, JSON.stringify({ event: 'start', instance, pid: process.pid, perInstance: process.env.SRE_WORKSPACE_PER_INSTANCE, concurrency: process.env.SRE_CONCURRENCY === undefined ? null : process.env.SRE_CONCURRENCY }) + '\\n');
+fs.appendFileSync(log, JSON.stringify({ event: 'start', instance, pid: process.pid, perInstance: process.env.SRE_WORKSPACE_PER_INSTANCE, concurrency: process.env.SRE_CONCURRENCY === undefined ? null : process.env.SRE_CONCURRENCY, agent: { uid: process.env.SRE_AGENT_UID || null, gid: process.env.SRE_AGENT_GID || null, home: process.env.SRE_AGENT_HOME || null, user: process.env.SRE_AGENT_USER || null }, numbered: Object.keys(process.env).filter((name) => /^SRE_AGENT_[0-9]+_/.test(name)) }) + '\\n');
 console.log('hello from ' + instance);
 const mode = process.env.STUB_MODE || 'wait';
 if (mode === 'exit0') process.exit(0);
@@ -147,6 +147,75 @@ async function main() {
       }
       assert.ok(await until(() => /\[pool-3\] hello from pool-3/.test(run.out)), run.out);
       assert.match(run.out, /\[pool-1\] hello from pool-1/);
+    } finally {
+      run.child.kill('SIGKILL');
+    }
+  });
+
+  const accounts = (count, base = 20000) => {
+    const env = { SRE_AGENT_UID: String(base), SRE_AGENT_GID: String(base), SRE_AGENT_HOME: '/agents/home', SRE_AGENT_USER: 'agent', SRE_RUNNER_UID: '19999', SRE_RUNNER_GID: '19999' };
+    for (let n = 1; n <= count; n += 1) {
+      env[`SRE_AGENT_${n}_UID`] = String(base + n * 10);
+      env[`SRE_AGENT_${n}_GID`] = String(base + n * 10);
+      env[`SRE_AGENT_${n}_HOME`] = '/agents/home';
+      env[`SRE_AGENT_${n}_USER`] = n === 1 ? 'agent' : `agent-${n}`;
+    }
+    return env;
+  };
+
+  await check('with the account split on, every worker gets an agent account of its own and none of the numbered variables', async () => {
+    const run = launch({ SRE_CONCURRENCY: '3', ...accounts(3) });
+    try {
+      assert.ok(await until(() => run.events().length === 3), run.err);
+      const byInstance = Object.fromEntries(run.events().map((event) => [event.instance, event]));
+      assert.deepEqual(
+        ['pool-1', 'pool-2', 'pool-3'].map((id) => byInstance[id].agent),
+        [1, 2, 3].map((n) => ({ uid: String(20000 + n * 10), gid: String(20000 + n * 10), home: '/agents/home', user: n === 1 ? 'agent' : `agent-${n}` }))
+      );
+      for (const event of run.events()) assert.deepEqual(event.numbered, []);
+    } finally {
+      run.child.kill('SIGKILL');
+    }
+  });
+
+  await check('more workers than agent accounts is refused with exit 2 and a sentence, never a shared account', async () => {
+    const run = launch({ SRE_CONCURRENCY: '3', ...accounts(2) });
+    await run.done;
+    assert.equal(run.code, 2, run.err);
+    assert.match(run.err, /needs 3 agent accounts, one for each worker, and the account for worker 3 is not configured/);
+    assert.equal(run.events().length, 0);
+  });
+
+  await check('two workers on one agent uid, or an agent account that is the runner\'s or root, is refused with exit 2', async () => {
+    const same = accounts(2);
+    same.SRE_AGENT_2_UID = same.SRE_AGENT_1_UID;
+    const first = launch({ SRE_CONCURRENCY: '2', ...same });
+    await first.done;
+    assert.equal(first.code, 2);
+    assert.match(first.err, /user id and a group id each of their own/);
+    const sameGid = accounts(2);
+    sameGid.SRE_AGENT_2_GID = sameGid.SRE_AGENT_1_GID;
+    const gid = launch({ SRE_CONCURRENCY: '2', ...sameGid });
+    await gid.done;
+    assert.equal(gid.code, 2);
+    const runner = accounts(2);
+    runner.SRE_AGENT_2_UID = runner.SRE_RUNNER_UID;
+    const own = launch({ SRE_CONCURRENCY: '2', ...runner });
+    await own.done;
+    assert.equal(own.code, 2);
+    assert.match(own.err, /runner's own account or root/);
+    const root = accounts(2);
+    root.SRE_AGENT_2_UID = '0';
+    const asRoot = launch({ SRE_CONCURRENCY: '2', ...root });
+    await asRoot.done;
+    assert.equal(asRoot.code, 2);
+  });
+
+  await check('with no agent account at all (the split off) any number of workers starts, with none handed over', async () => {
+    const run = launch({ SRE_CONCURRENCY: '4' });
+    try {
+      assert.ok(await until(() => run.events().length === 4), run.err);
+      for (const event of run.events()) assert.deepEqual(event.agent, { uid: null, gid: null, home: null, user: null });
     } finally {
       run.child.kill('SIGKILL');
     }
@@ -264,6 +333,33 @@ async function main() {
       child.kill('SIGTERM');
       await new Promise((resolve) => child.on('close', resolve));
     }
+  });
+
+  await check('the entrypoint refuses SRE_CONCURRENCY above the number of agent accounts, naming the account that is missing', () => {
+    const bin = path.join(work, 'bin-noaccounts');
+    fs.mkdirSync(bin);
+    for (const tool of ['git', 'gh', 'opencode', 'setpriv']) fs.writeFileSync(path.join(bin, tool), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const workspace = path.join(work, 'noaccounts-ws');
+    fs.mkdirSync(workspace);
+    const me = spawnSync('id', ['-un'], { encoding: 'utf8' }).stdout.trim();
+    const result = spawnSync(path.join(packageRoot, 'runner', 'entrypoint.sh'), [], {
+      env: {
+        PATH: `${bin}:${process.env.PATH}`,
+        HOME: work,
+        SRE_SERVER_URL: 'http://127.0.0.1:9',
+        SRE_API_KEY: 'sre-agent-poll-entrypoint-test-0000000000000000000000',
+        SRE_MODEL: 'openrouter/deepseek/deepseek-v4-pro',
+        SRE_WORKSPACE: workspace,
+        SRE_AGENT_USER: me,
+        SRE_CONCURRENCY: '2',
+      },
+      encoding: 'utf8',
+      timeout: 20_000,
+    });
+    if (process.getuid() === 0) return;
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, new RegExp(`the account ${me}-2 for worker 2 does not exist`));
+    assert.match(result.stderr, /never shares an agent account/);
   });
 
   await check('the entrypoint with an invalid SRE_CONCURRENCY exits 2', () => {

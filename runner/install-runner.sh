@@ -159,6 +159,22 @@ if ! getent passwd "$AGENT_ACCOUNT" >/dev/null 2>&1; then
   echo "created the ${AGENT_ACCOUNT} account"
 fi
 
+# Seven more, ${AGENT_ACCOUNT}-2 to -8, for SRE_CONCURRENCY above 1: each worker
+# runs its agent as an account of its own, so one request's agent cannot read
+# another's environment, checkout or home, and one worker ending the processes of
+# its agent's account ends nobody else's. Made the same way as the first.
+for worker in 2 3 4 5 6 7 8; do
+  extra_account="${AGENT_ACCOUNT}-${worker}"
+  if ! getent group "$extra_account" >/dev/null 2>&1; then
+    groupadd --system "$extra_account"
+  fi
+  if ! getent passwd "$extra_account" >/dev/null 2>&1; then
+    useradd --system --gid "$extra_account" --home-dir "$AGENT_HOME" --no-create-home \
+      --shell /usr/sbin/nologin --comment "SRE Agent fix runner, the agent's own account (worker ${worker})" "$extra_account"
+    echo "created the ${extra_account} account"
+  fi
+done
+
 package_path="$(at "$PACKAGE_DIR")"
 state_path="$(at "$STATE_DIR")"
 workspace_path="$(at "$WORKSPACE_DIR")"
@@ -266,6 +282,11 @@ SRE_GITHUB_TOKEN=
 
 # Optional. debug, info, warn or error.
 # SRE_LOG_LEVEL=info
+
+# Optional. How many requests this machine works at once, 1 to 8. Each worker
+# needs about one CPU and 2 GiB of memory and runs its agent as an account of its
+# own (sre-agent-fix-agent-2 to -8 were made by this script).
+# SRE_CONCURRENCY=1
 TEMPLATE
   chown root:root "$env_path"
   echo "wrote ${ENV_FILE} as a template, 0600 and owned by root"

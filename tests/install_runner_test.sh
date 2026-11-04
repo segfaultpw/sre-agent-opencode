@@ -191,6 +191,11 @@ agent_useradd="$(grep "^useradd .* ${agent_account}\$" "$STUB_LOG" || true)"
 for needle in "--system" "--gid ${agent_account}" "--home-dir ${state_dir}/agent-home" "nologin"; do
   if [[ "$agent_useradd" == *"$needle"* ]]; then echo "ok   the agent account is created with ${needle}"; else echo "FAIL agent useradd was '${agent_useradd}'"; fail=1; fi
 done
+for worker in 2 3 4 5 6 7 8; do
+  extra_useradd="$(grep "^useradd .* ${agent_account}-${worker}\$" "$STUB_LOG" || true)"
+  if grep -q "groupadd --system ${agent_account}-${worker}\$" "$STUB_LOG" && [[ "$extra_useradd" == *"--gid ${agent_account}-${worker}"* ]] && [[ "$extra_useradd" == *"--system"* ]] && [[ "$extra_useradd" == *"nologin"* ]]; then :; else echo "FAIL the account for worker ${worker} was not made like the first: '${extra_useradd}'"; fail=1; fi
+done
+echo "ok   seven more agent accounts (${agent_account}-2 to -8) are made like the first, one per extra worker of SRE_CONCURRENCY"
 if grep -q "chown ${service}:${service} .*${root}${state_dir}/agent-home" "$STUB_LOG" && ! grep -q "chown ${agent_account}:${agent_account} ${root}${state_dir}/agent-home" "$STUB_LOG"; then echo "ok   the directory above the per-repository homes belongs to the runner's account, which hands each home to the agent only for a run"; else echo "FAIL the agent-home directory was given to the wrong account: $(cat "$STUB_LOG")"; fail=1; fi
 # The agent runs as that account, so the package it loads its fences from must
 # not belong to it.

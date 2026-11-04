@@ -455,6 +455,59 @@ d.yml"
     jq -cn --arg m "$long" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderError", data: {message: $m}}}'
     exit 1
     ;;
+  workers)
+    # Two workers of one runner, each with an agent account of its own, for
+    # tests/uid_split_test.sh. The run in acme/app is quick and ends while the
+    # other, in acme/other, is still going; that one looks at the first from the
+    # inside (its processes' environment, its checkout, its agent home) and then
+    # has to be allowed to finish, which it is not if the quick one's cleanup
+    # ended every process of an account the two shared.
+    ws="${STUB_PROBE_WORKSPACE:?}"
+    printf 'start %s %s %s\n' "$(id -u)" "$PWD" "$(date +%s%N)" >> "${STUB_OPENCODE_TIMING:?}"
+    case "$PWD" in
+      */acme/app)
+        sleep "${STUB_QUICK:-4}"
+        ;;
+      *)
+        sleep 1.5
+        own="$(id -u)"
+        other_uid=""
+        for candidate in ${STUB_AGENT_UIDS:?}; do
+          if [ "$candidate" != "$own" ]; then other_uid="$candidate"; fi
+        done
+        other_instance=""
+        for candidate in ${STUB_INSTANCES:?}; do
+          case "$PWD" in
+            */instances/"$candidate"/*) ;;
+            *) other_instance="$candidate" ;;
+          esac
+        done
+        others=0
+        readable=0
+        for proc in /proc/[0-9]*; do
+          if [ "$(stat -c %u "$proc" 2>/dev/null)" = "$other_uid" ]; then
+            others=$((others + 1))
+            if cat "$proc/environ" >/dev/null 2>&1; then readable=$((readable + 1)); fi
+          fi
+        done
+        allowed() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
+        {
+          printf 'own: %s\n' "$own"
+          printf 'other_agent_processes: %s\n' "$others"
+          printf 'other_environ_readable: %s\n' "$readable"
+          printf 'other_checkout_list: %s\n' "$(allowed ls "$ws/instances/$other_instance/repos/acme/app")"
+          printf 'other_checkout_read: %s\n' "$(allowed cat "$ws/instances/$other_instance/repos/acme/app/README.md")"
+          printf 'other_checkout_write: %s\n' "$(allowed bash -c ": >> '$ws/instances/$other_instance/repos/acme/app/README.md'")"
+          printf 'other_home_list: %s\n' "$(allowed ls "$ws/instances/$other_instance/agent-home/acme/app")"
+          printf 'other_instance_list: %s\n' "$(allowed ls "$ws/instances/$other_instance")"
+        } >> "${STUB_WORKERS_PROBE:?}"
+        sleep "${STUB_SLOW:-7}"
+        ;;
+    esac
+    printf 'a line the fix added\n' >> README.md
+    printf 'end %s %s %s\n' "$(id -u)" "$PWD" "$(date +%s%N)" >> "$STUB_OPENCODE_TIMING"
+    emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
+    ;;
   timed)
     # Records when the run started and ended, and where, so a case can say
     # whether two runs overlapped.

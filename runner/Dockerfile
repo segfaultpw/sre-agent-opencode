@@ -161,6 +161,17 @@ RUN groupadd --gid 10001 runner \
     && useradd --uid 10002 --gid agent \
        --home-dir /workspace/agent-home --no-create-home --shell /usr/sbin/nologin agent \
     && chmod 0700 /home/runner
+# Seven more agent accounts, agent-2 to agent-8, for SRE_CONCURRENCY above 1: each
+# worker runs its agent as an account of its own (see runner/supervisor.js), so
+# one request's agent cannot read another's environment, checkout or home, and
+# one worker ending the processes of its agent's account ends nobody else's.
+# Same shape as agent: no shell, no home created, and ids that are fixed.
+RUN set -eux; \
+    for n in 2 3 4 5 6 7 8; do \
+      id=$((10001 + n)); \
+      groupadd --gid "$id" "agent-$n"; \
+      useradd --uid "$id" --gid "agent-$n" --home-dir /workspace/agent-home --no-create-home --shell /usr/sbin/nologin "agent-$n"; \
+    done
 ENV SRE_RUNNER_USER=runner
 ENV SRE_AGENT_USER=agent
 

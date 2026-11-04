@@ -464,6 +464,82 @@ prove root "$runner_uid" setpriv --groups=20001,20002 --
 prove caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
 
+# SRE_CONCURRENCY=2: two workers of one runner, each with an agent account of its
+# own (the entrypoint resolves them and hands them over as SRE_AGENT_<n>_*; here
+# the test does the same). The quick worker finishes while the other's agent is
+# still running: its cleanup ends every process of its own agent's account and
+# must end nobody else's, and the other agent, which looks at the first from the
+# inside, must find its environment, checkout and home closed.
+agent2_uid=10004
+prove_workers() {
+  local label="$1" owner="$2"
+  shift 2
+  local prefix=("$@")
+  local ws="$work/$label-wk-ws" runner_home="$work/home/$label-wk-runner" agent_home="$work/home/$label-wk-agent"
+  local probe="$work/$label.wk-probe" timing="$work/$label.wk-timing" out="$work/$label.wk.out" scratch_log="$work/$label.wk-scratch"
+  echo "--- $label: two workers, each with an agent account of its own ---"
+  mkdir -p "$ws" "$runner_home" "$agent_home"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  : > "$probe"; : > "$timing"; : > "$scratch_log"
+  chmod 666 "$probe" "$timing" "$scratch_log"
+  for ctl_file in git_uid_log gh_uid_log git_home_log gh_home_log git_cred_log gh_body_log; do
+    printf '%s' "$scratch_log" > "$work/ctl/$ctl_file"
+  done
+  jq -n --arg token "$handoff_token" --arg label "$label" \
+    '[{id: ("h-wk-" + $label + "-a"), repo: "acme/app"}, {id: ("h-wk-" + $label + "-b"), repo: "acme/other"}] | map({handoff_id: .id,
+       subject_id: "11111111-2222-3333-4444-555555555555",
+       repo_full_name: .repo,
+       context_repo_full_name: null,
+       brief_url: ("BASE/api/handoffs/" + .id + "/brief"),
+       report_url: ("BASE/api/handoffs/" + .id + "/report"),
+       token: $token})' > "$work/queue-wk.json"
+  FIXTURE_QUEUE_LEASE=1 FIXTURE_QUEUE_FILE="$work/queue-wk.json" start_fixture
+  sed -i "s#BASE#${server_url}#g" "$work/queue-wk.json"
+  local rc=0
+  timeout 120 "${prefix[@]}" env SRE_ONCE=1 SRE_CONCURRENCY=2 SRE_RUNNER_INSTANCE=pool \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" SRE_AGENT_USER=agent \
+    SRE_AGENT_1_UID="$agent_uid" SRE_AGENT_1_GID="$agent_uid" SRE_AGENT_1_HOME="$agent_home" SRE_AGENT_1_USER=agent \
+    SRE_AGENT_2_UID="$agent2_uid" SRE_AGENT_2_GID="$agent2_uid" SRE_AGENT_2_HOME="$agent_home" SRE_AGENT_2_USER=agent-2 \
+    HOME="$runner_home" \
+    STUB_OPENCODE_MODE=workers STUB_OPENCODE_TIMING="$timing" STUB_WORKERS_PROBE="$probe" STUB_PROBE_WORKSPACE="$ws" \
+    STUB_AGENT_UIDS="$agent_uid $agent2_uid" STUB_INSTANCES="pool-1 pool-2" \
+    node "$work/pkg/runner/supervisor.js" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  local reports
+  # The fixture log is shared by every case, so count only this case's two handoffs.
+  reports="$(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body | select(.pr_url == "https://github.com/acme/app/pull/7")' "$work/requests.jsonl" | wc -l)"
+  if [ "$rc" -eq 0 ] && [ "$reports" -eq 2 ]; then echo "ok   $label: both workers answered their request with a pull request, the one that outlived the other's cleanup included"; else echo "FAIL $label: rc=$rc reports=$reports failures=$(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure' "$work/requests.jsonl" | tr '\n' ' ') out=$(tail -n 6 "$out")"; fail=1; return; fi
+  local uids
+  uids="$(awk '$1 == "start" { print $2 }' "$timing" | sort -u | tr '\n' ' ')"
+  if [ "$uids" = "$agent_uid $agent2_uid " ]; then echo "ok   $label: the two agents ran as two different accounts ($uids)"; else echo "FAIL $label: agent uids: $uids"; fail=1; fi
+  local quick_end slow_end
+  quick_end="$(awk '$1 == "end" && $3 ~ /acme\/app$/ { print $4 }' "$timing")"
+  slow_end="$(awk '$1 == "end" && $3 ~ /acme\/other$/ { print $4 }' "$timing")"
+  if [ -n "$quick_end" ] && [ -n "$slow_end" ] && [ "$quick_end" -lt "$slow_end" ]; then echo "ok   $label: the quick worker's run ended while the other's agent was still running"; else echo "FAIL $label: ends: quick=$quick_end slow=$slow_end"; fail=1; fi
+  if grep -qE '^other_agent_processes: [1-9]' "$probe" && grep -qx 'other_environ_readable: 0' "$probe"; then echo "ok   $label: the other agent's processes were there to read and their environment is not readable"; else echo "FAIL $label: $(cat "$probe")"; fail=1; fi
+  if grep -qx 'other_checkout_list: denied' "$probe" && grep -qx 'other_checkout_read: denied' "$probe" && grep -qx 'other_checkout_write: denied' "$probe"; then echo "ok   $label: the other worker's checkout can be neither listed, read nor written"; else echo "FAIL $label: $(grep checkout "$probe")"; fail=1; fi
+  if grep -qx 'other_home_list: denied' "$probe" && grep -qx 'other_instance_list: denied' "$probe"; then echo "ok   $label: the other worker's agent home and instance directory cannot be listed"; else echo "FAIL $label: $(grep -E 'home|instance' "$probe")"; fail=1; fi
+  if ! jq -e --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure.kind // empty' "$work/requests.jsonl" >/dev/null; then echo "ok   $label: neither request reports an agent that was stopped or survived"; else echo "FAIL $label: $(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure' "$work/requests.jsonl" | tr '\n' ' ')"; fail=1; fi
+}
+prove_workers root "$runner_uid" setpriv --groups=20001,20002 --
+prove_workers caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
+  --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
+
+# With the account split on, more workers than agent accounts is refused, and
+# never answered by sharing one.
+echo "--- the supervisor refuses a start with fewer agent accounts than workers ---"
+refusal_rc=0
+refusal_out="$(timeout 60 env SRE_ONCE=1 SRE_CONCURRENCY=3 SRE_WORKSPACE="$work/refusal-ws" SRE_RUNNER_UID="$runner_uid" SRE_RUNNER_GID="$runner_uid" \
+  SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$work/home" \
+  SRE_AGENT_1_UID="$agent_uid" SRE_AGENT_1_GID="$agent_uid" SRE_AGENT_1_HOME="$work/home" \
+  SRE_AGENT_2_UID="$agent2_uid" SRE_AGENT_2_GID="$agent2_uid" SRE_AGENT_2_HOME="$work/home" \
+  node "$work/pkg/runner/supervisor.js" 2>&1)" || refusal_rc=$?
+if [ "$refusal_rc" -eq 2 ] && grep -q 'the account for worker 3 is not configured' <<<"$refusal_out" && [ ! -e "$work/refusal-ws" ]; then echo "ok   three workers with two agent accounts: exit 2, the missing account named, nothing started"; else echo "FAIL rc=$refusal_rc out: $refusal_out"; fail=1; fi
+
 # The memory bucket (runner/bucket.js): the AWS CLI is the runner's own call, so
 # what it restores belongs to the runner's account and what it mirrors is read
 # by the runner's account, whatever the mode; the agent sees none of it.

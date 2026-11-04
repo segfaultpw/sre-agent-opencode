@@ -51,6 +51,43 @@ function workerInstances(base, count) {
   return Array.from({ length: count }, (_, index) => `${stem}-${index + 1}`);
 }
 
+// One agent account per worker. The agent has a shell and is isolated from the
+// runner, and from every other request, only by being a different account, so
+// two workers must never run their agents as one account: one's cleanup (it
+// ends every process of the account) would end the other's run, and the other
+// could read its environment, checkout and home. When the account split is on
+// (SRE_AGENT_UID is set) the entrypoint hands over account n as
+// SRE_AGENT_<n>_UID, _GID, _HOME and _USER for n = 1..K, and a start with fewer
+// accounts than workers is refused, never shared. With the split off there is
+// no agent account and nothing to hand over. Answers null (split off), an array
+// of { uid, gid, home, user } or throws an Error whose message is the refusal.
+function workerAccounts(env, count) {
+  const split = env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '';
+  if (!split) return null;
+  const accounts = [];
+  for (let n = 1; n <= count; n += 1) {
+    const read = (name) => (n === 1 && env[`SRE_AGENT_${n}_${name}`] === undefined ? env[`SRE_AGENT_${name}`] : env[`SRE_AGENT_${n}_${name}`]);
+    const uid = read('UID');
+    const gid = read('GID');
+    const home = read('HOME');
+    if (!/^[0-9]+$/.test(uid || '') || !/^[0-9]+$/.test(gid || '') || !path.isAbsolute(home || '')) {
+      throw new Error(`SRE_CONCURRENCY=${count} needs ${count} agent accounts, one for each worker, and the account for worker ${n} is not configured (the container image and the systemd installer make ${MAX_WORKERS}: the agent account and ${env.SRE_AGENT_USER || 'agent'}-2 to -${MAX_WORKERS}); a worker never shares an agent account with another, so lower SRE_CONCURRENCY or add the account`);
+    }
+    accounts.push({ uid: Number.parseInt(uid, 10), gid: Number.parseInt(gid, 10), home, user: read('USER') || '' });
+  }
+  const runnerUid = /^[0-9]+$/.test(env.SRE_RUNNER_UID || '') ? Number.parseInt(env.SRE_RUNNER_UID, 10) : process.getuid();
+  const runnerGid = /^[0-9]+$/.test(env.SRE_RUNNER_GID || '') ? Number.parseInt(env.SRE_RUNNER_GID, 10) : process.getgid();
+  const uids = new Set(accounts.map((account) => account.uid));
+  const gids = new Set(accounts.map((account) => account.gid));
+  if (uids.size !== accounts.length || gids.size !== accounts.length) {
+    throw new Error('the agent accounts of the workers must have a user id and a group id each of their own, and two of them share one');
+  }
+  if (uids.has(runnerUid) || gids.has(runnerGid) || uids.has(0)) {
+    throw new Error('an agent account of a worker is the runner\'s own account or root; the agent accounts must be distinct from the runner and from each other');
+  }
+  return accounts;
+}
+
 // Output of a worker, one line at a time, each with the worker's id in front so
 // that eight interleaved logs can still be told apart.
 function prefixLines(stream, target, label) {
@@ -80,6 +117,14 @@ function main(env = process.env) {
     process.exit(2);
   }
 
+  let accounts;
+  try {
+    accounts = workerAccounts(env, count);
+  } catch (error) {
+    process.stderr.write(`sre-agent-fix-runner: ${error.message}\n`);
+    process.exit(2);
+  }
+
   const runnerPath = path.join(__dirname, 'runner.js');
   const base = memory.instanceId(env);
   const instances = workerInstances(base, count);
@@ -101,12 +146,12 @@ function main(env = process.env) {
     }
   }
 
-  stamp('info', `starting ${count} runner workers as ${instances.join(', ')}; they share the workspace ${workspace} and the memory tree on it`);
+  stamp('info', `starting ${count} runner workers as ${instances.join(', ')}${accounts ? `, each with an agent account of its own (uids ${accounts.map((account) => account.uid).join(', ')})` : ''}; they share the workspace ${workspace} and the memory tree on it`);
 
   let stopping = false;
   let unclean = false;
   const restarts = [];
-  const workers = instances.map((instance) => ({ instance, child: null, timer: null, exited: false }));
+  const workers = instances.map((instance, index) => ({ instance, account: accounts ? accounts[index] : null, child: null, timer: null, exited: false }));
 
   const finishIfDone = () => {
     if (workers.some((worker) => worker.child || worker.timer)) return;
@@ -117,6 +162,15 @@ function main(env = process.env) {
     worker.timer = null;
     const childEnv = { ...env, SRE_RUNNER_INSTANCE: worker.instance, SRE_WORKSPACE_PER_INSTANCE: '1' };
     delete childEnv.SRE_CONCURRENCY;
+    for (const name of Object.keys(childEnv)) {
+      if (/^SRE_AGENT_[0-9]+_(UID|GID|HOME|USER)$/.test(name)) delete childEnv[name];
+    }
+    if (worker.account) {
+      childEnv.SRE_AGENT_UID = String(worker.account.uid);
+      childEnv.SRE_AGENT_GID = String(worker.account.gid);
+      childEnv.SRE_AGENT_HOME = worker.account.home;
+      if (worker.account.user) childEnv.SRE_AGENT_USER = worker.account.user;
+    }
     const child = spawn(process.execPath, [runnerPath], { env: childEnv, stdio: ['inherit', 'pipe', 'pipe'] });
     worker.child = child;
     prefixLines(child.stdout, process.stdout, worker.instance);
@@ -187,7 +241,7 @@ function main(env = process.env) {
   for (const worker of workers) start(worker);
 }
 
-module.exports = { parseConcurrency, workerInstances, main };
+module.exports = { parseConcurrency, workerInstances, workerAccounts, main };
 
 if (require.main === module) {
   main();
