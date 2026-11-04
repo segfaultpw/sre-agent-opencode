@@ -49,6 +49,11 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'opencode_log_level: %s\n' "${OPENCODE_LOG_LEVEL:-missing}"
     if [ -n "${OPENCODE_LOG_PATH+set}" ]; then printf 'sees_OPENCODE_LOG_PATH: yes\n'; else printf 'sees_OPENCODE_LOG_PATH: no\n'; fi
     if [ -n "${SRE_OPENCODE_LOG_LEVEL+set}" ]; then printf 'sees_SRE_OPENCODE_LOG_LEVEL: yes\n'; else printf 'sees_SRE_OPENCODE_LOG_LEVEL: no\n'; fi
+    # The values of the variables a case names, for the cases that prove what a
+    # hook handed the agent (and, with the value absent, what it did not).
+    for recorded in ${STUB_RECORD_ENV:-}; do
+      if [ -n "${!recorded+set}" ]; then printf 'env_%s: %s\n' "$recorded" "${!recorded}"; else printf 'env_%s: unset\n' "$recorded"; fi
+    done
     printf 'memory_env: %s\n' "$(env | cut -d= -f1 | grep -E '^SRE_MEMORY_' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -d .sre-agent-memory ]; then
       printf 'memory_files: %s\n' "$(cd .sre-agent-memory && find . \( -type f -o -type l \) | LC_ALL=C sort | sed 's#^\./##' | tr '\n' ' ')"
@@ -143,6 +148,12 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
       chmod 755 "$HOME/.local/bin/sre-fixture-tool"
       printf 'tool: installed\n'
     fi
+    # The hooks directory is the runner's: a hook runs with the runner's
+    # privileges, so the agent must not be able to replace one.
+    if [ -n "${STUB_PROBE_HOOKS:-}" ]; then
+      printf 'hooks_write: %s\n' "$(if allowed bash -c ": >> '${STUB_PROBE_HOOKS}/pre-run'" | grep -qx allowed || allowed bash -c ": > '${STUB_PROBE_HOOKS}/planted'" | grep -qx allowed; then echo allowed; else echo denied; fi)"
+    fi
+    printf 'hook_credential: %s\n' "${HOOK_CRED:-absent}"
     printf 'path_first: %s\n' "${PATH%%:*}"
     printf 'path_has_mise_shims: %s\n' "$(case ":$PATH:" in *":$HOME/.local/share/mise/shims:"*) echo yes ;; *) echo no ;; esac)"
     printf 'npm_prefix: %s\n' "${NPM_CONFIG_PREFIX:-}"

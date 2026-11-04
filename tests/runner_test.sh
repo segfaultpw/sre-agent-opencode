@@ -3118,6 +3118,167 @@ for spec in "many_files:STUB_FILE_COUNT=100:through" "many_files:STUB_FILE_COUNT
 done
 remote_git update-ref -d refs/pull/7/head
 
+echo "--- 116. per-request hooks: pre-run, credentials and post-run around the agent ---"
+hooks_dir="$work/hooks"
+hook_secret="$(printf 'hook-secret-%040d' 5)"
+hook_order="$work/hook_order.log"
+mkdir -p "$hooks_dir"
+cat > "$hooks_dir/pre-run" <<EOF
+#!/usr/bin/env bash
+echo "pre-run \$SRE_REQUEST_KIND \$SRE_REPO \$SRE_HANDOFF_ID" >> "$hook_order"
+env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|GH_TOKEN|OPENROUTER_API_KEY)\$' >> "$work/hook_leaks.log" || true
+if [ -e "$work/ctl/hook_pre_fail" ]; then echo "pre-run is failing on purpose" >&2; exit 1; fi
+if [ -e "$work/ctl/hook_pre_hang" ]; then sleep 30; fi
+exit 0
+EOF
+cat > "$hooks_dir/credentials" <<EOF
+#!/usr/bin/env bash
+echo "credentials \$SRE_REQUEST_KIND" >> "$hook_order"
+if [ -e "$work/ctl/hook_cred_refused" ]; then echo "GH_TOKEN=${hook_secret}"; exit 0; fi
+echo "# provisioned for \$SRE_HANDOFF_ID"
+echo "HOOK_DB_PASSWORD=${hook_secret}"
+echo "HOOK_REGION=eu"
+EOF
+cat > "$hooks_dir/post-run" <<EOF
+#!/usr/bin/env bash
+echo "post-run \$SRE_REQUEST_KIND" >> "$hook_order"
+if [ -e "$work/ctl/hook_post_fail" ]; then echo "post-run is failing on purpose" >&2; exit 1; fi
+exit 0
+EOF
+chmod +x "$hooks_dir/pre-run" "$hooks_dir/credentials" "$hooks_dir/post-run"
+: > "$work/hook_leaks.log"
+export SRE_HOOKS_DIR="$hooks_dir" STUB_RECORD_ENV="HOOK_DB_PASSWORD HOOK_REGION SRE_HOOKS_DIR SRE_HOOK_TIMEOUT_SECONDS"
+hook_names() { cut -d' ' -f1 "$hook_order" | tr '\n' ' '; }
+
+: > "$hook_order"
+export STUB_OPENCODE_MODE=fix
+start_fixture hooks_ok
+queue_one h-hooks-ok acme/app
+touch "$work/ctl/hook_post_fail"
+run_once hooks_ok
+rm -f "$work/ctl/hook_post_fail"
+if [ "$rc" -eq 0 ] && [ "$(hook_names)" = "pre-run credentials post-run " ]; then echo "ok   the hooks run in order: pre-run, credentials, post-run"; else echo "FAIL rc=$rc hooks: $(hook_names)"; fail=1; fi
+if grep -q '^pre-run fix_request acme/app h-hooks-ok$' "$hook_order"; then echo "ok   a hook is told the request kind, the repository and the handoff id"; else echo "FAIL hook order log: $(cat "$hook_order")"; fail=1; fi
+if grep -qx "env_HOOK_DB_PASSWORD: ${hook_secret}" "$opencode_log" && grep -qx "env_HOOK_REGION: eu" "$opencode_log"; then echo "ok   what the credentials hook printed is in the agent's environment"; else echo "FAIL agent env: $(grep env_ "$opencode_log")"; fail=1; fi
+if grep -qx "env_SRE_HOOKS_DIR: unset" "$opencode_log" && grep -qx "env_SRE_HOOK_TIMEOUT_SECONDS: unset" "$opencode_log"; then echo "ok   the runner's hook settings are not in the agent's environment"; else echo "FAIL agent env: $(grep env_ "$opencode_log")"; fail=1; fi
+if [ ! -s "$work/hook_leaks.log" ]; then echo "ok   no hook was given the poll key, a GitHub token or a provider key"; else echo "FAIL a hook saw: $(cat "$work/hook_leaks.log")"; fail=1; fi
+if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && grep -q 'the post-run hook exited 1' "$out"; then echo "ok   a failing post-run is logged and the request is still answered with its pull request"; else echo "FAIL report: $report"; fail=1; fi
+if ! grep -qF "$hook_secret" "$out" "$fixture_log" "$git_log" "$gh_log" "$gh_body" "$work/git_argv.log" "$work/gh_argv.log" && ! grep -rqF "$hook_secret" "$workspace"; then echo "ok   the credential is in no log line, report, git or gh call, pull request body or file of the workspace"; else echo "FAIL the credential leaked: $(grep -lF "$hook_secret" "$out" "$fixture_log" "$git_log" "$gh_log" "$gh_body" 2>/dev/null) $(grep -rlF "$hook_secret" "$workspace" 2>/dev/null)"; fail=1; fi
+stop_fixture
+
+echo "--- 116b. a failing pre-run fails the request with its name, before the agent, and post-run still runs ---"
+: > "$hook_order"
+touch "$work/ctl/hook_pre_fail"
+start_fixture hooks_pre_fail
+queue_one h-hooks-pre-fail acme/app
+run_once hooks_pre_fail
+rm -f "$work/ctl/hook_pre_fail"
+if [ "$rc" -eq 0 ] && [ "$(count_path /report)" -eq 1 ] && jq -e '.summary | test("pre-run hook exited 1")' <<<"$report" >/dev/null && jq -e '.failure.kind == "runner_error" and (.failure.detail | test("pre-run"))' <<<"$report" >/dev/null; then echo "ok   the report is a runner error that names the pre-run hook and its exit status"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ "$(hook_names)" = "pre-run post-run " ] && ! grep -q -- '--agent' "$opencode_log" && ! branch_exists sre-agent/h-hooks-pre-fail && [ ! -s "$gh_log" ]; then echo "ok   no credentials hook, no agent run, nothing pushed, and post-run ran"; else echo "FAIL hooks: $(hook_names) opencode: $(cat "$opencode_log") gh: $(cat "$gh_log")"; fail=1; fi
+stop_fixture
+
+echo "--- 116c. a hook that outlives SRE_HOOK_TIMEOUT_SECONDS is stopped and fails the request ---"
+: > "$hook_order"
+touch "$work/ctl/hook_pre_hang"
+export SRE_HOOK_TIMEOUT_SECONDS=1
+start_fixture hooks_timeout
+queue_one h-hooks-timeout acme/app
+started="$(date +%s%N)"
+run_once hooks_timeout
+elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
+rm -f "$work/ctl/hook_pre_hang"
+unset SRE_HOOK_TIMEOUT_SECONDS
+if [ "$rc" -eq 0 ] && [ "$elapsed" -lt 25000 ] && jq -e '.summary | test("pre-run hook did not finish within 1 seconds")' <<<"$report" >/dev/null && [ "$(hook_names)" = "pre-run post-run " ]; then echo "ok   the hook is stopped at the bound (${elapsed} ms), the report names it, and post-run ran"; else echo "FAIL rc=$rc ${elapsed} ms report: $report hooks: $(hook_names)"; fail=1; fi
+stop_fixture
+
+echo "--- 116d. a credentials hook that prints a refused name fails the request naming the variable, never the value ---"
+: > "$hook_order"
+touch "$work/ctl/hook_cred_refused"
+start_fixture hooks_refused
+queue_one h-hooks-refused acme/app
+run_once hooks_refused
+rm -f "$work/ctl/hook_cred_refused"
+if [ "$rc" -eq 0 ] && jq -e '.summary | test("credentials hook") and test("GH_TOKEN")' <<<"$report" >/dev/null && ! grep -q -- '--agent' "$opencode_log" && [ "$(hook_names)" = "pre-run credentials post-run " ]; then echo "ok   the request fails before the agent, naming the credentials hook and GH_TOKEN"; else echo "FAIL rc=$rc report: $report hooks: $(hook_names)"; fail=1; fi
+if ! grep -qF "$hook_secret" "$out" "$fixture_log"; then echo "ok   the value of the refused variable is in no log line and no report"; else echo "FAIL the refused value leaked"; fail=1; fi
+stop_fixture
+
+echo "--- 116e. post-run also runs when the agent fails, and when the job was taken over ---"
+: > "$hook_order"
+start_fixture hooks_agent_fail
+queue_one h-hooks-agent-fail acme/app
+export STUB_OPENCODE_MODE=provider_error
+run_once hooks_agent_fail
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(hook_names)" = "pre-run credentials post-run " ] && jq -e '.failure.kind == "agent_exit"' <<<"$report" >/dev/null; then echo "ok   a failed agent run is reported and post-run ran after it"; else echo "FAIL rc=$rc hooks: $(hook_names) report: $report"; fail=1; fi
+stop_fixture
+: > "$hook_order"
+rm -f "$work/hooks-stopped.pid"
+export FIXTURE_HEARTBEAT_SECONDS=1 FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_HEARTBEAT_AFTER_FILE="$work/hooks-stopped.pid"
+start_fixture hooks_taken
+queue_one h-hooks-taken acme/app
+export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120 STUB_OPENCODE_PIDFILE="$work/hooks-stopped.pid"
+run_once hooks_taken
+unset STUB_OPENCODE_SLEEP STUB_OPENCODE_PIDFILE FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE FIXTURE_HEARTBEAT_SECONDS
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(count_path /report)" -eq 0 ] && [ "$(hook_names)" = "pre-run credentials post-run " ]; then echo "ok   a taken-over run reports nothing and post-run still ran"; else echo "FAIL rc=$rc reports=$(count_path /report) hooks: $(hook_names)"; fail=1; fi
+stop_fixture
+
+echo "--- 116f. the test job runs the hooks too, and a failing pre-run is its model step's failure ---"
+: > "$hook_order"
+touch "$work/ctl/hook_pre_fail"
+start_fixture hooks_test_job
+queue_test_job h-hooks-test ""
+run_once hooks_test_job
+rm -f "$work/ctl/hook_pre_fail"
+if [ "$rc" -eq 0 ] && jq -e '(.test.steps[] | select(.name == "model")) | (.ok == false and (.detail | test("pre-run hook exited 1")))' <<<"$report" >/dev/null && grep -q '^pre-run test ' "$hook_order" && [ "$(hook_names)" = "pre-run post-run " ]; then echo "ok   the model step fails with the hook named, and post-run ran with the request kind test"; else echo "FAIL rc=$rc report: $report hooks: $(hook_names)"; fail=1; fi
+stop_fixture
+
+echo "--- 116g. a hooks directory on the workspace refuses the start ---"
+mkdir -p "$workspace/hooks-in-workspace"
+start_fixture hooks_on_workspace
+queue_one h-hooks-on-workspace acme/app
+SRE_HOOKS_DIR="$workspace/hooks-in-workspace" run_once hooks_on_workspace
+if [ "$rc" -ne 0 ] && grep -q 'SRE_HOOKS_DIR names .* which is on the workspace' "$out" && [ "$(count_path /api/fix-runner/queue)" -eq 0 ]; then echo "ok   the runner refuses to start with a sentence, and polls nothing"; else echo "FAIL rc=$rc out: $(cat "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 116h. with no SRE_HOOKS_DIR nothing runs and the request is as in v2.4.1 ---"
+unset SRE_HOOKS_DIR
+: > "$hook_order"
+start_fixture hooks_none
+queue_one h-hooks-none acme/app
+run_once hooks_none
+if [ "$rc" -eq 0 ] && [ ! -s "$hook_order" ] && grep -qx "env_HOOK_DB_PASSWORD: unset" "$opencode_log" && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   no hook ran, the agent got nothing extra, and the pull request was opened"; else echo "FAIL rc=$rc hooks: $(hook_names) report: $report"; fail=1; fi
+stop_fixture
+
+echo "--- 116i. the built-in role: the agent holds the assumed session and not the runner's own AWS identity ---"
+mkdir -p "$work/awsrole/bin"
+cat > "$work/awsrole/bin/aws" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/awsrole/calls.log"
+printf '{"Credentials":{"AccessKeyId":"ASIASTUBSESSION","SecretAccessKey":"stub-session-secret-key-value","SessionToken":"stub-session-token-value-0001"}}\n'
+EOF
+chmod +x "$work/awsrole/bin/aws"
+role_arn="arn:aws:iam::123456789012:role/sre-agent-fix"
+export STUB_RECORD_ENV="AWS_ACCESS_KEY_ID AWS_SESSION_TOKEN AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+saved_path="$PATH"
+export PATH="$work/awsrole/bin:$PATH"
+: > "$work/awsrole/calls.log"
+start_fixture role_on
+queue_one h-role-on acme/app
+SRE_AGENT_AWS_ROLE_ARN="$role_arn" SRE_AGENT_AWS_ACCESS=1 AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/runner run_once role_on
+if [ "$rc" -eq 0 ] && grep -qx "env_AWS_ACCESS_KEY_ID: ASIASTUBSESSION" "$opencode_log" && grep -qx "env_AWS_SESSION_TOKEN: stub-session-token-value-0001" "$opencode_log" && grep -qx "env_AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: unset" "$opencode_log"; then echo "ok   with agent AWS access the agent holds the session variables and not the container credentials URI"; else echo "FAIL agent env: $(grep env_ "$opencode_log")"; fail=1; fi
+if [ "$(cat "$work/awsrole/calls.log")" = "sts assume-role --role-arn $role_arn --role-session-name sre-h-role-o --duration-seconds 3600 --output json" ]; then echo "ok   the role is assumed once, with a session named for the handoff, for an hour"; else echo "FAIL aws calls: $(cat "$work/awsrole/calls.log")"; fail=1; fi
+if ! grep -qF -e "stub-session-token-value-0001" -e "stub-session-secret-key-value" "$out" "$fixture_log"; then echo "ok   the session credentials are in no log line and no report"; else echo "FAIL the session leaked"; fail=1; fi
+stop_fixture
+: > "$work/awsrole/calls.log"
+start_fixture role_off
+queue_one h-role-off acme/app
+SRE_AGENT_AWS_ROLE_ARN="$role_arn" AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/v2/credentials/runner run_once role_off
+if [ "$rc" -eq 0 ] && grep -qx "env_AWS_ACCESS_KEY_ID: unset" "$opencode_log" && [ ! -s "$work/awsrole/calls.log" ]; then echo "ok   without agent AWS access the role is not assumed and the agent holds no AWS variable"; else echo "FAIL agent env: $(grep env_ "$opencode_log") calls: $(cat "$work/awsrole/calls.log")"; fail=1; fi
+stop_fixture
+export PATH="$saved_path"
+unset STUB_RECORD_ENV
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

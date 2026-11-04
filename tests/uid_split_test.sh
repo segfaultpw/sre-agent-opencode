@@ -80,6 +80,24 @@ chmod -R a+rX "$work/pkg"
 runner="$work/pkg/runner/runner.js"
 fixture_dir="$work/pkg/tests/fixture"
 survivors=()
+# The hooks (SRE_HOOKS_DIR): root's own, closed to the agent. They record the uid
+# they run as, and a credentials hook hands the agent one variable.
+hooks_dir="$work/hooks"
+hooks_log="$work/hooks.log"
+hooks_leaks="$work/hooks.leaks"
+hook_credential="$(printf 'hook-credential-%032d' 9)"
+mkdir -p "$hooks_dir"
+: > "$hooks_log"; : > "$hooks_leaks"
+chmod 666 "$hooks_log" "$hooks_leaks"
+for hook in pre-run post-run; do
+  cat > "$hooks_dir/$hook" <<HOOK
+#!/usr/bin/env bash
+echo "$hook uid=\$(id -u) gid=\$(id -g) \$SRE_HANDOFF_ID" >> "$hooks_log"
+env | cut -d= -f1 | grep -E '^(SRE_API_KEY|SRE_GITHUB_TOKEN|SRE_AGENT_GITHUB_TOKEN|GH_TOKEN|GITHUB_TOKEN|SRE_AGENT_(UID|GID|HOME|USER)|SRE_RUNNER_(UID|GID|HOME|USER))\$' >> "$hooks_leaks" || true
+HOOK
+done
+printf '#!/usr/bin/env bash\necho "HOOK_CRED=%s"\n' "$hook_credential" > "$hooks_dir/credentials"
+chmod 755 "$hooks_dir" "$hooks_dir/pre-run" "$hooks_dir/credentials" "$hooks_dir/post-run"
 fixture_pid=""
 github_pid=""
 # shellcheck disable=SC2329 # the EXIT trap below runs it
@@ -299,6 +317,7 @@ prove() {
       SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
       HOME="$runner_home" \
       AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
+      SRE_HOOKS_DIR="$hooks_dir" STUB_PROBE_HOOKS="$hooks_dir" \
       STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe_file" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor_file" \
       STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" STUB_RUNNER_TOKEN="$github_token" \
       "${extra_runner_env[@]}" \
@@ -338,6 +357,10 @@ prove() {
   if grep -qx 'gitdir_list: denied' "$probe" && grep -qx 'gitdir_write: denied' "$probe"; then echo "ok   $label: the agent can neither read the git directory nor write commondir, alternates, grafts, a replace ref, config.worktree, attributes, config or a hook into it"; else echo "FAIL $label: $(grep gitdir "$probe")"; fail=1; fi
   if [ -z "$(ls -A "$work/markers")" ]; then echo "ok   $label: the filter and fsmonitor the agent planted in its tree never ran"; else echo "FAIL $label: these ran: $(find "$work/markers" -mindepth 1 -printf '%f ')"; fail=1; fi
   if [ "$(stat -c '%a %u' "$ws/gitdirs/acme/app")" = "700 $owner" ] && [ "$(stat -c '%a %u' "$ws/gitdirs")" = "700 $owner" ]; then echo "ok   $label: the git directory is the runner's, mode 0700"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/gitdirs" "$ws/gitdirs/acme/app")"; fail=1; fi
+  if grep -qx "pre-run uid=$owner gid=$owner h-$label" "$hooks_log" && grep -qx "post-run uid=$owner gid=$owner h-$label" "$hooks_log"; then echo "ok   $label: the pre-run and post-run hooks ran as the runner's account, not the agent's and not root"; else echo "FAIL $label: hooks ran as: $(grep "h-$label\$" "$hooks_log" | tr '\n' ';')"; fail=1; fi
+  if [ ! -s "$hooks_leaks" ]; then echo "ok   $label: no hook was given the poll key, a GitHub token or the agent's account variables"; else echo "FAIL $label: a hook saw: $(sort -u "$hooks_leaks" | tr '\n' ' ')"; fail=1; fi
+  if grep -qx "hook_credential: $hook_credential" "$probe" && ! grep -qF "$hook_credential" "$out" "$work/requests.jsonl"; then echo "ok   $label: what the credentials hook printed reached the agent, and is in no log line or report"; else echo "FAIL $label: $(grep hook_credential "$probe")"; fail=1; fi
+  if grep -qx 'hooks_write: denied' "$probe"; then echo "ok   $label: the agent can neither replace a hook nor plant one"; else echo "FAIL $label: $(grep hooks_write "$probe")"; fail=1; fi
   if grep -qx 'aws_env: ' "$probe"; then echo "ok   $label: no AWS variable reaches the agent"; else echo "FAIL $label: $(grep aws_env "$probe" || true)"; fail=1; fi
   if [ -s "$uidlog" ] && ! grep -qvx "$owner" "$uidlog"; then echo "ok   $label: every git call ran as the runner's account ($(wc -l < "$uidlog") calls)"; else echo "FAIL $label: git uids: $(sort -u "$uidlog" | tr '\n' ' ')"; fail=1; fi
   if [ -s "$ghuidlog" ] && ! grep -qvx "$owner" "$ghuidlog"; then echo "ok   $label: gh ran as the runner's account"; else echo "FAIL $label: gh uids: $(sort -u "$ghuidlog" | tr '\n' ' ')"; fail=1; fi

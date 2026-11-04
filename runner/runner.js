@@ -269,6 +269,9 @@ function describeIdentity() {
 // 24 hours it is valid.
 const constantSecrets = [];
 let jobSecret = null;
+// What the current request's credentials hook printed and the role it assumed,
+// redacted from every line like the secrets above for as long as the request lasts.
+let requestSecrets = [];
 
 function redact(text) {
   let out = String(text);
@@ -276,6 +279,7 @@ function redact(text) {
     if (secret) out = out.split(secret).join('[redacted]');
   }
   if (jobSecret) out = out.split(jobSecret).join('[redacted]');
+  for (const secret of requestSecrets) out = out.split(secret).join('[redacted]');
   return out;
 }
 
@@ -481,6 +485,8 @@ function loadConfig() {
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
   };
+  config.hooks = loadHookSettings(process.env, layout, identity.agent);
+  hookSettings = config.hooks;
   registerConfigSecrets(config);
   credential = newCredential(config.serverUrl, config.apiKey);
   return config;
@@ -2885,6 +2891,307 @@ function boundedLine(line, maxChars) {
   return `${cut}...[truncated]`;
 }
 
+// Per-request hooks and credentials.
+//
+// SRE_HOOKS_DIR holds executables the operator wrote, named pre-run,
+// credentials and post-run. They run as the runner's account (never the
+// agent's) with a short environment, around every kind of job: pre-run before
+// the agent, credentials right after it (its NAME=value lines become the
+// agent's environment for this request alone), post-run when the request is
+// over however it ended. A pre-run or credentials hook that fails, times out or
+// prints a refused name fails the request with the hook's name; post-run's
+// failure is only logged. A hook runs with the privileges the runner has, so
+// the directory is refused when the agent could replace what is in it.
+const HOOK_NAMES = ['pre-run', 'credentials', 'post-run'];
+const HOOK_TIMEOUT_SECONDS_DEFAULT = 60;
+const HOOK_OUTPUT_MAX_LINES = 50;
+const HOOK_OUTPUT_LINE_MAX = 500;
+const CREDENTIAL_OUTPUT_MAX_BYTES = 65_536;
+const CREDENTIAL_MAX_COUNT = 64;
+const CREDENTIAL_NAME = /^[A-Z][A-Z0-9_]*$/;
+const CREDENTIAL_REFUSED_NAMES = new Set(['PATH', 'HOME', 'ENV', 'BASH_ENV', 'NODE_OPTIONS', 'NODE_PATH', 'GH_TOKEN', 'GITHUB_TOKEN']);
+const CREDENTIAL_REFUSED_PREFIXES = ['SRE_', 'OPENCODE_', 'GIT_'];
+// A value shorter than this is not redacted: it is not a credential, and
+// replacing every "1" or "yes" in a log would only corrupt it.
+const REQUEST_SECRET_MIN_LENGTH = 6;
+const ASSUME_ROLE_DURATION_SECONDS = 3600;
+const ASSUME_ROLE_TIMEOUT_MS = 60_000;
+const ROLE_ARN = /^arn:aws[a-z-]*:iam::[0-9]{12}:role\/[A-Za-z0-9+=,.@_\/-]{1,512}$/;
+// The variables the agent would otherwise reach the runner's own AWS identity
+// by; with a role assumed for the request they are removed and the three
+// session variables stand alone.
+const AWS_INHERITED_PATTERN = /^(AWS_|ECS_CONTAINER_METADATA_URI)/;
+const AWS_KEEP = new Set(['AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_EC2_METADATA_DISABLED', 'AWS_STS_REGIONAL_ENDPOINTS']);
+
+// What load put in place: the hooks directory (or null) and the bound.
+let hookSettings = { dir: null, timeoutMs: HOOK_TIMEOUT_SECONDS_DEFAULT * 1000, roleArn: null };
+
+function whyAgentCouldWrite(stat, agent) {
+  const sticky = stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+  if (stat.uid === agent.uid) return 'owned by the agent account';
+  if ((stat.mode & 0o002) !== 0 && !sticky) return 'writable by every account';
+  if ((stat.mode & 0o020) !== 0 && stat.gid === agent.gid && !sticky) return 'writable by the agent\'s group';
+  return null;
+}
+
+// Validates SRE_HOOKS_DIR and SRE_HOOK_TIMEOUT_SECONDS at start, so a hooks
+// directory the runner could not use or must not trust refuses the start with
+// a sentence instead of failing the first request. Returns the settings.
+function loadHookSettings(env, layout, agent) {
+  const timeoutRaw = env.SRE_HOOK_TIMEOUT_SECONDS;
+  let timeoutSeconds = HOOK_TIMEOUT_SECONDS_DEFAULT;
+  if (timeoutRaw !== undefined && timeoutRaw !== '') {
+    timeoutSeconds = /^[0-9]+$/.test(timeoutRaw) ? Number.parseInt(timeoutRaw, 10) : 0;
+    if (timeoutSeconds <= 0) throw fatal('SRE_HOOK_TIMEOUT_SECONDS must be a positive whole number of seconds');
+  }
+  const roleRaw = env.SRE_AGENT_AWS_ROLE_ARN;
+  let roleArn = null;
+  if (roleRaw !== undefined && roleRaw !== '') {
+    if (!ROLE_ARN.test(roleRaw)) {
+      throw fatal('SRE_AGENT_AWS_ROLE_ARN must be the ARN of an IAM role (arn:aws:iam::<12 digit account>:role/<name>)');
+    }
+    roleArn = roleRaw;
+  }
+  const settings = { dir: null, timeoutMs: timeoutSeconds * 1000, roleArn };
+  const named = env.SRE_HOOKS_DIR;
+  if (named === undefined || named === '') return settings;
+  if (!path.isAbsolute(named)) {
+    throw fatal(`SRE_HOOKS_DIR is ${named}, which is not an absolute path; name a directory in the image or on the host`);
+  }
+  let real;
+  try {
+    real = fs.realpathSync(named);
+    if (!fs.statSync(real).isDirectory()) throw new Error('not a directory');
+  } catch {
+    throw fatal(`SRE_HOOKS_DIR names ${named}, which is not a directory this runner can read`);
+  }
+  let workspaceReal = layout.workspace;
+  try {
+    workspaceReal = fs.realpathSync(layout.workspace);
+  } catch {
+    // A workspace that does not exist yet has nothing in it to be under.
+  }
+  for (const candidate of [path.resolve(named), real]) {
+    for (const root of [layout.workspace, workspaceReal]) {
+      const relative = path.relative(root, candidate);
+      if (relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+        throw fatal(`SRE_HOOKS_DIR names ${named}, which is on the workspace ${layout.workspace}; the agent can write there and a hook runs with the runner's privileges, so put the hooks in the image or in a directory only the runner's side can write`);
+      }
+    }
+  }
+  if (agent) {
+    const parts = [];
+    for (let current = real; ; current = path.dirname(current)) {
+      parts.push(current);
+      if (current === path.dirname(current)) break;
+    }
+    for (const name of HOOK_NAMES) {
+      const file = path.join(real, name);
+      if (fs.existsSync(file)) parts.push(fs.realpathSync(file));
+    }
+    for (const part of parts) {
+      const why = whyAgentCouldWrite(fs.statSync(part), agent);
+      if (why) {
+        throw fatal(`SRE_HOOKS_DIR names ${named}, and ${part} on the way to a hook is ${why}; the agent could replace a hook that runs with the runner's privileges, so put the hooks where only root or the runner's account writes`);
+      }
+    }
+  }
+  for (const name of HOOK_NAMES) {
+    const file = path.join(real, name);
+    let stat = null;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile()) throw fatal(`the ${name} hook in SRE_HOOKS_DIR is not a regular file`);
+    try {
+      fs.accessSync(file, fs.constants.X_OK);
+    } catch {
+      throw fatal(`the ${name} hook in SRE_HOOKS_DIR is not executable by the runner's account`);
+    }
+  }
+  settings.dir = real;
+  return settings;
+}
+
+// The NAME=value lines a credentials hook printed, as an object. Throws with a
+// sentence that names the variable or the line and never prints a value.
+// Blank lines and lines that start with # are ignored; a value runs to the end
+// of its line, so it cannot hold a line break.
+function loadCredentialEnv(output) {
+  const text = String(output);
+  if (Buffer.byteLength(text) > CREDENTIAL_OUTPUT_MAX_BYTES) {
+    throw new Error(`the credentials hook printed more than ${CREDENTIAL_OUTPUT_MAX_BYTES} bytes`);
+  }
+  const env = {};
+  let lineNumber = 0;
+  for (const raw of text.split('\n')) {
+    lineNumber += 1;
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
+    const equals = line.indexOf('=');
+    const name = equals > 0 ? line.slice(0, equals) : '';
+    if (!CREDENTIAL_NAME.test(name)) {
+      throw new Error(`line ${lineNumber} of the credentials hook's output is not NAME=value with an upper case name (letters, digits and underscores, starting with a letter)`);
+    }
+    if (CREDENTIAL_REFUSED_NAMES.has(name) || CREDENTIAL_REFUSED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+      throw new Error(`the credentials hook printed ${name}, which the runner does not pass to the agent (refused: ${[...CREDENTIAL_REFUSED_NAMES].join(', ')}, and anything starting with ${CREDENTIAL_REFUSED_PREFIXES.join(', ')})`);
+    }
+    const value = line.slice(equals + 1);
+    if (value.includes('\0')) throw new Error(`the credentials hook printed a NUL byte in the value of ${name}`);
+    if (!(name in env) && Object.keys(env).length >= CREDENTIAL_MAX_COUNT) {
+      throw new Error(`the credentials hook printed more than ${CREDENTIAL_MAX_COUNT} variables`);
+    }
+    env[name] = value;
+  }
+  return env;
+}
+
+function rememberRequestSecrets(values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.length >= REQUEST_SECRET_MIN_LENGTH) requestSecrets.push(value);
+  }
+}
+
+function clearRequestSecrets() {
+  requestSecrets = [];
+}
+
+function jobKind(job) {
+  if (job && job.test === true) return 'test';
+  if (job && job.kind === 'pr_change') return 'pr_change';
+  return 'fix_request';
+}
+
+function jobRepoName(job) {
+  if (!job) return '';
+  if (typeof job.repo_full_name === 'string' && job.repo_full_name) return job.repo_full_name;
+  if (job.change && typeof job.change.repo_full_name === 'string') return job.change.repo_full_name;
+  if (typeof job.test_repo_full_name === 'string') return job.test_repo_full_name;
+  return '';
+}
+
+// What a hook is given: the runner's minimal environment, its own AWS identity
+// (a hook that provisions credentials needs the machine's role to do it), and
+// the request. Never the poll key, the GitHub tokens, a model provider key or
+// anything a credentials hook printed.
+function hookEnv(job, workspaceDir, extraEnv) {
+  const env = awsEnv();
+  env.SRE_HANDOFF_ID = String((job && job.handoff_id) || '');
+  env.SRE_REPO = jobRepoName(job);
+  env.SRE_REQUEST_KIND = jobKind(job);
+  env.SRE_WORKSPACE = workspaceDir || '';
+  return { ...env, ...extraEnv };
+}
+
+function hookFailure(name, result) {
+  if (result.timedOut) return `the ${name} hook did not finish within ${Math.round(hookSettings.timeoutMs / 1000)} seconds and was stopped`;
+  if (result.abandoned) return `the ${name} hook did not finish within ${Math.round(hookSettings.timeoutMs / 1000)} seconds and a process it started did not exit`;
+  if (result.code === null || result.code === undefined) {
+    return result.signal ? `the ${name} hook was ended by ${result.signal}` : `the ${name} hook could not be started${result.stderr ? ` (${oneLine(redact(result.stderr), 160)})` : ''}`;
+  }
+  return `the ${name} hook exited ${result.code}`;
+}
+
+function logHookOutput(name, text, level) {
+  const lines = String(text).split('\n').map((line) => line.replace(/\r$/, '')).filter((line) => line.trim() !== '');
+  for (const line of lines.slice(0, HOOK_OUTPUT_MAX_LINES)) log(level, `hook ${name}: ${boundedLine(redact(line), HOOK_OUTPUT_LINE_MAX)}`);
+  if (lines.length > HOOK_OUTPUT_MAX_LINES) log(level, `hook ${name}: ${lines.length - HOOK_OUTPUT_MAX_LINES} more lines not shown`);
+}
+
+// Runs one hook. { ran: false } when the directory has none by that name; else
+// { ran: true, ok, code, stdout, stderr, failure }. The hook's output is
+// logged (stdout of the credentials hook is not: it holds the credentials).
+async function runHook(name, job, extraEnv = {}, context = {}) {
+  if (!hookSettings.dir) return { ran: false, ok: true };
+  const file = path.join(hookSettings.dir, name);
+  if (!fs.existsSync(file)) return { ran: false, ok: true };
+  log('info', `running the ${name} hook`, { handoff_id: job && job.handoff_id });
+  const result = await runProcess(file, [], {
+    cwd: hookSettings.dir,
+    env: hookEnv(job, context.workspace, extraEnv),
+    as: 'runner',
+    timeoutMs: hookSettings.timeoutMs,
+    signal: context.signal || null,
+  });
+  const ok = result.code === 0 && !result.timedOut && !result.abandoned;
+  if (name !== 'credentials') logHookOutput(name, result.stdout, 'info');
+  logHookOutput(name, result.stderr, ok ? 'info' : 'warn');
+  const answer = { ran: true, ok, code: result.code, stdout: result.stdout, stderr: result.stderr, aborted: Boolean(result.aborted) };
+  if (!ok && !answer.aborted) {
+    answer.failure = hookFailure(name, result);
+    log(name === 'post-run' ? 'warn' : 'error', answer.failure);
+  }
+  return answer;
+}
+
+// The role the agent is given for this request, assumed by the runner's own
+// identity: three session variables that expire, and nothing else of AWS.
+async function assumeAgentRole(config, job) {
+  const prefix = String((job && job.handoff_id) || 'request').replace(/[^A-Za-z0-9_+=,.@-]/g, '-').slice(0, 8) || 'request';
+  const result = await runProcess(
+    'aws',
+    ['sts', 'assume-role', '--role-arn', hookSettings.roleArn, '--role-session-name', `sre-${prefix}`, '--duration-seconds', String(ASSUME_ROLE_DURATION_SECONDS), '--output', 'json'],
+    { cwd: config.layout.workspace, env: awsEnv(), as: 'runner', timeoutMs: ASSUME_ROLE_TIMEOUT_MS }
+  );
+  if (result.code !== 0) {
+    const why = result.timedOut ? 'the call timed out' : oneLine(redact(result.stderr || result.stdout || ''), 200) || `aws exited ${result.code}`;
+    throw new Error(`the role in SRE_AGENT_AWS_ROLE_ARN could not be assumed for this request: ${why}`);
+  }
+  let credentials = null;
+  try {
+    credentials = JSON.parse(result.stdout).Credentials;
+  } catch {
+    credentials = null;
+  }
+  if (!credentials || !credentials.AccessKeyId || !credentials.SecretAccessKey || !credentials.SessionToken) {
+    throw new Error('the role in SRE_AGENT_AWS_ROLE_ARN was assumed, but the answer carried no session credentials');
+  }
+  return {
+    AWS_ACCESS_KEY_ID: credentials.AccessKeyId,
+    AWS_SECRET_ACCESS_KEY: credentials.SecretAccessKey,
+    AWS_SESSION_TOKEN: credentials.SessionToken,
+  };
+}
+
+// pre-run, then the credentials the agent will be given. Throws (with the
+// hook's name) when either fails; the environment it answers goes to runAgent
+// as `extraEnv`, with `awsReplaced` true when the agent's inherited AWS
+// identity must go.
+async function prepareRequestEnv(config, job, context) {
+  const answer = { extraEnv: {}, awsReplaced: false };
+  const taken = () => {
+    const error = new Error(`the job was taken from this runner (${context.signal.reason})`);
+    error.takenOver = true;
+    return error;
+  };
+  const pre = await runHook('pre-run', job, {}, context);
+  if (pre.aborted) throw taken();
+  if (!pre.ok) throw new Error(pre.failure);
+  if (hookSettings.roleArn && config.agentAwsAccess) {
+    const session = await assumeAgentRole(config, job);
+    rememberRequestSecrets(Object.values(session));
+    Object.assign(answer.extraEnv, session);
+    answer.awsReplaced = true;
+  }
+  const credentials = await runHook('credentials', job, {}, context);
+  if (credentials.aborted) throw taken();
+  if (!credentials.ok) throw new Error(credentials.failure);
+  if (credentials.ran) {
+    let printed;
+    try {
+      printed = loadCredentialEnv(credentials.stdout);
+    } catch (error) {
+      throw new Error(`the credentials hook failed: ${error.message}`);
+    }
+    rememberRequestSecrets(Object.values(printed));
+    Object.assign(answer.extraEnv, printed);
+    log('info', `the credentials hook provided ${Object.keys(printed).length} variable${Object.keys(printed).length === 1 ? '' : 's'} for this request: ${Object.keys(printed).sort().join(', ') || 'none'}`);
+  }
+  return answer;
+}
+
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
 // fences handed over as opencode's configuration. The runner's own
 // credentials are stripped from the child's environment: the agent has a
@@ -2931,6 +3238,10 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // (the print switch is the variable the pinned binary reads; it reads no
   // OPENCODE_LOG_PATH), and the level it was given.
   delete env.SRE_OPENCODE_LOG_LEVEL;
+  // The runner's hooks, token and scaling settings are the runner's business.
+  for (const name of ['SRE_HOOKS_DIR', 'SRE_HOOK_TIMEOUT_SECONDS', 'SRE_AGENT_AWS_ROLE_ARN', 'SRE_TASK_PROTECTION', 'SRE_CONCURRENCY']) {
+    delete env[name];
+  }
   delete env.OPENCODE_LOG_PATH;
   delete env.OPENCODE_LOG_LEVEL;
   delete env.OPENCODE_PRINT_LOGS;
@@ -2973,7 +3284,16 @@ async function runAgent(config, workspace, prompt, options = {}) {
     for (const name of Object.keys(env)) {
       if (name.startsWith('AWS_') || name.startsWith('ECS_CONTAINER_METADATA_URI')) delete env[name];
     }
+  } else if (options.awsReplaced) {
+    // A role was assumed for this request: the agent holds its expiring session
+    // and not the identity the runner itself runs under.
+    for (const name of Object.keys(env)) {
+      if (AWS_INHERITED_PATTERN.test(name) && !AWS_KEEP.has(name)) delete env[name];
+    }
   }
+  // After every removal above: what the credentials hook printed is meant to
+  // reach the agent, AWS variables included, and its names were checked.
+  Object.assign(env, options.extraEnv || {});
 
   // No --auto: the configuration leaves no permission at ask, and an
   // unexpected one is rejected rather than approved.
@@ -4242,6 +4562,8 @@ async function runTestJob(config, job, heartbeat) {
   result.test = [];
   let failed = null;
   let repo = null;
+  let hookWorkspace = null;
+  let hooksBegan = false;
   const memoryRoot = config.layout.memory;
   const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
@@ -4289,8 +4611,11 @@ async function runTestJob(config, job, heartbeat) {
       let quiet = true;
       const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
       try {
+        hookWorkspace = scratch.dir;
+        hooksBegan = true;
+        const prepared = await prepareRequestEnv(config, job, { workspace: scratch.dir, signal });
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal });
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
@@ -4374,6 +4699,7 @@ async function runTestJob(config, job, heartbeat) {
       return { ok: true, detail: 'wrote a pull request body as publish() does and read it back as the runner\'s account' };
     });
   } finally {
+    if (hooksBegan) await runHook('post-run', job, {}, { workspace: hookWorkspace });
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
     result.actions.push('ran the test job: no fix was run and nothing was pushed');
     result.summary = testSummary(config, result.test, failed);
@@ -4392,6 +4718,7 @@ async function runTestJob(config, job, heartbeat) {
       }
     }
     jobSecret = null;
+    clearRequestSecrets();
     await mirrorMemory(config, result);
   }
   return result;
@@ -4428,6 +4755,10 @@ async function handleJob(config, job, options = {}) {
   // instance holds the repository's lock past the bound.
   let lease = null;
   let change = null;
+  // Where post-run is told the request worked, and whether the hooks began: a
+  // request that never got as far as its checkout provisioned nothing.
+  let hookWorkspace = null;
+  let hooksBegan = false;
 
   try {
     stillHeld(signal);
@@ -4500,6 +4831,7 @@ async function handleJob(config, job, options = {}) {
     let agent;
     let reclaimed = false;
     let agentProcessesEnded = true;
+    hookWorkspace = workspace.dir;
     // The agent's home for this repository, or for the estate; none without an
     // account split, where the process's own home stands.
     const home = identity.mode !== 'none' ? agentHomeFor(repo) : null;
@@ -4507,10 +4839,12 @@ async function handleJob(config, job, options = {}) {
     // git directory, and nothing of the agent's.
     const bundle = repo ? await makeBaseBundle(workspace) : null;
     try {
+      hooksBegan = true;
+      const prepared = await prepareRequestEnv(config, job, { workspace: workspace.dir, signal });
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal });
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -4672,6 +5006,7 @@ async function handleJob(config, job, options = {}) {
     // the backstop for everything that can stop it earlier, before the
     // mirror and the report spend their time under it.
     releaseLock(lease);
+    if (hooksBegan) await runHook('post-run', job, {}, { workspace: hookWorkspace });
     await mirrorMemory(config, result);
     // A job that was taken is not reported: the platform has already given it
     // to someone else. Read and switched with no await between, so no beat can
@@ -4693,6 +5028,7 @@ async function handleJob(config, job, options = {}) {
       }
     }
     jobSecret = null;
+    clearRequestSecrets();
   }
   return result;
 }
@@ -4881,6 +5217,14 @@ module.exports = {
     runProcess,
     apiCredential,
     poll,
+    runHook,
+    loadCredentialEnv,
+    loadHookSettings,
+    prepareRequestEnv,
+    assumeAgentRole,
+    redact,
+    rememberRequestSecrets,
+    clearRequestSecrets,
     setIdentity: (value) => {
       identity = value;
     },
