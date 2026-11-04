@@ -269,4 +269,13 @@ if [ -n "${SRE_RUNNER_SETUP:-}" ]; then
   echo "sre-agent-fix-runner: the setup script finished"
 fi
 
+# SRE_CONCURRENCY above 1 starts that many workers of the runner under a
+# supervisor (runner/supervisor.js), each with an instance id of its own and its
+# own directory under the workspace; the supervisor also refuses a value that
+# is not a whole number from 1 to 8, with exit status 2. Unset or 1 starts the
+# runner itself, as it always was, with no supervisor in between.
+if [ -n "${SRE_CONCURRENCY:-}" ] && [ "${SRE_CONCURRENCY}" != "1" ]; then
+  exec node "${package_root}/runner/supervisor.js" "$@"
+fi
+
 exec node "${package_root}/runner/runner.js" "$@"

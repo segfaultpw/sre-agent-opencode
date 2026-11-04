@@ -19,6 +19,12 @@
 //   FIXTURE_BRIEF_FILE     the brief the brief endpoint serves
 //   FIXTURE_BRIEF_STATUS   a status other than 200 to answer the brief with, as a
 //                          platform that failed to serve it would
+//   FIXTURE_QUEUE_LEASE    when 1, FIXTURE_QUEUE_FILE is a queue several runner
+//                          instances share, as the platform leases it: a poll
+//                          is answered with the job already leased to the
+//                          instance it names and not yet collected, else the
+//                          next job nobody holds, which is then leased to it.
+//                          A job is collected when its brief is fetched.
 //   FIXTURE_HEARTBEAT_SECONDS  when set, the queue's answer carries it as
 //                          heartbeat_seconds, as a platform with heartbeats
 //                          does; unset, the answer is an older platform's
@@ -100,6 +106,24 @@ function liveToken(authorization) {
   if (!row) return null;
   if (tokenRevokeFile && fs.existsSync(tokenRevokeFile)) return null;
   return row.expires > Date.now() ? row : null;
+}
+
+const leaseMode = process.env.FIXTURE_QUEUE_LEASE === '1';
+let leaseJobs = null;
+const leasedTo = new Map();
+const collectedJobs = new Set();
+
+function readLeased(instance) {
+  if (leaseJobs === null) {
+    const file = process.env.FIXTURE_QUEUE_FILE;
+    leaseJobs = file && fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : [];
+  }
+  const mine = leaseJobs.filter((job) => leasedTo.get(job.handoff_id) === instance && !collectedJobs.has(job.handoff_id));
+  if (mine.length > 0) return mine;
+  const next = leaseJobs.find((job) => !leasedTo.has(job.handoff_id));
+  if (!next) return [];
+  leasedTo.set(next.handoff_id, instance);
+  return [next];
 }
 
 let queueCalls = 0;
@@ -200,7 +224,7 @@ const server = http.createServer((request, response) => {
         send(response, 401, 'application/json', JSON.stringify({ error: 'unauthorized' }));
         return;
       }
-      const answer = { data: readQueue() };
+      const answer = { data: leaseMode ? readLeased(body && body.instance) : readQueue() };
       if (heartbeatSeconds !== null) answer.heartbeat_seconds = heartbeatSeconds;
       send(response, 200, 'application/json', JSON.stringify(answer));
       return;
@@ -215,6 +239,7 @@ const server = http.createServer((request, response) => {
     }
 
     if (request.method === 'GET' && url.pathname.endsWith('/brief')) {
+      collectedJobs.add(url.pathname.split('/')[3]);
       if (briefStatus !== 200) {
         send(response, briefStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
         return;

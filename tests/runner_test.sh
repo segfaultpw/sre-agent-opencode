@@ -348,7 +348,7 @@ run_once() {
     SRE_WORKSPACE="$workspace" \
     SRE_GITHUB_TOKEN="${runner_github_token-$github_token}" \
     SRE_RUN_TIMEOUT_SECONDS="$run_timeout" \
-    node "$runner" > "$out" 2>&1 || rc=$?
+    node "${runner_entry:-$runner}" > "$out" 2>&1 || rc=$?
   report="$(jq -c 'select(.path | endswith("/report")) | .body' "$fixture_log" | tail -n 1)"
 }
 
@@ -3307,6 +3307,48 @@ run_once progress_older
 export STUB_OPENCODE_MODE=fix
 if [ "$rc" -eq 0 ] && [ "$(count_path /heartbeat)" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   no beat is sent without an interval, and the pull request is opened"; else echo "FAIL rc=$rc beats=$(count_path /heartbeat)"; fail=1; fi
 stop_fixture
+
+echo "--- 118. SRE_CONCURRENCY=2: two workers, two repositories in parallel, one repository one after the other ---"
+queue_two() {
+  jq -n --arg a "$1" --arg ra "$2" --arg b "$3" --arg rb "$4" --arg base "$server_url" --arg token "$handoff_token" \
+    '[{id: $a, repo: $ra}, {id: $b, repo: $rb}] | map({handoff_id: .id,
+       subject_id: "11111111-2222-3333-4444-555555555555",
+       repo_full_name: .repo,
+       context_repo_full_name: null,
+       brief_url: ($base + "/api/handoffs/" + .id + "/brief"),
+       report_url: ($base + "/api/handoffs/" + .id + "/report"),
+       token: $token})' > "$queue_file"
+}
+pool_ws="$work/workspace-concurrent"
+timing="$work/concurrent.timing"
+overlap() { awk '{ if ($1 == "start") start[$2] = $3; if ($1 == "end") fin[$2] = $3 } END { n = 0; for (k in start) { keys[++n] = k } print (n == 2 && start[keys[1]] < fin[keys[2]] && start[keys[2]] < fin[keys[1]]) ? "overlap" : "apart" }' "$timing"; }
+for spec in "parallel:acme/app:acme/other" "serial:acme/app:acme/app"; do
+  label="${spec%%:*}"; rest="${spec#*:}"; repo_a="${rest%%:*}"; repo_b="${rest#*:}"
+  mkdir -p "$pool_ws-$label"
+  : > "$timing"
+  export FIXTURE_QUEUE_LEASE=1
+  start_fixture "concurrent_$label"
+  queue_two "h-conc-$label-a" "$repo_a" "h-conc-$label-b" "$repo_b"
+  export STUB_OPENCODE_MODE=timed STUB_OPENCODE_SLEEP=2 STUB_OPENCODE_TIMING="$timing"
+  flat_workspace="$workspace"
+  workspace="$pool_ws-$label"
+  SRE_CONCURRENCY=2 SRE_RUNNER_INSTANCE=pool runner_entry="$pkg/runner/supervisor.js" run_once "concurrent_$label"
+  workspace="$flat_workspace"
+  unset FIXTURE_QUEUE_LEASE STUB_OPENCODE_TIMING
+  export STUB_OPENCODE_MODE=fix
+  reports="$(jq -c 'select(.path | endswith("/report")) | .body.pr_url' "$fixture_log" | grep -c "$pr_url" || true)"
+  if [ "$rc" -eq 0 ] && [ "$reports" -eq 2 ]; then echo "ok   $label: the supervisor exits 0 once both workers have answered their job, and both ended in a pull request"; else echo "FAIL $label: rc=$rc reports=$reports out: $(tail -n 5 "$out")"; fail=1; fi
+  instances="$(jq -r 'select(.path | endswith("/api/fix-runner/queue")) | .body.instance' "$fixture_log" | sort -u | tr '\n' ' ')"
+  if [ "$instances" = "pool-1 pool-2 " ]; then echo "ok   $label: the two workers poll as pool-1 and pool-2"; else echo "FAIL $label: instances: $instances"; fail=1; fi
+  if [ -d "$pool_ws-$label/instances/pool-1" ] && [ -d "$pool_ws-$label/instances/pool-2" ] && [ ! -e "$pool_ws-$label/repos" ]; then echo "ok   $label: each worker works under its own instances/ directory"; else echo "FAIL $label: $(find "$pool_ws-$label" -maxdepth 2 -type d | head)"; fail=1; fi
+  if [ "$label" = parallel ]; then
+    if [ "$(overlap)" = overlap ]; then echo "ok   parallel: the two agents ran at the same time"; else echo "FAIL parallel: $(cat "$timing")"; fail=1; fi
+  else
+    if [ "$(overlap)" = apart ] && [ "$(grep -c '^start' "$timing")" -eq 2 ]; then echo "ok   serial: the second worker waited for the repository and ran after the first"; else echo "FAIL serial: $(cat "$timing")"; fail=1; fi
+  fi
+  if grep -q '^\[pool-1\] ' "$out" && grep -q '^\[pool-2\] ' "$out"; then echo "ok   $label: each worker's log lines carry its instance id"; else echo "FAIL $label: $(head -n 5 "$out")"; fail=1; fi
+  stop_fixture
+done
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do

@@ -455,6 +455,15 @@ d.yml"
     jq -cn --arg m "$long" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderError", data: {message: $m}}}'
     exit 1
     ;;
+  timed)
+    # Records when the run started and ended, and where, so a case can say
+    # whether two runs overlapped.
+    printf 'start %s %s\n' "$PWD" "$(date +%s%N)" >> "${STUB_OPENCODE_TIMING:?}"
+    sleep "${STUB_OPENCODE_SLEEP:-2}"
+    printf 'a line the fix added\n' >> README.md
+    printf 'end %s %s\n' "$PWD" "$(date +%s%N)" >> "$STUB_OPENCODE_TIMING"
+    emit "Raised the connection pool ceiling in README.md so the service stops refusing checkouts under load. Ran bash test.sh and it passed."
+    ;;
   tools)
     # Three completed tool calls, two of them carrying a hostile command and
     # output, then a pause long enough for a one second beat to land in the
