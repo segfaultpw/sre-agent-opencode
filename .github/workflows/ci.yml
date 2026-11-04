@@ -50,6 +50,7 @@ jobs:
       - run: node tests/memory_test.js
       - run: node tests/bundle_test.js
       - run: node tests/agent_home_test.js
+      - run: node tests/agent_db_test.js
       - run: node tests/github_app_test.js
       - run: node tests/run_process_test.js
       - run: node tests/change_job_test.js

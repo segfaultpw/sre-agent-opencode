@@ -23,6 +23,9 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'default_agent: %s\n' "$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | jq -r '.default_agent // "missing"')"
     printf 'bash_fence: %s\n' "$(printf '%s' "${OPENCODE_CONFIG_CONTENT:-}" | jq -r '.permission.bash["git push*"] // "missing"')"
     printf 'autoupdate_disabled: %s\n' "${OPENCODE_DISABLE_AUTOUPDATE:-missing}"
+    printf 'opencode_db: %s\n' "${OPENCODE_DB:-missing}"
+    printf 'opencode_db_dir: %s\n' "$(if [ -n "${OPENCODE_DB:-}" ] && [ -d "$(dirname "$OPENCODE_DB")" ] && [ -w "$(dirname "$OPENCODE_DB")" ]; then echo writable; else echo unusable; fi)"
+    printf 'xdg_data_home: %s\n' "${XDG_DATA_HOME:-unset}"
     printf 'opencode_switches: %s\n' "$(env | grep -E '^OPENCODE_(DISABLE_CLAUDE_CODE|DISABLE_CLAUDE_CODE_PROMPT|DISABLE_CLAUDE_CODE_SKILLS|DISABLE_EXTERNAL_SKILLS|PURE)=' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_API_KEY+set}" ]; then printf 'sees_SRE_API_KEY: yes\n'; else printf 'sees_SRE_API_KEY: no\n'; fi
     if [ -n "${SRE_GITHUB_TOKEN+set}" ]; then printf 'sees_SRE_GITHUB_TOKEN: yes\n'; else printf 'sees_SRE_GITHUB_TOKEN: no\n'; fi

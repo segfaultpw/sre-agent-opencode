@@ -477,6 +477,20 @@ if grep -qx "bash_fence: deny" "$opencode_log"; then echo "ok   the package's ow
 if grep -qx "sees_SRE_API_KEY: no" "$opencode_log" && grep -qx "sees_SRE_GITHUB_TOKEN: no" "$opencode_log"; then echo "ok   the runner's own credentials are stripped from the agent's environment"; else echo "FAIL the agent could see a runner credential: $(cat "$opencode_log")"; fail=1; fi
 if grep -qx "gh_token: matches" "$opencode_log"; then echo "ok   the agent gets the repository token as GH_TOKEN, to clone private repositories"; else echo "FAIL gh_token: $(grep gh_token "$opencode_log")"; fail=1; fi
 if grep -qx "autoupdate_disabled: 1" "$opencode_log"; then echo "ok   the agent cannot update the binary that enforces its fences"; else echo "FAIL autoupdate: $(cat "$opencode_log")"; fail=1; fi
+# opencode's database is SQLite in WAL mode, which a network file system cannot serve ("locking protocol"):
+# it is made in a directory of this run on the machine's own disk, outside the workspace and the agent's home,
+# usable by the agent while it runs and gone afterwards.
+opencode_db="$(sed -n 's/^opencode_db: //p' "$opencode_log" | head -n 1)"
+case "$opencode_db" in
+  /*/opencode.db) db_absolute=yes ;;
+  *) db_absolute=no ;;
+esac
+case "$opencode_db" in
+  "$workspace"/*) db_on_volume=yes ;;
+  *) db_on_volume=no ;;
+esac
+if [ "$db_absolute" = yes ] && [ "$db_on_volume" = no ] && grep -qx "opencode_db_dir: writable" "$opencode_log"; then echo "ok   opencode's database is an absolute path off the workspace volume, in a directory the agent can use"; else echo "FAIL opencode database: '$opencode_db' $(grep -E 'opencode_db_dir|xdg_data_home' "$opencode_log")"; fail=1; fi
+if [ -n "$opencode_db" ] && [ ! -e "$(dirname "$opencode_db")" ]; then echo "ok   the run's database directory is removed with the run"; else echo "FAIL the database directory outlived the run: $(dirname "$opencode_db")"; fail=1; fi
 if grep -qxF "$marker" "$brief_seen"; then echo "ok   the brief reaches the agent on stdin"; else echo "FAIL the agent did not receive the brief"; fail=1; fi
 if grep -q "sre-agent-opencode:v${version}" "$workspace/repos/acme/app/.opencode/agents/sre-fix.md"; then echo "ok   the agent file is written into the checkout with the version stamped in"; else echo "FAIL the agent file is missing or unstamped"; fail=1; fi
 if grep -qx '.opencode/' "$workspace/gitdirs/acme/app/info/exclude"; then echo "ok   the agent file is excluded from git"; else echo "FAIL .opencode/ is not excluded"; fail=1; fi

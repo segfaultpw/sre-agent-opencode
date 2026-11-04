@@ -1328,6 +1328,65 @@ function applyAgentHomeEnv(env, home) {
   env.XDG_STATE_HOME = path.join(home, '.local', 'state');
 }
 
+// opencode keeps its sessions in a SQLite database it opens in WAL mode. WAL
+// needs shared memory and POSIX locks that a network file system (EFS, NFS) does
+// not give: a run on one fails with "locking protocol" (SQLITE_PROTOCOL), and a
+// task killed mid-run leaves -wal and -shm files that the next open trips on.
+// The agent's home is on the volume (its installed tools and caches are meant to
+// last), so the database alone is pointed at a directory of this run on the
+// machine's own disk (OPENCODE_DB, an absolute path), and removed with the run:
+// a run's sessions are of no use to the next one. SRE_AGENT_DB_DIR names the
+// directory it is made in (an absolute path on local storage), else the temporary
+// directory; point neither at the workspace volume.
+const AGENT_DB_PREFIX = 'sre-agent-db-';
+const AGENT_DB_STALE_MS = 24 * 3600 * 1000;
+
+function agentDbRoot(env) {
+  const named = env.SRE_AGENT_DB_DIR;
+  return named && path.isAbsolute(named) ? named : os.tmpdir();
+}
+
+// What a killed runner left behind in the same place, older than any run lasts.
+function sweepAgentDbs(root, now) {
+  let names = [];
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.startsWith(AGENT_DB_PREFIX)) continue;
+    const target = path.join(root, name);
+    try {
+      const stat = fs.lstatSync(target);
+      if (stat.isDirectory() && now - stat.mtimeMs > AGENT_DB_STALE_MS) fs.rmSync(target, { recursive: true, force: true });
+    } catch {
+      // Gone already, or not ours to remove: either way nothing is owed.
+    }
+  }
+}
+
+// A directory only the agent's account can use, or null when none could be made
+// (the run then keeps opencode's own default and says so, which is no worse than
+// before this directory existed).
+function prepareAgentDb(env = process.env, now = Date.now()) {
+  const root = agentDbRoot(env);
+  try {
+    sweepAgentDbs(root, now);
+    const dir = fs.mkdtempSync(path.join(root, AGENT_DB_PREFIX));
+    fs.chmodSync(dir, 0o700);
+    if (identity.mode !== 'none' && identity.agent) fs.lchownSync(dir, identity.agent.uid, identity.agent.gid);
+    return { dir, file: path.join(dir, 'opencode.db') };
+  } catch (error) {
+    log('warn', `opencode's database stays in the agent's home: no local directory could be made in ${root} (${error.code || error.message})`);
+    return null;
+  }
+}
+
+function removeAgentDb(db) {
+  if (db) fs.rmSync(db.dir, { recursive: true, force: true });
+}
+
 function agentHomeFor(repo) {
   const base = identity.agent.home;
   return repo ? path.join(base, repo.owner, repo.name) : path.join(base, memory.ESTATE);
@@ -2669,6 +2728,11 @@ async function runAgent(config, workspace, prompt, options = {}) {
   } else {
     applyAgentHomeEnv(env, null);
   }
+  // The database is the one thing of opencode's that must not be on the volume.
+  delete env.OPENCODE_DB;
+  delete env.SRE_AGENT_DB_DIR;
+  const agentDb = prepareAgentDb();
+  if (agentDb) env.OPENCODE_DB = agentDb.file;
   // The tree holds the agent's own repository, and git must not go looking
   // above it for one that is not this request's.
   env.GIT_CEILING_DIRECTORIES = path.dirname(workspace);
@@ -2689,15 +2753,20 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // No --auto: the configuration leaves no permission at ask, and an
   // unexpected one is rejected rather than approved.
   const args = ['run', '--agent', 'sre-fix', '--model', config.model, '--format', 'json'];
-  const result = await runProcess('opencode', args, {
-    cwd: workspace,
-    env,
-    input: prompt,
-    as: 'agent',
-    home: options.home,
-    timeoutMs: options.timeoutMs || config.runTimeoutMs,
-    signal: options.signal || null,
-  });
+  let result;
+  try {
+    result = await runProcess('opencode', args, {
+      cwd: workspace,
+      env,
+      input: prompt,
+      as: 'agent',
+      home: options.home,
+      timeoutMs: options.timeoutMs || config.runTimeoutMs,
+      signal: options.signal || null,
+    });
+  } finally {
+    removeAgentDb(agentDb);
+  }
   // Once, right after the process ends, whatever ended it: the tail of the
   // structured server log opencode printed on stderr goes to the operator's
   // log group. null when the process printed no structured line, which the
@@ -4575,6 +4644,9 @@ module.exports = {
     closeAllAgentHomes,
     agentHomeFor,
     applyAgentHomeEnv,
+    prepareAgentDb,
+    removeAgentDb,
+    sweepAgentDbs,
     autoLoadSwitches: AUTOLOAD_SWITCHES,
     loadIdentity,
     acquireLock,
