@@ -41,6 +41,21 @@
 //   FIXTURE_HEARTBEAT_AFTER_FILE  when set, every beat is answered continue
 //                          until this file exists, and the list above starts
 //                          from there: a case can wait for its agent to start
+//   FIXTURE_TOKEN_LIFETIME_MS  when set, the platform has the runner token
+//                          exchange (POST /api/fix_runner/token, or the hyphen
+//                          spelling with FIXTURE_TOKEN_ROUTE=hyphen): the key
+//                          mints a chain whose tokens live this long and end
+//                          FIXTURE_TOKEN_CAP_MS after its first mint (default
+//                          a day), a token renews to a new token capped at the
+//                          chain's end, and the queue accepts a live token as
+//                          well as the key. Unset, the exchange answers 404 as
+//                          an older platform does.
+//   FIXTURE_TOKEN_REVOKE_FILE  when this file exists the key and every token are
+//                          refused, as when the key was revoked
+//   FIXTURE_TOKEN_FORGET_FILE  when this file exists the platform forgets every
+//                          token it minted (and the file is removed), as when
+//                          it was replaced: the key still works
+//   FIXTURE_TOKEN_STATUS   a status to answer the exchange with instead (503)
 
 const fs = require('node:fs');
 const http = require('node:http');
@@ -57,6 +72,28 @@ const heartbeatAnswers = (process.env.FIXTURE_HEARTBEAT_ANSWERS || 'continue').s
 const heartbeatAfterFile = process.env.FIXTURE_HEARTBEAT_AFTER_FILE || '';
 const briefDelayMs = Number.parseInt(process.env.FIXTURE_BRIEF_DELAY_MS || '0', 10);
 const reportDelayMs = Number.parseInt(process.env.FIXTURE_REPORT_DELAY_MS || '0', 10);
+
+const tokenLifetimeMs = process.env.FIXTURE_TOKEN_LIFETIME_MS ? Number.parseInt(process.env.FIXTURE_TOKEN_LIFETIME_MS, 10) : null;
+const tokenCapMs = Number.parseInt(process.env.FIXTURE_TOKEN_CAP_MS || String(24 * 3600 * 1000), 10);
+const tokenRoute = process.env.FIXTURE_TOKEN_ROUTE === 'hyphen' ? '/api/fix-runner/token' : '/api/fix_runner/token';
+const tokenRevokeFile = process.env.FIXTURE_TOKEN_REVOKE_FILE || '';
+const tokenForgetFile = process.env.FIXTURE_TOKEN_FORGET_FILE || '';
+const tokenStatus = process.env.FIXTURE_TOKEN_STATUS ? Number.parseInt(process.env.FIXTURE_TOKEN_STATUS, 10) : null;
+const tokens = new Map();
+let tokenCount = 0;
+
+// The token behind an Authorization header, if it is one this server minted and
+// it is neither revoked nor expired.
+function liveToken(authorization) {
+  if (tokenForgetFile && fs.existsSync(tokenForgetFile)) {
+    tokens.clear();
+    fs.rmSync(tokenForgetFile, { force: true });
+  }
+  const row = tokens.get(authorization.replace(/^Bearer /, ''));
+  if (!row) return null;
+  if (tokenRevokeFile && fs.existsSync(tokenRevokeFile)) return null;
+  return row.expires > Date.now() ? row : null;
+}
 
 let queueCalls = 0;
 let queueServed = false;
@@ -107,6 +144,36 @@ const server = http.createServer((request, response) => {
     const beatAnswer = beat ? nextHeartbeatAnswer() : undefined;
     record({ method: request.method, path: url.pathname, authorization, body, at: Date.now(), ...(beat ? { answer: beatAnswer } : {}) });
 
+    if (request.method === 'POST' && url.pathname === tokenRoute && tokenLifetimeMs !== null) {
+      if (tokenStatus !== null) {
+        send(response, tokenStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
+        return;
+      }
+      const presented = authorization.replace(/^Bearer /, '');
+      let chainEnd;
+      if (authorization === `Bearer ${apiKey}` && tokenRevokeFile && fs.existsSync(tokenRevokeFile)) {
+        send(response, 401, 'application/json', JSON.stringify({ error: 'unauthorized' }));
+        return;
+      }
+      if (authorization === `Bearer ${apiKey}`) {
+        chainEnd = Date.now() + tokenCapMs;
+      } else {
+        const held = liveToken(authorization);
+        // A token at its cap cannot be renewed, so it is refused like any other stranger.
+        if (!held || held.expires >= held.max) {
+          send(response, 401, 'application/json', JSON.stringify({ error: 'unauthorized' }));
+          return;
+        }
+        chainEnd = held.max;
+      }
+      tokenCount += 1;
+      const token = `sre_frt_fixture${String(tokenCount).padStart(4, '0')}${presented === apiKey ? 'k' : 'r'}`;
+      const expires = Math.min(Date.now() + tokenLifetimeMs, chainEnd);
+      tokens.set(token, { expires, max: chainEnd });
+      send(response, 200, 'application/json', JSON.stringify({ token, expires_at: new Date(expires).toISOString(), max_expires_at: new Date(chainEnd).toISOString() }));
+      return;
+    }
+
     if (url.pathname === '/api/fix-runner/queue') {
       const status = statuses[Math.min(queueCalls, statuses.length - 1)];
       queueCalls += 1;
@@ -118,7 +185,8 @@ const server = http.createServer((request, response) => {
         send(response, status, 'application/json', JSON.stringify(code ? { error: { code } } : { error: 'fixture' }));
         return;
       }
-      if (authorization !== `Bearer ${apiKey}`) {
+      const keyRevoked = tokenRevokeFile && fs.existsSync(tokenRevokeFile);
+      if ((authorization !== `Bearer ${apiKey}` || keyRevoked) && !liveToken(authorization)) {
         send(response, 401, 'application/json', JSON.stringify({ error: 'unauthorized' }));
         return;
       }

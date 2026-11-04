@@ -77,6 +77,24 @@ const REPLACEMENT_SUMMARY_MAX = 500;
 const REPLACEMENT_ANALYSIS_MAX = 20_000;
 const CHANGE_MESSAGE_MAX = 300;
 
+// The runner token: an expiring stand-in for SRE_API_KEY, minted by the
+// platform in exchange for the key and renewed through the same call. A start
+// that holds the key exchanges it before the first poll and renews at 70% of
+// each token's life; a start that holds a token (the key can then stay off the
+// host) renews that. The route is spelled with an underscore in the wire
+// contract and with a hyphen like the queue's, and a platform that answers 404
+// to both has no exchange, which is an older release and means the key as
+// before.
+const TOKEN_PREFIX = 'sre_frt_';
+const TOKEN_PATHS = ['/api/fix_runner/token', '/api/fix-runner/token'];
+const TOKEN_RENEW_FRACTION = 0.7;
+const TOKEN_RETRY_MS = 30_000;
+const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
+// A token this close to its expiry is treated as gone: a poll started on it
+// could be refused before the answer arrives.
+const TOKEN_EXPIRY_MARGIN_MS = 5_000;
+const TOKEN_CLOCK_SKEW_MS = 5_000;
+
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
 // so with the split off nothing changes, lock files included). A lock names
@@ -464,6 +482,7 @@ function loadConfig() {
     trimmed,
   };
   registerConfigSecrets(config);
+  credential = newCredential(config.serverUrl, config.apiKey);
   return config;
 }
 
@@ -482,6 +501,194 @@ function registerConfigSecrets(config) {
   for (const name of PROVIDER_KEY_VARIABLES) {
     if (process.env[name]) constantSecrets.push(process.env[name]);
   }
+}
+
+// The credential the runner sends the queue with, and the state that renews it.
+// One per process, like the identity: a supervisor runs one process per worker,
+// so nothing is shared.
+let credential = null;
+
+function newCredential(serverUrl, apiKey) {
+  const isToken = apiKey.startsWith(TOKEN_PREFIX);
+  return {
+    serverUrl,
+    // The long-lived key when this start holds it, else null.
+    key: isToken ? null : apiKey,
+    bearer: apiKey,
+    kind: isToken ? 'token' : 'key',
+    // Whether the platform has no exchange (answered 404): the key stands.
+    unsupported: false,
+    expiresAt: null,
+    maxExpiresAt: null,
+    renewAt: 0,
+    // Set when the token cannot be renewed any more and has to be replaced by
+    // whoever started this runner.
+    capped: false,
+    margin: 0,
+    dead: null,
+    timer: null,
+    inFlight: null,
+    announced: false,
+  };
+}
+
+function tokenRefusal() {
+  return 'the platform refused the runner token: it expired, reached its 24 hour cap or its key was revoked. Start the runner again with a fresh SRE_API_KEY (a token from whatever mints them, or the key itself)';
+}
+
+// One call to the exchange with `secret` as the bearer. Answers
+// { status, token, expiresAt, maxExpiresAt, serverNow } on a usable 200, or
+// { status } for anything else (status 0: no answer).
+async function exchangeToken(c, secret) {
+  let last = { status: 0 };
+  for (const route of TOKEN_PATHS) {
+    let response;
+    try {
+      response = await httpRequest(`${c.serverUrl}${route}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${secret}`, Accept: 'application/json', 'Content-Length': '0' },
+        timeoutMs: TOKEN_REQUEST_TIMEOUT_MS,
+      });
+    } catch (error) {
+      return { status: 0, detail: error.message };
+    }
+    last = { status: response.status };
+    if (response.status === 404) continue;
+    if (response.status !== 200) return last;
+    let payload = null;
+    try {
+      payload = JSON.parse(response.body);
+    } catch {
+      payload = null;
+    }
+    const expiresAt = payload ? Date.parse(payload.expires_at) : NaN;
+    const maxExpiresAt = payload ? Date.parse(payload.max_expires_at) : NaN;
+    if (!payload || typeof payload.token !== 'string' || payload.token === '' || /\s/.test(payload.token) || !Number.isFinite(expiresAt) || !Number.isFinite(maxExpiresAt)) {
+      return { status: 200, detail: 'the answer was not a token with its expiry' };
+    }
+    // The platform's own clock, from the response's Date header (whole
+    // seconds), so a local clock that is minutes off does not move the renewal
+    // point; a difference of a second or two is the header's rounding and is
+    // ignored.
+    const headerDate = response.headers && response.headers.date ? Date.parse(response.headers.date) : NaN;
+    const skew = Number.isFinite(headerDate) && Math.abs(headerDate - Date.now()) >= TOKEN_CLOCK_SKEW_MS ? headerDate - Date.now() : 0;
+    const serverNow = Date.now() + skew;
+    return { status: 200, token: payload.token, expiresAt, maxExpiresAt, serverNow };
+  }
+  return last;
+}
+
+function adoptToken(c, answer) {
+  c.bearer = answer.token;
+  c.kind = 'token';
+  c.expiresAt = answer.expiresAt;
+  c.maxExpiresAt = answer.maxExpiresAt;
+  c.capped = answer.expiresAt >= answer.maxExpiresAt;
+  c.dead = null;
+  const life = Math.max(0, answer.expiresAt - answer.serverNow);
+  c.margin = Math.min(TOKEN_EXPIRY_MARGIN_MS, Math.floor(life * 0.1));
+  c.renewAt = Date.now() + Math.floor(life * TOKEN_RENEW_FRACTION);
+  constantSecrets.push(answer.token);
+  if (c.timer) clearTimeout(c.timer);
+  c.timer = null;
+  // A capped token is never renewed; the next poll after its expiry says so.
+  if (!c.capped) scheduleRenewal(c, c.renewAt - Date.now());
+  if (!c.announced) {
+    c.announced = true;
+    log('info', `the runner uses an expiring token in place of SRE_API_KEY (valid until ${new Date(c.expiresAt).toISOString()}, never longer than ${new Date(c.maxExpiresAt).toISOString()}) and renews it before it runs out`);
+  }
+}
+
+function scheduleRenewal(c, delayMs) {
+  if (c.timer) clearTimeout(c.timer);
+  c.timer = setTimeout(() => {
+    c.timer = null;
+    renewCredential(c).catch((error) => {
+      log('warn', `the runner token could not be renewed (${redact(error.message)})`);
+    });
+  }, Math.max(0, delayMs));
+  c.timer.unref();
+}
+
+// Exchanges (a key) or renews (a token). One at a time. Never throws for a
+// platform that cannot be reached: the credential in hand keeps working until
+// it expires, and the next attempt is TOKEN_RETRY_MS away.
+function renewCredential(c) {
+  if (c.inFlight) return c.inFlight;
+  c.inFlight = (async () => {
+    const secret = c.key || c.bearer;
+    const answer = await exchangeToken(c, secret);
+    if (answer.status === 200 && answer.token) {
+      adoptToken(c, answer);
+      return;
+    }
+    if (c.key) {
+      if (answer.status === 404) {
+        c.unsupported = true;
+        c.bearer = c.key;
+        c.kind = 'key';
+        log('info', 'the platform has no runner token exchange (an older release), so the runner uses SRE_API_KEY as before');
+        return;
+      }
+      // Not a verdict on the key: the queue's own answer to it is the verdict.
+      log('warn', `the runner token could not be obtained (${answer.detail || `HTTP ${answer.status || 'no answer'}`}); using SRE_API_KEY meanwhile, and asking again in ${TOKEN_RETRY_MS / 1000} s`);
+      c.renewAt = Date.now() + TOKEN_RETRY_MS;
+      if (c.kind === 'token' && c.expiresAt !== null && Date.now() >= c.expiresAt - c.margin) {
+        c.bearer = c.key;
+        c.kind = 'key';
+      }
+      scheduleRenewal(c, TOKEN_RETRY_MS);
+      return;
+    }
+    if (answer.status === 401 || answer.status === 404) {
+      c.dead = answer.status === 401 ? tokenRefusal() : 'the platform has no runner token exchange, so a runner token cannot be renewed; start the runner with SRE_API_KEY set to the key';
+      return;
+    }
+    log('warn', `the runner token could not be renewed (${answer.detail || `HTTP ${answer.status || 'no answer'}`}); asking again in ${TOKEN_RETRY_MS / 1000} s`);
+    c.renewAt = Date.now() + TOKEN_RETRY_MS;
+    scheduleRenewal(c, TOKEN_RETRY_MS);
+  })().finally(() => {
+    c.inFlight = null;
+  });
+  return c.inFlight;
+}
+
+// The bearer for the queue. A start with the key exchanges it before the first
+// use; a start with a token renews it before the first use, which is also how
+// it learns the token's expiry. Fatal (error.fatal) only when a token-only
+// runner has nothing left to renew with.
+async function apiCredential() {
+  const c = credential;
+  if (!c) throw fatal('no credential is loaded; loadConfig has not run');
+  if (c.unsupported) return c.bearer;
+  if (c.dead) throw fatal(c.dead);
+  if (c.capped && Date.now() >= c.expiresAt - c.margin) {
+    if (c.key) {
+      c.capped = false;
+      c.renewAt = 0;
+    } else {
+      throw fatal('the runner token reached its 24 hour cap and cannot be renewed. Start the runner again with a fresh SRE_API_KEY (a token from whatever mints them, or the key itself)');
+    }
+  }
+  if (!c.capped && Date.now() >= c.renewAt) {
+    await renewCredential(c);
+    if (c.dead) throw fatal(c.dead);
+  }
+  if (c.kind === 'token' && c.expiresAt !== null && Date.now() >= c.expiresAt && !c.key) {
+    throw new Error('the runner token expired and the platform could not be reached to renew it');
+  }
+  return c.bearer;
+}
+
+// After the queue refused the credential: with the key in hand, get a token
+// of its own again and say whether that happened.
+async function refreshFromKey() {
+  const c = credential;
+  if (!c || !c.key || c.unsupported) return false;
+  c.renewAt = 0;
+  c.capped = false;
+  await renewCredential(c);
+  return c.kind === 'token';
 }
 
 function httpRequest(target, options = {}) {
@@ -503,7 +710,7 @@ function httpRequest(target, options = {}) {
       const chunks = [];
       response.on('data', (chunk) => chunks.push(chunk));
       response.on('end', () => {
-        resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8') });
+        resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString('utf8'), headers: response.headers });
       });
     });
     request.setTimeout(timeoutMs, () => {
@@ -902,13 +1109,14 @@ async function poll(config) {
   // contract says, and the length is spelled out so the body is framed whatever
   // the platform reads it with.
   const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}`, capabilities: CAPABILITIES });
+  let freshToken = false;
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
     let failure = '';
     try {
       response = await httpRequest(url, {
         headers: {
-          Authorization: `Bearer ${config.apiKey}`,
+          Authorization: `Bearer ${await apiCredential()}`,
           Accept: 'application/json',
           'Content-Type': 'application/json',
           'Content-Length': String(Buffer.byteLength(body)),
@@ -917,6 +1125,7 @@ async function poll(config) {
         timeoutMs: POLL_REQUEST_TIMEOUT_MS,
       });
     } catch (error) {
+      if (error.fatal) throw error;
       failure = error.message;
     }
 
@@ -932,6 +1141,22 @@ async function poll(config) {
       );
       if (!config.once) await sleep(DISABLED_POLL_MS);
       return { jobs: [], heartbeatSeconds: null };
+    }
+
+    // A token the queue no longer accepts (revoked with its key, or lost to a
+    // platform that was replaced) is exchanged again from the key when this
+    // start holds it, once; a start without the key has nothing to ask with.
+    if (response && response.status === 401 && credential && credential.kind === 'token') {
+      if (credential.key && !freshToken) {
+        freshToken = true;
+        log('warn', 'the queue refused the runner token; exchanging SRE_API_KEY for a new one');
+        if (await refreshFromKey()) {
+          attempt -= 1;
+          continue;
+        }
+      } else if (!credential.key) {
+        throw fatal(tokenRefusal());
+      }
     }
 
     if (response && (response.status === 401 || response.status === 403)) {
@@ -4654,6 +4879,8 @@ module.exports = {
     readHeldLock,
     repoLockPath,
     runProcess,
+    apiCredential,
+    poll,
     setIdentity: (value) => {
       identity = value;
     },

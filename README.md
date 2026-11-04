@@ -206,7 +206,7 @@ The unit runs as its own account, never as root, with `NoNewPrivileges`, `Protec
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `SRE_SERVER_URL` | yes | Where SRE Agent runs, for example `https://app.example.com`. The runner polls `/api/fix-runner/queue` there. |
-| `SRE_API_KEY` | yes | The organization API key holding only `fix_runner:poll`. |
+| `SRE_API_KEY` | yes | The organization API key holding only `fix_runner:poll`, or a runner token (`sre_frt_...`) minted from it. With the key the runner exchanges it for an expiring token before its first poll and polls with the token; with a token it renews that. See [Tokens in place of the key](#tokens-in-place-of-the-key). |
 | `SRE_MODEL` | yes | `provider/model`, for example `openrouter/deepseek/deepseek-v4-pro`. |
 | the provider's own key | yes | Named for the provider, for example `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY`; [`scripts/provider_env.sh`](scripts/provider_env.sh) maps a model prefix to the variable. opencode reads it directly. |
 | `SRE_GITHUB_TOKEN` | with a repository, one auth mode | A token that may push a branch and open a pull request in the repositories this runner is asked to fix: contents and pull requests, write. Without any GitHub credential, such a request is reported back saying exactly that, and a request naming no repository is still answered. Exactly one mode is allowed: this variable alone, or the two `SRE_GITHUB_APP_*` variables together, never both. |
@@ -381,6 +381,15 @@ Older platforms and the capability. The poll's `capabilities` key is one more ke
 - **In the runner's log.** Every poll, request and refusal, which bound cut which file, every failing mirror or restore call and each first sync, with the poll key, the repository token and the handoff token replaced by `[redacted]`.
 - **opencode's own log, forwarded.** Each run's opencode is started with `OPENCODE_PRINT_LOGS=1`, so the binary writes its structured server log (one `timestamp=... level=... run=... message=...` line per event) on the process's stderr, and when the process ends, however it ended, the runner forwards the tail of those lines from the captured stderr to its own output: filter the runner's log group on `opencode:` and the lines are there. Every forwarded line goes through the same redaction as every other line the runner writes, applied to the whole line before the line is cut, and the bounds hold a chatty level: at most the last 200 lines, each cut at 2,000 characters, a line that is not valid UTF-8 or holds a NUL byte dropped whole and counted in one line. A failed run, a killed run and a failed test-job model step name how many lines were forwarded in the report's evidence (`opencode_log_lines`). `SRE_OPENCODE_LOG_LEVEL` raises the detail the binary logs at.
 - **In your repositories.** A change to a repository reaches it only as a pull request, which your review and CI stand in front of. Memory never does: it lives outside every checkout, and the protected paths gate refuses any staged `.sre-agent-memory/` path.
+
+### Tokens in place of the key
+
+`SRE_API_KEY` is long-lived: whoever reads a host's environment holds it until somebody rotates it. From v2.5.0 the runner does not need to send it. Before its first poll it calls `POST /api/fix_runner/token` with the key and receives a token that expires after an hour and carries the same single scope, `fix_runner:poll`. It polls with the token and renews it at 70% of its life through the same call, in the background, so a token never runs out during a long run. Every token is looked up on each request like a key, so revoking or deleting the key ends all of its tokens at the next request. A token chain lasts 24 hours at most from its first mint.
+
+- **Key on the host** (the default, and what v2.4.1 did, now with the token in between): nothing to change. The key stays in the runner's environment and is used only to get tokens; it is never written to a log, a report or the agent's environment.
+- **Token on the host:** set `SRE_API_KEY` to a token whoever starts the runner minted from the key (the scaler of the Terraform module does). The runner renews it until the 24 hour cap, then stops with a sentence that says so, and whatever started it starts it again with a fresh one. Leave the key off hosts that only run.
+- **A queue that stops accepting the token** (the platform was replaced, or the token's chain ended) makes a start with the key exchange it once more and go on; a start without the key stops with the same sentence.
+- **An older platform** has no exchange: it answers 404 to both spellings of the route, and the runner uses the key exactly as v2.4.1 did.
 
 ### When the runner is offline
 
