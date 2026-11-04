@@ -2,6 +2,18 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.4.1
+
+opencode's database no longer lives on the workspace volume.
+
+A run on a runner whose workspace is a network file system (EFS, NFS) could fail with `Error: locking protocol` and no final message from the agent. opencode keeps its sessions in a SQLite database it opens in WAL mode, and WAL needs the shared memory and POSIX locks a network file system does not provide. A task killed in the middle of a run also left `-wal` and `-shm` files beside the database, which the next open could trip on. The agent's home is on the volume on purpose, so the tools it installs and their caches last, and that put the database there too.
+
+The runner now sets `OPENCODE_DB` to a private directory it makes for each run under the machine's temporary directory (on a Fargate task, its ephemeral disk), usable by the agent's account only, and removes it when the run ends, so a run's sessions never reach the next run. Directories a killed runner left behind are swept when the next run starts, once they are a day old. If no local directory can be made, the run goes on with opencode's own default and the log says so. Everything else of the agent's home, its installed tools, caches and notes, stays on the volume.
+
+New, optional: `SRE_AGENT_DB_DIR`, an absolute path on the machine's own disk where those directories are made, for a host whose temporary directory is small. Never point it at the workspace volume.
+
+What a customer must change on upgrade: nothing.
+
 ## v2.4.0
 
 The runner makes a change asked for on an open pull request: it pushes the change onto that pull request's own branch, or opens the replacement pull request SRE Agent decides.
