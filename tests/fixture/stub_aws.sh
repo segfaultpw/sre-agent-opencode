@@ -42,9 +42,11 @@ id -u >> "$ctl/aws_uid.log"
 printf '%s\n' "${HOME:-}" >> "$ctl/aws_home.log"
 
 # The requests the fixture platform had received: its log also notes when it
-# answered a report, which is not a request and is not counted.
+# answered a report, which is not a request and is not counted, and the runner
+# token exchange (which comes before the first poll) is not one of the requests
+# the cases count.
 if [ -s "$ctl/fixture_log_path" ]; then
-  grep -vc '"method":"ANSWERED"' "$(cat "$ctl/fixture_log_path")" >> "$ctl/aws_seen.log" || true
+  grep -vcE '"method":"ANSWERED"|/token"' "$(cat "$ctl/fixture_log_path")" >> "$ctl/aws_seen.log" || true
 else
   echo 0 >> "$ctl/aws_seen.log"
 fi
