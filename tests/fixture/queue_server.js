@@ -48,6 +48,10 @@
 //                          change) is answered continue without using up an
 //                          answer of the list, and its entry says
 //                          `phase_change: true`
+//   FIXTURE_ECS_STATUS     answers the ECS agent's task protection route (PUT
+//                          .../task-protection/v1/state) with this status; 200
+//                          by default. 400 and 403 carry the AccessDenied body
+//                          a task role without ecs:UpdateTaskProtection gets.
 //   Every entry carries `at`, the milliseconds it arrived.
 //   FIXTURE_HEARTBEAT_AFTER_FILE  when set, every beat is answered continue
 //                          until this file exists, and the list above starts
@@ -177,6 +181,18 @@ const server = http.createServer((request, response) => {
     if (phase !== null) lastPhase = phase;
     const beatAnswer = beat ? (phaseChange ? 'continue' : nextHeartbeatAnswer()) : undefined;
     record({ method: request.method, path: url.pathname, authorization, body, at: Date.now(), ...(beat ? { answer: beatAnswer } : {}), ...(phaseChange ? { phase_change: true } : {}) });
+
+    if (request.method === 'PUT' && url.pathname.endsWith('/task-protection/v1/state')) {
+      const status = Number.parseInt(process.env.FIXTURE_ECS_STATUS || '200', 10);
+      if (status === 400 || status === 403) {
+        send(response, status, 'application/json', JSON.stringify({ failure: { arn: 'arn:aws:ecs:fixture', reason: 'not allowed' }, error: { Code: 'AccessDeniedException', Message: 'User is not authorized to perform: ecs:UpdateTaskProtection' } }));
+      } else if (status === 200) {
+        send(response, 200, 'application/json', JSON.stringify({ protection: { enabled: true } }));
+      } else {
+        send(response, status, 'application/json', JSON.stringify({ error: 'fixture' }));
+      }
+      return;
+    }
 
     if (request.method === 'POST' && url.pathname === tokenRoute && tokenLifetimeMs !== null) {
       if (tokenStatus !== null) {

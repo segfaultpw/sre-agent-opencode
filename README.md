@@ -222,6 +222,7 @@ The unit runs as its own account, never as root, with `NoNewPrivileges`, `Protec
 | `SRE_HOOK_TIMEOUT_SECONDS` | no | How long one hook may run, 60 by default. At the bound the hook's whole process group is stopped and the request fails (`post-run`: the failure is only logged). |
 | `SRE_AGENT_AWS_ROLE_ARN` | no | The ARN of an IAM role the runner assumes for each request (`aws sts assume-role`, session name `sre-` and the first eight characters of the handoff id, one hour) when `SRE_AGENT_AWS_ACCESS=1`. The agent then holds the three session variables, which expire, instead of the runner's own AWS identity. Without `SRE_AGENT_AWS_ACCESS=1` the role is not assumed. A role that cannot be assumed fails the request with the CLI's words. |
 | `SRE_CONCURRENCY` | no | How many requests this container or machine works at once, 1 to 8, 1 by default. Above 1 the entrypoint starts `runner/supervisor.js`, which runs that many workers; see [Several requests at once](#several-requests-at-once). Anything else than a whole number from 1 to 8 stops the start with exit status 2. |
+| `SRE_TASK_PROTECTION` | no | `auto` (the default), `on` or `off`. On an ECS task (the agent address `ECS_AGENT_URI` is in the environment) the runner asks ECS to protect its task from scale-in while a request is held; see [ECS task protection](#ecs-task-protection). `auto` and `on` do that wherever the address exists and skip it quietly elsewhere; `off` never calls it. |
 | `SRE_MEMORY_BUCKET` | no | The name of an S3 bucket you own, to mirror the agent's memory to and restore it from; see [Mirroring the memory to your own bucket](#mirroring-the-memory-to-your-own-bucket). Empty or unset (the default) means no bucket, and the runner never calls the AWS CLI. A value that is not a valid bucket name (3 to 63 characters, lower case letters, digits, dots and hyphens, not a URL, an ARN or an IP address) stops the runner at start with a sentence naming the variable. The runner is the only process that holds it: the agent's environment does not. |
 | `SRE_MEMORY_PREFIX` | no | Where in the bucket the memory goes, `memory/` by default. Relative to the bucket, no `..`, `.` or empty part, letters, digits, dots, underscores and hyphens in each part, at most 512 characters; a missing trailing slash is added. A bad value stops the runner at start. Ignored when `SRE_MEMORY_BUCKET` is unset. |
 | `SRE_RUNNER_SETUP` | no | The path of an executable file in the container, run once as root by the entrypoint before the runner starts; see [Customizing the image](#customizing-the-image). |
@@ -333,6 +334,16 @@ A single runner is unaffected: unset, or any value other than `1`, keeps the one
 - **SIGTERM** is passed to every worker, and the supervisor exits 0 when they have stopped (a worker that has not stopped after 30 seconds is killed). A worker that finishes cleanly (`SRE_ONCE=1`) is not restarted, and the supervisor exits 0 when all have.
 - **Log lines** from a worker are prefixed with `[<instance id>] `, so eight interleaved logs can be told apart.
 - **1 or unset** starts `runner.js` itself, exactly as before, with no supervisor in the process tree.
+
+### ECS task protection
+
+A scaler that lowers an ECS service's desired count chooses the tasks to stop, and it does not know which are in the middle of a fix. So while a worker holds a request (from the poll that handed it over until its report has been answered, taken over or failed) the runner asks the ECS agent to turn on scale-in protection for its task: `PUT ${ECS_AGENT_URI}/task-protection/v1/state` with `{"ProtectionEnabled": true, "ExpiresInMinutes": 60}`. When no worker of the task holds a request any more it sends `{"ProtectionEnabled": false}`. The expiry is the safety net: a runner that dies holding the protection leaves one that ends by itself within 60 minutes.
+
+- **Several workers in one task** (`SRE_CONCURRENCY`) share it: a marker file per worker, in a directory under the workspace's `locks/` named for this task (so other tasks sharing the volume are not counted), and a lock around each change, keep it on until the last worker releases.
+- **Not on ECS** (no `ECS_AGENT_URI`): nothing is called, and a debug line says why once.
+- **A task role that may not do it.** Protection needs `ecs:UpdateTaskProtection` on the task role. A fixed fleet does not have it; the Terraform module's scaler does. The ECS agent answers that with an AccessDenied (HTTP 400 with `AccessDeniedException`, or any 403), and the runner logs one info line, stops asking for the rest of the process, and carries on: it is never retried per request and never fails one.
+- **Any other failure** of the call (a timeout, a 5xx) is a warning; the request goes on and the next one tries again.
+- The agent does not see `ECS_AGENT_URI`.
 
 ### What the agent remembers
 

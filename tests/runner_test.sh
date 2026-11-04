@@ -3350,6 +3350,82 @@ for spec in "parallel:acme/app:acme/other" "serial:acme/app:acme/app"; do
   stop_fixture
 done
 
+echo "--- 119. ECS task protection: on while a request is held, off after its report, and never a reason to fail one ---"
+# The order of the interesting calls, from the fixture's log: P for a protection call
+# turning it on, p for off, B for a brief, R for a report.
+sequence() {
+  jq -r 'if (.method == "PUT" and (.path | endswith("/task-protection/v1/state"))) then (if .body.ProtectionEnabled then "P" else "p" end)
+         elif (.path | endswith("/brief")) then "B" elif ((.path | endswith("/report")) and .method == "POST") then "R" else empty end' "$fixture_log" | tr -d '\n'
+}
+start_fixture protect_ok
+queue_one h-protect-ok acme/app
+ECS_AGENT_URI="$server_url/ecs/task1" run_once protect_ok
+if [ "$rc" -eq 0 ] && [ "$(sequence)" = "PBRp" ] && [ "$(jq -r 'select(.method == "PUT") | .body.ExpiresInMinutes // empty' "$fixture_log" | head -n 1)" = "60" ]; then echo "ok   a request that ends in a pull request: protection on for 60 minutes before the brief, off after the report ($(sequence))"; else echo "FAIL rc=$rc sequence: $(sequence)"; fail=1; fi
+stop_fixture
+
+start_fixture protect_fail
+queue_one h-protect-fail acme/app
+export STUB_OPENCODE_MODE=provider_error
+ECS_AGENT_URI="$server_url/ecs/task1" run_once protect_fail
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(sequence)" = "PBRp" ]; then echo "ok   a request whose agent fails: protection is lifted after the failure is reported ($(sequence))"; else echo "FAIL rc=$rc sequence: $(sequence)"; fail=1; fi
+stop_fixture
+
+rm -f "$work/protect-stopped.pid"
+export FIXTURE_HEARTBEAT_SECONDS=1 FIXTURE_HEARTBEAT_ANSWERS=taken_over FIXTURE_HEARTBEAT_AFTER_FILE="$work/protect-stopped.pid"
+start_fixture protect_taken
+queue_one h-protect-taken acme/app
+export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120 STUB_OPENCODE_PIDFILE="$work/protect-stopped.pid"
+ECS_AGENT_URI="$server_url/ecs/task1" run_once protect_taken
+unset STUB_OPENCODE_SLEEP STUB_OPENCODE_PIDFILE FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_AFTER_FILE FIXTURE_HEARTBEAT_SECONDS
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(sequence)" = "PBp" ]; then echo "ok   a job taken over: nothing is reported and protection is still lifted ($(sequence))"; else echo "FAIL rc=$rc sequence: $(sequence)"; fail=1; fi
+stop_fixture
+
+for status in 400 403; do
+  export FIXTURE_ECS_STATUS="$status"
+  start_fixture "protect_denied_$status"
+  queue_one "h-protect-denied-$status" acme/app
+  ECS_AGENT_URI="$server_url/ecs/task1" run_once "protect_denied_$status"
+  unset FIXTURE_ECS_STATUS
+  if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ "$(sequence)" = "PBR" ] && [ "$(grep -c 'task protection' "$out")" -eq 1 ] && grep -q ' info .*ECS task protection is not available to this task' "$out"; then echo "ok   a task role that may not set protection ($status): one info line, one call, no retry on release, and the request ends in its pull request"; else echo "FAIL $status rc=$rc sequence: $(sequence) lines: $(grep -i 'task protection' "$out")"; fail=1; fi
+  stop_fixture
+done
+
+export FIXTURE_ECS_STATUS=500
+start_fixture protect_down
+queue_one h-protect-down acme/app
+ECS_AGENT_URI="$server_url/ecs/task1" run_once protect_down
+unset FIXTURE_ECS_STATUS
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && grep -q ' warn .*task protection on was not set' "$out"; then echo "ok   an ECS agent that fails the call is a warning, and the request ends in its pull request"; else echo "FAIL rc=$rc out: $(grep -i 'task protection' "$out")"; fail=1; fi
+stop_fixture
+
+start_fixture protect_absent
+queue_one h-protect-absent acme/app
+SRE_LOG_LEVEL=debug run_once protect_absent
+if [ "$rc" -eq 0 ] && [ -z "$(sequence | tr -d 'BR')" ] && grep -q 'ECS task protection is skipped: this is not an ECS task' "$out"; then echo "ok   off ECS (no ECS_AGENT_URI) nothing is called, and a debug line says so"; else echo "FAIL rc=$rc sequence: $(sequence) out: $(grep -i protection "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 119b. two workers of one task: protection stays on until both have finished ---"
+pool_ws="$work/workspace-protect-pool"
+mkdir -p "$pool_ws"
+: > "$work/protect.timing"
+export FIXTURE_QUEUE_LEASE=1
+start_fixture protect_pool
+queue_two h-protect-a acme/app h-protect-b acme/other
+export STUB_OPENCODE_MODE=timed STUB_OPENCODE_SLEEP=2 STUB_OPENCODE_TIMING="$work/protect.timing"
+flat_workspace="$workspace"
+workspace="$pool_ws"
+SRE_CONCURRENCY=2 SRE_RUNNER_INSTANCE=pool runner_entry="$pkg/runner/supervisor.js" ECS_AGENT_URI="$server_url/ecs/task1" run_once protect_pool
+workspace="$flat_workspace"
+unset FIXTURE_QUEUE_LEASE STUB_OPENCODE_TIMING
+export STUB_OPENCODE_MODE=fix
+offs="$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == false) | .at' "$fixture_log" | grep -c '' || true)"
+last_report="$(jq -r 'select(.path | endswith("/report")) | .at' "$fixture_log" | sort -n | tail -n 1)"
+off_at="$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == false) | .at' "$fixture_log" | head -n 1)"
+if [ "$rc" -eq 0 ] && [ "$offs" -eq 1 ] && [ -n "$off_at" ] && [ "$off_at" -ge "$last_report" ] && [ "$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == true) | .at' "$fixture_log" | grep -c '')" -ge 2 ]; then echo "ok   both workers turned it on, and it was turned off once, after the last report"; else echo "FAIL rc=$rc offs=$offs off_at=$off_at last_report=$last_report sequence: $(sequence)"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

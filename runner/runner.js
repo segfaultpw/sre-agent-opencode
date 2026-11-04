@@ -95,6 +95,15 @@ const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 const TOKEN_EXPIRY_MARGIN_MS = 5_000;
 const TOKEN_CLOCK_SKEW_MS = 5_000;
 
+// ECS task scale-in protection. While a worker holds a request the runner asks
+// the ECS agent (ECS_AGENT_URI, present on Fargate and ECS) to protect its task,
+// so a scaler that lowers the desired count never stops a task in the middle of
+// a fix; it asks again to lift it when no request is held. The protection
+// expires by itself (the lease window) if the runner dies holding it.
+const TASK_PROTECTION_MINUTES = 60;
+const TASK_PROTECTION_TIMEOUT_MS = 5_000;
+const TASK_PROTECTION_LOCK_WAIT_MS = 10_000;
+
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
 // so with the split off nothing changes, lock files included). A lock names
@@ -485,6 +494,12 @@ function loadConfig() {
     // The names of the secrets that had whitespace around them, for the log.
     trimmed,
   };
+  const protectionMode = (process.env.SRE_TASK_PROTECTION || 'auto').trim().toLowerCase();
+  if (!['auto', 'on', 'off'].includes(protectionMode)) {
+    throw fatal('SRE_TASK_PROTECTION must be auto, on or off');
+  }
+  config.taskProtection = { mode: protectionMode, uri: (process.env.ECS_AGENT_URI || '').replace(/\/+$/, '') };
+  taskProtectionState = { config, held: new Map(), disabled: false, announced: false };
   config.hooks = loadHookSettings(process.env, layout, identity.agent);
   hookSettings = config.hooks;
   registerConfigSecrets(config);
@@ -3331,7 +3346,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // OPENCODE_LOG_PATH), and the level it was given.
   delete env.SRE_OPENCODE_LOG_LEVEL;
   // The runner's hooks, token and scaling settings are the runner's business.
-  for (const name of ['SRE_HOOKS_DIR', 'SRE_HOOK_TIMEOUT_SECONDS', 'SRE_AGENT_AWS_ROLE_ARN', 'SRE_TASK_PROTECTION', 'SRE_CONCURRENCY']) {
+  for (const name of ['SRE_HOOKS_DIR', 'SRE_HOOK_TIMEOUT_SECONDS', 'SRE_AGENT_AWS_ROLE_ARN', 'SRE_TASK_PROTECTION', 'SRE_CONCURRENCY', 'ECS_AGENT_URI']) {
     delete env[name];
   }
   delete env.OPENCODE_LOG_PATH;
@@ -5201,10 +5216,140 @@ async function syncMemory(config) {
   }
 }
 
+// The state of this process's protection: what it holds, and whether the ECS
+// agent has said protection is not available here.
+let taskProtectionState = null;
+
+function taskProtectionFiles(config) {
+  const key = crypto.createHash('sha256').update(config.taskProtection.uri).digest('hex').slice(0, 12);
+  return {
+    lock: path.join(config.layout.locks, `task-protection-${key}.lock`),
+    dir: path.join(config.layout.locks, `task-protection-${key}`),
+  };
+}
+
+// One call to the ECS agent. 'ok', 'denied' (the task role lacks
+// ecs:UpdateTaskProtection, which is what a fixed fleet's role does, or the
+// agent refuses outright: protection is not available here), or 'failed'.
+async function putTaskProtection(uri, body) {
+  let response;
+  try {
+    response = await httpRequest(`${uri}/task-protection/v1/state`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+      timeoutMs: TASK_PROTECTION_TIMEOUT_MS,
+    });
+  } catch (error) {
+    return { result: 'failed', detail: error.message };
+  }
+  if (response.status >= 200 && response.status < 300) return { result: 'ok' };
+  if (response.status === 403 || ((response.status === 400 || response.status === 401) && /AccessDenied/i.test(response.body))) {
+    return { result: 'denied', detail: `HTTP ${response.status}` };
+  }
+  return { result: 'failed', detail: `HTTP ${response.status}` };
+}
+
+// The workers of one task share the task's protection: it is on while any of
+// them holds a request. With a pool or a supervisor (workers in separate
+// processes) a marker file per holder, in a directory named for this task so
+// other tasks sharing the volume are not counted, and a lock around the
+// change, make the count; a single runner counts in memory.
+const protection = {
+  async hold(handoffId) {
+    const state = taskProtectionState;
+    if (!state || state.disabled) return;
+    const { config } = state;
+    if (config.taskProtection.mode === 'off' || !config.taskProtection.uri) {
+      if (!state.announced) {
+        state.announced = true;
+        log('debug', config.taskProtection.mode === 'off' ? 'ECS task protection is switched off (SRE_TASK_PROTECTION=off)' : 'ECS task protection is skipped: this is not an ECS task (no ECS_AGENT_URI)');
+      }
+      state.disabled = true;
+      return;
+    }
+    try {
+      await protection.change(state, handoffId, true);
+    } catch (error) {
+      log('warn', `ECS task protection could not be turned on (${redact(error.message)}); the request goes on`);
+    }
+  },
+
+  async release(handoffId) {
+    const state = taskProtectionState;
+    if (!state || state.disabled) return;
+    try {
+      await protection.change(state, handoffId, false);
+    } catch (error) {
+      log('warn', `ECS task protection could not be turned off (${redact(error.message)}); it expires by itself within ${TASK_PROTECTION_MINUTES} minutes`);
+    }
+  },
+
+  async change(state, handoffId, on) {
+    const { config } = state;
+    const uri = config.taskProtection.uri;
+    let lock = null;
+    let remaining;
+    if (config.layout.perInstance) {
+      const files = taskProtectionFiles(config);
+      lock = await acquireLock(files.lock, { instance: config.layout.instance, waitMs: TASK_PROTECTION_LOCK_WAIT_MS, staleMs: config.lockStaleMs });
+      if (!lock.ok) throw new Error('the lock that counts this task\'s requests is held by another worker');
+      try {
+        settleDir(files.dir, 0o700);
+        const mine = path.join(files.dir, `${config.layout.instance}.hold`);
+        if (on) fs.writeFileSync(mine, `${process.pid} ${handoffId}\n`, { mode: 0o600 });
+        else fs.rmSync(mine, { force: true });
+        remaining = 0;
+        for (const name of fs.readdirSync(files.dir)) {
+          if (!name.endsWith('.hold')) continue;
+          const holder = Number.parseInt(String(fs.readFileSync(path.join(files.dir, name), 'utf8')).split(' ')[0], 10);
+          if (pidIsAlive(holder)) remaining += 1;
+          else fs.rmSync(path.join(files.dir, name), { force: true });
+        }
+        await protection.send(state, on, remaining);
+      } finally {
+        releaseLock(lock);
+      }
+      return;
+    }
+    if (on) state.held.set(handoffId, true);
+    else state.held.delete(handoffId);
+    await protection.send(state, on, state.held.size);
+  },
+
+  // Turns protection on whenever a request is held (which also moves its expiry
+  // on), and off when the last one is released.
+  async send(state, on, holders) {
+    if (!on && holders > 0) return;
+    const answer = await putTaskProtection(state.config.taskProtection.uri, on ? { ProtectionEnabled: true, ExpiresInMinutes: TASK_PROTECTION_MINUTES } : { ProtectionEnabled: false });
+    if (answer.result === 'denied') {
+      state.disabled = true;
+      if (!state.announced) {
+        state.announced = true;
+        log('info', `ECS task protection is not available to this task (${answer.detail}: its role does not allow ecs:UpdateTaskProtection), so it is not used; a scaler that stops tasks could stop this one mid-request`);
+      }
+      return;
+    }
+    if (answer.result === 'failed') {
+      log('warn', `ECS task protection ${on ? 'on' : 'off'} was not set (${answer.detail}); the request goes on${on ? '' : `, and the protection expires by itself within ${TASK_PROTECTION_MINUTES} minutes`}`);
+    }
+  },
+};
+
 // One request: a restore that has not succeeded is tried again first (before
 // the brief is fetched, so the platform's clock for the request is not spent
 // on it more than once), then the request.
 async function serveJob(config, job, options = {}) {
+  const held = String((job && job.handoff_id) || 'unknown');
+  await protection.hold(held);
+  try {
+    return await serveHeldJob(config, job, options);
+  } finally {
+    await protection.release(held);
+  }
+}
+
+async function serveHeldJob(config, job, options) {
   const settings = bucketSettings(config);
   if (settings) {
     try {
@@ -5319,6 +5464,8 @@ module.exports = {
     runProcess,
     apiCredential,
     poll,
+    protection,
+    taskProtectionFiles,
     progressTracker,
     toolCounter,
     startHeartbeat,
