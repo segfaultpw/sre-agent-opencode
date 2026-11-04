@@ -412,6 +412,19 @@ Set `SRE_HOOKS_DIR` to a directory of your own and put executables in it named `
 
 **The hooks directory is trusted code.** A hook runs with the runner's privileges, so the runner refuses to start when `SRE_HOOKS_DIR` is not absolute, is not a directory, is on the workspace (the agent writes there), is a path the agent's account could write (owned by it, writable by everyone outside a sticky directory, or writable by its group) or has a hook in it that the runner cannot execute. Put the hooks in the image or in a root-owned directory.
 
+### Progress on the heartbeat
+
+From v2.5.0 a beat carries where the request is, so a person watching it in SRE Agent sees the phase live instead of waiting for the report. The body is the instance and, once the request has a phase, `progress`:
+
+```json
+{"instance": "alpha", "progress": {"phase": "agent", "detail": "agent working", "tools": 14, "last_tool": "edit"}}
+```
+
+- `phase` is one of `collected`, `cloning`, `agent`, `checks` and `publishing`, in that order for a request that clones and publishes. `detail` is a fixed sentence chosen by the phase alone (`collected the request`, `cloning the repository`, `agent working`, `checking the change`, `publishing the change`).
+- During the agent's phase the runner reads opencode's `--format json` event stream as it arrives and counts the completed tool calls (`tools`) and names the kind of the last one (`last_tool`: the tool's name, such as `read`, `edit` or `bash`, and nothing when it is not a plain name of at most 40 characters).
+- **Nothing the agent ran or read is sent**: no command, no path, no file content, no tool output and no model text, in any field. The only things taken from the stream are the event's type and the tool's name.
+- A beat is sent on every phase change, besides the regular beats, so a short phase is not missed. The regular rhythm is otherwise the platform's `heartbeat_seconds`. A platform that does not read `progress` ignores the key, and one that names no interval gets no beats at all.
+
 ### When the runner is offline
 
 - **A request that arrives while it is down** does not wait for it. Past five minutes without a poll the runner is not routable, and the request runs on SRE Agent's own agent instead, with the reason on the card. A repository set to "Self-hosted runner" behaves the same way.

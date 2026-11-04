@@ -2419,16 +2419,18 @@ if jq -e '.failure.kind == "agent_exit"' <<<"$report" >/dev/null && [ "$detail_b
 stop_fixture
 
 echo "--- 73. a beat that renewed nothing is sent again after a fifth of the interval, until one renews ---"
-export FIXTURE_HEARTBEAT_SECONDS=5 FIXTURE_HEARTBEAT_ANSWERS=route404,503,route404,continue
+# The beat a phase change sends is answered continue and does not use up an answer
+# of the script, and the gaps below are between the regular beats alone.
+export FIXTURE_HEARTBEAT_SECONDS=5 FIXTURE_HEARTBEAT_ANSWERS=route404,503,route404,continue FIXTURE_HEARTBEAT_PHASE_FREE=1
 start_fixture rebeat
 queue_one h-rebeat acme/app
 # Long enough for a beat to follow the renewal: misses at 5, 6 and 7 s, the
 # renewal at 8 s, the next beat at 13 s.
 export STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=16
 run_once rebeat
-unset STUB_OPENCODE_SLEEP FIXTURE_HEARTBEAT_ANSWERS
+unset STUB_OPENCODE_SLEEP FIXTURE_HEARTBEAT_ANSWERS FIXTURE_HEARTBEAT_PHASE_FREE
 export STUB_OPENCODE_MODE=fix FIXTURE_HEARTBEAT_SECONDS=1
-beat_times="$(jq -r 'select(.path | endswith("/heartbeat")) | "\(.at) \(.answer)"' "$fixture_log")"
+beat_times="$(jq -r 'select((.path | endswith("/heartbeat")) and ((.phase_change // false) | not)) | "\(.at) \(.answer)"' "$fixture_log")"
 # The gaps after each of the three misses, and the one after the renewal.
 gaps="$(awk 'NR > 1 { printf "%d:%s ", $1 - prev, prev_answer } { prev = $1; prev_answer = $2 }' <<<"$beat_times")"
 miss_gaps_ok="$(awk '{ ok = 1; n = 0; for (i = 1; i <= NF; i++) { split($i, g, ":"); if (g[2] != "continue") { n++; if (g[1] < 700 || g[1] > 2500) ok = 0 } else if (g[1] < 4500) ok = 0 } print (ok && n == 3 && NF >= 4) ? "yes" : "no" }' <<<"$gaps")"
@@ -3119,6 +3121,9 @@ done
 remote_git update-ref -d refs/pull/7/head
 
 echo "--- 116. per-request hooks: pre-run, credentials and post-run around the agent ---"
+# What earlier cases scripted into the stubs (a pull request GitHub already has,
+# a refused push) must not carry into these.
+rm -f "$work"/ctl/created_url "$work"/ctl/create_exists "$work"/ctl/fail_create "$work"/ctl/fail_draft "$work"/ctl/fail_close "$work"/ctl/fail_push "$work"/ctl/silent_push_fail "$work"/ctl/reject_push "$work"/ctl/pr_view "$work"/ctl/pr_list "$work"/ctl/take_on_push "$work"/ctl/take_on_close "$work"/ctl/break_tmp "$work"/ctl/fail_context "$work"/ctl/remote
 hooks_dir="$work/hooks"
 hook_secret="$(printf 'hook-secret-%040d' 5)"
 hook_order="$work/hook_order.log"
@@ -3278,6 +3283,30 @@ if [ "$rc" -eq 0 ] && grep -qx "env_AWS_ACCESS_KEY_ID: unset" "$opencode_log" &&
 stop_fixture
 export PATH="$saved_path"
 unset STUB_RECORD_ENV
+
+echo "--- 117. progress rides on the heartbeat: the phases in order, the tool count, and nothing the agent ran ---"
+export FIXTURE_HEARTBEAT_SECONDS=1
+start_fixture progress
+queue_one h-progress acme/app
+export STUB_OPENCODE_MODE=tools
+run_once progress
+export STUB_OPENCODE_MODE=fix
+unset FIXTURE_HEARTBEAT_SECONDS
+phases="$(jq -r 'select(.path | endswith("/heartbeat")) | .body.progress.phase // empty' "$fixture_log" | uniq | tr '\n' ' ')"
+if [ "$rc" -eq 0 ] && [ "$phases" = "collected cloning agent checks publishing " ]; then echo "ok   the beats name the phases in order: $phases"; else echo "FAIL rc=$rc phases: $phases"; fail=1; fi
+if jq -e -s '[.[] | select(.path | endswith("/heartbeat")) | select(.body.progress.phase == "agent" and .body.progress.tools == 3 and .body.progress.last_tool == "edit")] | length >= 1' "$fixture_log" >/dev/null; then echo "ok   a beat during the agent carries three tool calls and the kind of the last"; else echo "FAIL beats: $(jq -c 'select(.path | endswith("/heartbeat")) | .body' "$fixture_log" | tr '\n' ' ')"; fail=1; fi
+if ! jq -c 'select(.path | endswith("/heartbeat")) | .body' "$fixture_log" | grep -qE 'hostile|evil.example|id_rsa|rm -rf'; then echo "ok   nothing the agent ran or read is in any beat"; else echo "FAIL a beat carried the agent's content"; fail=1; fi
+if jq -e -s '[.[] | select(.path | endswith("/heartbeat")) | .body.progress.detail // empty] | all(. == "collected the request" or . == "cloning the repository" or . == "agent working" or . == "checking the change" or . == "publishing the change")' "$fixture_log" >/dev/null; then echo "ok   every detail is one of the fixed sentences"; else echo "FAIL details"; fail=1; fi
+if [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   the request still ends in its pull request"; else echo "FAIL report: $report"; fail=1; fi
+stop_fixture
+echo "--- 117b. a platform without heartbeats gets no beat, and so no progress ---"
+start_fixture progress_older
+queue_one h-progress-older acme/app
+export STUB_OPENCODE_MODE=tools
+run_once progress_older
+export STUB_OPENCODE_MODE=fix
+if [ "$rc" -eq 0 ] && [ "$(count_path /heartbeat)" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ]; then echo "ok   no beat is sent without an interval, and the pull request is opened"; else echo "FAIL rc=$rc beats=$(count_path /heartbeat)"; fail=1; fi
+stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do

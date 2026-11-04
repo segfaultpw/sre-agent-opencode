@@ -782,7 +782,7 @@ function launch(command, args, env, as, home) {
 // and the answer says `aborted` rather than `timedOut`. A signal already
 // aborted starts nothing.
 function runProcess(command, args, options = {}) {
-  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null, signal: abortSignal = null } = options;
+  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null, signal: abortSignal = null, onStdout = null } = options;
   if (abortSignal && abortSignal.aborted) {
     return Promise.resolve({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
   }
@@ -858,6 +858,7 @@ function runProcess(command, args, options = {}) {
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
+      if (onStdout) onStdout(chunk);
     });
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
@@ -1193,6 +1194,73 @@ async function poll(config) {
   return { jobs: [], heartbeatSeconds: null };
 }
 
+// What the runner tells the platform about a request in flight: the phase it is
+// in and, during the agent's, how many tools it has run and the kind of the
+// last one. The sentence is chosen by the phase alone; nothing the agent said,
+// ran or read (a command, a path, a tool's output) is ever put in it.
+const PROGRESS_PHASES = {
+  collected: 'collected the request',
+  cloning: 'cloning the repository',
+  agent: 'agent working',
+  checks: 'checking the change',
+  publishing: 'publishing the change',
+};
+const PROGRESS_TOOL_MAX = 40;
+const PROGRESS_TOOL_KIND = /^[A-Za-z0-9_.:-]+$/;
+// One line of opencode's event stream that is not complete yet is kept for the
+// next chunk; a line longer than this is not an event and is dropped.
+const PROGRESS_LINE_MAX = 1_000_000;
+
+function progressTracker() {
+  let phase = null;
+  let tools = 0;
+  let lastTool = null;
+  let onChange = null;
+  return {
+    phase(name) {
+      if (!Object.prototype.hasOwnProperty.call(PROGRESS_PHASES, name) || name === phase) return;
+      phase = name;
+      if (onChange) onChange(name);
+    },
+    tool(kind) {
+      tools += 1;
+      lastTool = typeof kind === 'string' && kind.length > 0 && kind.length <= PROGRESS_TOOL_MAX && PROGRESS_TOOL_KIND.test(kind) ? kind : null;
+    },
+    snapshot() {
+      if (phase === null) return null;
+      return { phase, detail: PROGRESS_PHASES[phase], tools, last_tool: lastTool };
+    },
+    // The heartbeat sends an extra beat when the phase changes.
+    onPhaseChange(fn) {
+      onChange = fn;
+    },
+  };
+}
+
+// Reads opencode's `--format json` stream as it arrives and counts the tools it
+// ran. Only the event's type and its tool's name are read.
+function toolCounter(progress) {
+  let buffer = '';
+  return (chunk) => {
+    buffer += chunk;
+    let at = buffer.indexOf('\n');
+    while (at !== -1) {
+      const line = buffer.slice(0, at).trim();
+      buffer = buffer.slice(at + 1);
+      if (line.startsWith('{')) {
+        try {
+          const event = JSON.parse(line);
+          if (event && event.type === 'tool_use') progress.tool(event.part && event.part.tool);
+        } catch {
+          // Not an event; the agent's final read of the stream judges the rest.
+        }
+      }
+      at = buffer.indexOf('\n');
+    }
+    if (buffer.length > PROGRESS_LINE_MAX) buffer = '';
+  };
+}
+
 // Step 2a. While a job is held, tell the platform this machine is still on it.
 // The runner polls nothing during a run, so without a beat the platform cannot
 // tell a long run from a dead machine until its 45 minute backstop; with one, a
@@ -1222,7 +1290,8 @@ async function poll(config) {
 // makes the next beat answer taken_over. stop() ends the beats. Answers an
 // inert handle when the platform named no interval.
 function startHeartbeat(config, job, seconds) {
-  const inert = { signal: null, reporting() {}, stop() {} };
+  const progress = progressTracker();
+  const inert = { signal: null, reporting() {}, stop() {}, progress };
   if (!seconds || !job || !job.token || typeof job.report_url !== 'string') return inert;
   let url;
   try {
@@ -1233,7 +1302,6 @@ function startHeartbeat(config, job, seconds) {
     return inert;
   }
   const controller = new AbortController();
-  const body = JSON.stringify({ instance: config.instance });
   const intervalSeconds = seconds;
   const retrySeconds = Math.max(1, Math.round(seconds / HEARTBEAT_RETRY_DIVISOR));
   let stopped = false;
@@ -1253,7 +1321,7 @@ function startHeartbeat(config, job, seconds) {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body,
+        body: beatBody(config, progress),
         timeoutMs: Math.min(HTTP_TIMEOUT_MS, intervalSeconds * 1000),
       });
     } catch (error) {
@@ -1305,14 +1373,30 @@ function startHeartbeat(config, job, seconds) {
 
   // The next beat is scheduled when this one has its answer, so beats never
   // overlap, and how soon depends on whether it renewed.
+  let beating = false;
+  let beatWanted = false;
   const schedule = (delaySeconds) => {
     if (stopped) return;
+    clearTimeout(timer);
     timer = setTimeout(async () => {
+      beating = true;
       const renewed = await beat();
-      schedule(renewed ? intervalSeconds : retrySeconds);
+      beating = false;
+      const extra = beatWanted;
+      beatWanted = false;
+      schedule(extra ? 0 : renewed ? intervalSeconds : retrySeconds);
     }, delaySeconds * 1000);
     timer.unref();
   };
+
+  // One extra beat when the phase changes, so a person watching sees it at
+  // once and not a minute later. A beat already in flight is followed by it;
+  // the regular rhythm resumes after it, so the rate is otherwise unchanged.
+  progress.onPhaseChange(() => {
+    if (stopped || reporting) return;
+    if (beating) beatWanted = true;
+    else schedule(0);
+  });
 
   schedule(intervalSeconds);
   log('info', `beating for handoff ${job.handoff_id} every ${intervalSeconds} s while this runner holds it (every ${retrySeconds} s after a beat that renewed nothing)`);
@@ -1325,7 +1409,15 @@ function startHeartbeat(config, job, seconds) {
       stopped = true;
       clearTimeout(timer);
     },
+    progress,
   };
+}
+
+// The body of a beat: the instance, and the progress when there is any (a
+// platform that does not read it ignores the key).
+function beatBody(config, progress) {
+  const snapshot = progress.snapshot();
+  return JSON.stringify(snapshot ? { instance: config.instance, progress: snapshot } : { instance: config.instance });
 }
 
 // What a run does when its heartbeat ended the job (startHeartbeat): it stops
@@ -3308,6 +3400,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
       home: options.home,
       timeoutMs: options.timeoutMs || config.runTimeoutMs,
       signal: options.signal || null,
+      onStdout: options.progress ? toolCounter(options.progress) : null,
     });
   } finally {
     removeAgentDb(agentDb);
@@ -4558,6 +4651,7 @@ function testBusyDetail(holder, repo) {
 
 async function runTestJob(config, job, heartbeat) {
   const signal = heartbeat.signal;
+  const progress = heartbeat.progress || progressTracker();
   const result = newResult(config);
   result.test = [];
   let failed = null;
@@ -4596,6 +4690,7 @@ async function runTestJob(config, job, heartbeat) {
       const named = typeof job.test_repo_full_name === 'string' ? job.test_repo_full_name.trim() : '';
       if (!named) return { ok: true, detail: 'no repository is set to the self-hosted runner, so a scratch directory is used' };
       const wanted = parseRepo(named);
+      progress.phase('cloning');
       const workspace = await prepareCheckout(config, job, wanted);
       repo = wanted;
       result.evidence.test_repository = wanted.fullName;
@@ -4615,7 +4710,8 @@ async function runTestJob(config, job, heartbeat) {
         hooksBegan = true;
         const prepared = await prepareRequestEnv(config, job, { workspace: scratch.dir, signal });
         await handOver(scratch.dir, home);
-        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced });
+        progress.phase('agent');
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress });
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
@@ -4730,6 +4826,7 @@ async function runTestJob(config, job, heartbeat) {
 async function handleJob(config, job, options = {}) {
   const heartbeat = options.heartbeat || { signal: null, reporting() {}, stop() {} };
   const signal = heartbeat.signal;
+  const progress = heartbeat.progress || progressTracker();
   identity = config.identity || NO_IDENTITY;
   settleRunnerHome();
   if (!job || !job.handoff_id || !job.report_url || !job.token) {
@@ -4747,6 +4844,7 @@ async function handleJob(config, job, options = {}) {
     repo_full_name: job.repo_full_name || named || null,
   });
 
+  progress.phase('collected');
   if (job.test === true) return runTestJob(config, job, heartbeat);
 
   const result = newResult(config);
@@ -4781,6 +4879,7 @@ async function handleJob(config, job, options = {}) {
       recordFailure(result, 'busy_repository', `${subject} is being worked on by another runner instance (${lease.busy.instance || 'unknown'})`);
       return result;
     }
+    if (repo) progress.phase('cloning');
     const workspace = repo ? await prepareCheckout(config, job, repo, change ? checkoutOptions(change) : {}) : prepareScratch(config);
     if (change) {
       result.evidence.repository = repo.fullName;
@@ -4844,7 +4943,8 @@ async function handleJob(config, job, options = {}) {
       await handOver(workspace.dir, home);
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced });
+      progress.phase('agent');
+      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress });
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -4946,6 +5046,7 @@ async function handleJob(config, job, options = {}) {
       return result;
     }
 
+    progress.phase('checks');
     const { changed, flagged, memoryCopies, embedded } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
@@ -4970,6 +5071,7 @@ async function handleJob(config, job, options = {}) {
       return result;
     }
 
+    progress.phase('publishing');
     if (change) {
       await finishChange(config, job, change, workspace, { message: agent.finalMessage, changed, signal }, result);
       return result;
@@ -5217,6 +5319,9 @@ module.exports = {
     runProcess,
     apiCredential,
     poll,
+    progressTracker,
+    toolCounter,
+    startHeartbeat,
     runHook,
     loadCredentialEnv,
     loadHookSettings,

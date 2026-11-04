@@ -37,6 +37,11 @@
 //   FIXTURE_BRIEF_DELAY_MS  how long to hold the brief's answer
 //   FIXTURE_REPORT_DELAY_MS how long to hold the report's answer; the moment it
 //                          is sent is logged as its own entry, `answered_at`
+//   FIXTURE_HEARTBEAT_PHASE_FREE  when set, a beat that announces a new progress
+//                          phase (the extra beat the runner sends on a phase
+//                          change) is answered continue without using up an
+//                          answer of the list, and its entry says
+//                          `phase_change: true`
 //   Every entry carries `at`, the milliseconds it arrived.
 //   FIXTURE_HEARTBEAT_AFTER_FILE  when set, every beat is answered continue
 //                          until this file exists, and the list above starts
@@ -69,6 +74,8 @@ const briefFile = process.env.FIXTURE_BRIEF_FILE || '';
 const briefStatus = Number.parseInt(process.env.FIXTURE_BRIEF_STATUS || '200', 10);
 const heartbeatSeconds = process.env.FIXTURE_HEARTBEAT_SECONDS ? Number(process.env.FIXTURE_HEARTBEAT_SECONDS) : null;
 const heartbeatAnswers = (process.env.FIXTURE_HEARTBEAT_ANSWERS || 'continue').split(',');
+const heartbeatPhaseFree = Boolean(process.env.FIXTURE_HEARTBEAT_PHASE_FREE);
+let lastPhase = null;
 const heartbeatAfterFile = process.env.FIXTURE_HEARTBEAT_AFTER_FILE || '';
 const briefDelayMs = Number.parseInt(process.env.FIXTURE_BRIEF_DELAY_MS || '0', 10);
 const reportDelayMs = Number.parseInt(process.env.FIXTURE_REPORT_DELAY_MS || '0', 10);
@@ -141,8 +148,11 @@ const server = http.createServer((request, response) => {
       }
     }
     const beat = request.method === 'POST' && url.pathname.endsWith('/heartbeat') && authorization === `Bearer ${handoffToken}`;
-    const beatAnswer = beat ? nextHeartbeatAnswer() : undefined;
-    record({ method: request.method, path: url.pathname, authorization, body, at: Date.now(), ...(beat ? { answer: beatAnswer } : {}) });
+    const phase = beat && body && body.progress && typeof body.progress.phase === 'string' ? body.progress.phase : null;
+    const phaseChange = heartbeatPhaseFree && phase !== null && phase !== lastPhase;
+    if (phase !== null) lastPhase = phase;
+    const beatAnswer = beat ? (phaseChange ? 'continue' : nextHeartbeatAnswer()) : undefined;
+    record({ method: request.method, path: url.pathname, authorization, body, at: Date.now(), ...(beat ? { answer: beatAnswer } : {}), ...(phaseChange ? { phase_change: true } : {}) });
 
     if (request.method === 'POST' && url.pathname === tokenRoute && tokenLifetimeMs !== null) {
       if (tokenStatus !== null) {
