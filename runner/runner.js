@@ -523,8 +523,15 @@ function loadConfig() {
     throw fatal('SRE_TASK_PROTECTION must be auto, on or off');
   }
   config.taskProtection = { mode: protectionMode, uri: (process.env.ECS_AGENT_URI || '').replace(/\/+$/, '') };
-  taskProtectionState = { config, held: new Map(), disabled: false, announced: false };
-  config.hooks = loadHookSettings(process.env, layout, identity.agent, identity.mode === 'root' ? identity.runner : null);
+  taskProtectionState = { config, held: new Map(), disabled: false, announced: false, current: null, chain: Promise.resolve(), renewTimer: null };
+  let hookAgents = identity.agent ? [identity.agent] : null;
+  if (hookAgents) {
+    for (const entry of (process.env.SRE_AGENT_ACCOUNTS || '').split(',')) {
+      const match = /^([0-9]+):([0-9]+)$/.exec(entry.trim());
+      if (match && !hookAgents.some((account) => account.uid === Number(match[1]))) hookAgents.push({ uid: Number(match[1]), gid: Number(match[2]) });
+    }
+  }
+  config.hooks = loadHookSettings(process.env, layout, hookAgents, identity.mode === 'root' ? identity.runner : null);
   hookSettings = config.hooks;
   registerConfigSecrets(config);
   credential = newCredential(config.serverUrl, config.apiKey);
@@ -3068,9 +3075,10 @@ const CREDENTIAL_NAME = /^[A-Z][A-Z0-9_]*$/;
 const CREDENTIAL_REFUSED_NAMES = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'IFS', 'PS4', 'ENV', 'TMPDIR',
   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+  'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS',
 ]);
 const CREDENTIAL_REFUSED_PREFIXES = [
-  'LD_', 'DYLD_', 'XDG_', 'NODE_', 'PYTHON', 'RUBY', 'PERL', 'BASH_', 'GIT_', 'SSH_', 'GH_', 'GITHUB_', 'SRE_', 'OPENCODE_',
+  'LD_', 'DYLD_', 'XDG_', 'NODE_', 'BUN_', 'DENO_', 'PYTHON', 'RUBY', 'PERL', 'BASH_', 'GIT_', 'SSH_', 'GH_', 'GITHUB_', 'SRE_', 'OPENCODE_',
 ];
 // A value shorter than this is not redacted: it is not a credential, and
 // replacing every "1" or "yes" in a log would only corrupt it.
@@ -3125,25 +3133,30 @@ function ancestorsOf(start) {
 // appears later is judged when it does, and a link cannot move to a place the
 // agent writes. Only an agent account that is not the runner's makes this a
 // question.
-function untrustedHook(dir, name, agent) {
-  if (!agent) return null;
+function untrustedHook(dir, name, agents) {
+  const accounts = Array.isArray(agents) ? agents : agents ? [agents] : [];
+  if (accounts.length === 0) return null;
   const file = path.join(dir, name);
-  const checks = [[dir, true, 'the hooks directory']];
-  for (const above of ancestorsOf(path.dirname(dir))) checks.push([above, false, 'a directory on the way to the hooks']);
-  let target = null;
+  const checks = [[dir, true, 'the hooks directory', false]];
+  for (const above of ancestorsOf(path.dirname(dir))) checks.push([above, false, 'a directory on the way to the hooks', false]);
+  let hops = [];
   try {
-    target = fs.realpathSync(file);
-  } catch {
-    target = null;
+    hops = hookHops(file);
+  } catch (error) {
+    if (error.code !== 'ENOENT') return `the ${name} hook could not be followed (${error.code || error.message})`;
+    hops = [];
   }
-  if (target) {
-    checks.push([target, false, `the ${name} hook`]);
-    const holder = path.dirname(target);
+  hops.forEach((hop, index) => {
+    const last = index === hops.length - 1;
+    // A link's own mode says nothing; what matters about it is who can replace
+    // it, which is whoever can write the directory it sits in.
+    if (last) checks.push([hop, false, `the ${name} hook`, false]);
+    const holder = path.dirname(hop);
     if (holder !== dir) {
-      checks.push([holder, true, `the directory holding the ${name} hook`]);
-      for (const above of ancestorsOf(path.dirname(holder))) checks.push([above, false, 'a directory on the way to the hook']);
+      checks.push([holder, true, `the directory holding the ${name} hook${last ? '' : '\'s link'}`, false]);
+      for (const above of ancestorsOf(path.dirname(holder))) checks.push([above, false, 'a directory on the way to the hook', false]);
     }
-  }
+  });
   for (const [part, holdsHooks, what] of checks) {
     let stat;
     try {
@@ -3151,10 +3164,32 @@ function untrustedHook(dir, name, agent) {
     } catch {
       return `${part} could not be read`;
     }
-    const why = whyAgentCouldWrite(stat, agent, holdsHooks);
-    if (why) return `${what} ${part} is ${why}`;
+    for (const agent of accounts) {
+      const why = whyAgentCouldWrite(stat, agent, holdsHooks);
+      if (why) return `${what} ${part} is ${why}`;
+    }
   }
   return null;
+}
+
+// The path of every hop from `file` to the file it finally is: the file itself
+// and each link on the way, with the directories resolved, so every directory a
+// link sits in can be judged and not only the last one. Throws ENOENT when the
+// file is not there.
+function hookHops(file) {
+  const hops = [];
+  let current = file;
+  for (let count = 0; count < 20; count += 1) {
+    const holder = fs.realpathSync(path.dirname(current));
+    const entry = path.join(holder, path.basename(current));
+    hops.push(entry);
+    if (!fs.lstatSync(entry).isSymbolicLink()) return hops;
+    const to = fs.readlinkSync(entry);
+    current = path.isAbsolute(to) ? to : path.join(holder, to);
+  }
+  const error = new Error('too many links');
+  error.code = 'ELOOP';
+  throw error;
 }
 
 // Validates SRE_HOOKS_DIR and SRE_HOOK_TIMEOUT_SECONDS at start, so a hooks
@@ -3163,6 +3198,8 @@ function untrustedHook(dir, name, agent) {
 // `runnerAccount` is {uid, gid} when this process is root and the hooks run as
 // that other account, whose permissions are then judged by mode.
 function loadHookSettings(env, layout, agent, runnerAccount = null) {
+  // `agent` is the account of this worker or the list of every agent account of
+  // the fleet; a hook the agent of ANY worker could write is not trusted.
   const timeoutRaw = env.SRE_HOOK_TIMEOUT_SECONDS;
   let timeoutSeconds = HOOK_TIMEOUT_SECONDS_DEFAULT;
   if (timeoutRaw !== undefined && timeoutRaw !== '') {
@@ -3221,7 +3258,7 @@ function loadHookSettings(env, layout, agent, runnerAccount = null) {
     // any execute bit, and the hook runs as the runner's account.
     let runnable;
     if (runnerAccount) {
-      runnable = accountPermits(stat, runnerAccount, 5) && accountPermits(fs.statSync(real), runnerAccount, 1);
+      runnable = accountPermits(stat, runnerAccount, 5) && ancestorsOf(real).every((part) => accountPermits(fs.statSync(part), runnerAccount, 1));
     } else {
       try {
         fs.accessSync(file, fs.constants.R_OK | fs.constants.X_OK);
@@ -3253,11 +3290,13 @@ function loadCredentialEnv(output) {
     if (line.trim() === '' || line.trimStart().startsWith('#')) continue;
     const equals = line.indexOf('=');
     const name = equals > 0 ? line.slice(0, equals) : '';
+    // A refused name is named as such even when its spelling (a leading
+    // underscore) is not one a hook could be told is valid.
+    if (CREDENTIAL_REFUSED_NAMES.has(name) || (CREDENTIAL_NAME.test(name) && CREDENTIAL_REFUSED_PREFIXES.some((prefix) => name.startsWith(prefix)))) {
+      throw new Error(`the credentials hook printed ${name}, which the runner does not pass to the agent (refused: ${[...CREDENTIAL_REFUSED_NAMES].join(', ')}, and anything starting with ${CREDENTIAL_REFUSED_PREFIXES.join(', ')})`);
+    }
     if (!CREDENTIAL_NAME.test(name)) {
       throw new Error(`line ${lineNumber} of the credentials hook's output is not NAME=value with an upper case name (letters, digits and underscores, starting with a letter)`);
-    }
-    if (CREDENTIAL_REFUSED_NAMES.has(name) || CREDENTIAL_REFUSED_PREFIXES.some((prefix) => name.startsWith(prefix))) {
-      throw new Error(`the credentials hook printed ${name}, which the runner does not pass to the agent (refused: ${[...CREDENTIAL_REFUSED_NAMES].join(', ')}, and anything starting with ${CREDENTIAL_REFUSED_PREFIXES.join(', ')})`);
     }
     const value = line.slice(equals + 1);
     if (value.includes('\0')) throw new Error(`the credentials hook printed a NUL byte in the value of ${name}`);
@@ -3477,7 +3516,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
   // OPENCODE_LOG_PATH), and the level it was given.
   delete env.SRE_OPENCODE_LOG_LEVEL;
   // The runner's hooks, token and scaling settings are the runner's business.
-  for (const name of ['SRE_HOOKS_DIR', 'SRE_HOOK_TIMEOUT_SECONDS', 'SRE_AGENT_AWS_ROLE_ARN', 'SRE_TASK_PROTECTION', 'SRE_CONCURRENCY', 'ECS_AGENT_URI']) {
+  for (const name of ['SRE_HOOKS_DIR', 'SRE_HOOK_TIMEOUT_SECONDS', 'SRE_AGENT_AWS_ROLE_ARN', 'SRE_TASK_PROTECTION', 'SRE_CONCURRENCY', 'SRE_AGENT_ACCOUNTS', 'ECS_AGENT_URI']) {
     delete env[name];
   }
   delete env.OPENCODE_LOG_PATH;
@@ -5301,8 +5340,21 @@ async function mirrorMemory(config, result) {
 // the restore of an empty (or half restored) volume from the bucket. A restore
 // that cannot finish is not an error here: serveJob tries it again before each
 // request, and nothing is mirrored until it has succeeded.
+// Once, before the first poll: whatever a worker of the same agent account left
+// running (the worker died mid-run, and its agent's children or a daemon it
+// started outlived it) is ended before this worker takes a request, because the
+// next request's checkout and home are handed to the same account and the
+// leftover would be inside them. A start that cannot end them refuses to poll.
+async function reapAgentLeftovers(kill = killAgentProcesses) {
+  if (identity.mode === 'none') return;
+  if (!(await kill())) {
+    throw fatal('processes of the agent\'s account from an earlier run could not be ended, so this worker will not take a request: the next request\'s checkout and home would be handed to them; end them (or restart the container) and start the runner again');
+  }
+}
+
 async function startMemory(config) {
   identity = config.identity || NO_IDENTITY;
+  await reapAgentLeftovers();
   try {
     const moved = memory.migrate(config.layout);
     if (moved.length > 0) {
@@ -5399,6 +5451,7 @@ const protection = {
       state.disabled = true;
       return;
     }
+    state.current = handoffId;
     try {
       await protection.change(state, handoffId, true);
     } catch (error) {
@@ -5424,6 +5477,9 @@ const protection = {
   async release(handoffId) {
     const state = taskProtectionState;
     if (!state) return;
+    // Before anything else: a renewal already waiting for the lock or for the
+    // agent finds the request no longer held and does nothing.
+    state.current = null;
     clearInterval(state.renewTimer);
     state.renewTimer = null;
     if (state.disabled) return;
@@ -5434,8 +5490,17 @@ const protection = {
     }
   },
 
-  async change(state, handoffId, on) {
+  // One change at a time in this process, in the order asked, so a renewal that
+  // is late cannot land after the release it raced with.
+  change(state, handoffId, on) {
+    const next = state.chain.then(() => protection.apply(state, handoffId, on));
+    state.chain = next.catch(() => {});
+    return next;
+  },
+
+  async apply(state, handoffId, on) {
     const { config } = state;
+    if (on && state.current !== handoffId) return;
     const uri = config.taskProtection.uri;
     let lock = null;
     let remaining;
@@ -5446,6 +5511,7 @@ const protection = {
       try {
         settleDir(files.dir, 0o700);
         const mine = path.join(files.dir, `${config.layout.instance}.hold`);
+        if (on && state.current !== handoffId) return;
         if (on) fs.writeFileSync(mine, `${process.pid} ${handoffId}\n`, { mode: 0o600 });
         else fs.rmSync(mine, { force: true });
         remaining = 0;
@@ -5635,6 +5701,7 @@ module.exports = {
     },
     // The pause between the replacement call's attempts, for the tests.
     addRotatingSecret,
+    reapAgentLeftovers,
     setHookSettings: (value) => {
       hookSettings = value;
     },

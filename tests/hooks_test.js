@@ -15,6 +15,8 @@ const runner = require(path.resolve(__dirname, '..', 'runner', 'runner.js'));
 const { internals } = runner;
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'hooks-test-'));
+// Walkable by other accounts, as a hooks directory's ancestors have to be for the runner's.
+fs.chmodSync(work, 0o755);
 const realPath = process.env.PATH;
 let failed = 0;
 let counter = 0;
@@ -90,10 +92,10 @@ async function main() {
     const refused = [
       'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'IFS', 'PS4', 'ENV', 'TMPDIR', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
       'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'NODE_OPTIONS', 'NODE_PATH',
-      'PYTHONPATH', 'PYTHONSTARTUP', 'RUBYOPT', 'PERL5LIB', 'BASH_ENV', 'BASH_FUNC_X', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_HOST', 'SRE_API_KEY',
+      'PYTHONPATH', 'PYTHONSTARTUP', 'RUBYOPT', 'PERL5LIB', 'BASH_ENV', 'BASH_FUNC_X', 'BUN_BE_BUN', 'BUN_OPTIONS', 'BUN_INSPECT', 'DENO_DIR', 'DENO_AUTH_TOKENS', 'JAVA_TOOL_OPTIONS', '_JAVA_OPTIONS', 'JDK_JAVA_OPTIONS', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_HOST', 'SRE_API_KEY',
       'SRE_ANYTHING', 'OPENCODE_CONFIG', 'GIT_SSH_COMMAND', 'GIT_CONFIG_COUNT', 'SSH_AUTH_SOCK',
     ];
-    for (const name of refused.filter((entry) => /^[A-Z][A-Z0-9_]*$/.test(entry))) {
+    for (const name of refused) {
       let message = null;
       try {
         internals.loadCredentialEnv(`OK_ONE=1\n${name}=${DISTINCT}\n`);
@@ -487,6 +489,87 @@ async function main() {
     assert.equal(internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other).dir, fs.realpathSync(hooks));
     fs.chmodSync(hooks, 0o700);
     assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other), /cannot be read and executed/);
+  });
+
+  await check('the agent accounts of every worker are judged, so a hook one worker\'s agent could write is not run by another', async () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const mine = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const sibling = { uid: me.uid + 4243, gid: me.gid };
+    const layout = { workspace: makeDir('ws-fleet') };
+    const hooks = makeDir('hooks', 0o775);
+    assert.equal(internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, mine).dir, fs.realpathSync(hooks), 'this worker\'s own account cannot write it');
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, [mine, sibling]), /writable by the agent's group/);
+    fs.chmodSync(hooks, 0o755);
+    const settings = internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, [mine, sibling]);
+    internals.setHookSettings(settings);
+    const file = writeHook(hooks, 'pre-run', 'true');
+    fs.chmodSync(file, 0o775);
+    const refused = await internals.runHook('pre-run', job(), {}, {});
+    assert.equal(refused.ok, false, 'a hook the sibling worker\'s agent group could write ran');
+    assert.match(refused.failure, /the pre-run hook was not run/);
+  });
+
+  await check('every hop of a chain of links is judged: a link in the middle in a directory the agent could write is refused', async () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const stranger = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const layout = { workspace: makeDir('ws-chain') };
+    const real = makeDir('real-tools', 0o755);
+    const target = writeHook(real, 'pre-run', 'true');
+    const middle = makeDir('middle-links', 0o755);
+    fs.symlinkSync(target, path.join(middle, 'pre-run'));
+    const hooks = makeDir('hooks', 0o755);
+    fs.symlinkSync(path.join(middle, 'pre-run'), path.join(hooks, 'pre-run'));
+    const settings = internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, stranger);
+    internals.setHookSettings(settings);
+    assert.equal((await internals.runHook('pre-run', job(), {}, {})).ok, true);
+    fs.chmodSync(middle, 0o777);
+    const moved = await internals.runHook('pre-run', job(), {}, {});
+    assert.equal(moved.ok, false, 'the middle link\'s directory became writable');
+    assert.match(moved.failure, /the directory holding the pre-run hook's link .* is writable by every account/);
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, stranger), /directory holding the pre-run hook's link/);
+  });
+
+  await check('a loop of links is refused, not followed for ever', async () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const stranger = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const layout = { workspace: makeDir('ws-loop') };
+    const hooks = makeDir('hooks', 0o755);
+    fs.symlinkSync(path.join(hooks, 'pre-run'), path.join(hooks, 'pre-run'));
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, stranger), /could not be followed|not a regular file|ELOOP/);
+  });
+
+  await check('in a root start the runner\'s account must be able to walk to the hooks: a directory above them closed to it is refused at start', () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const other = { uid: me.uid + 77, gid: me.gid + 77 };
+    const layout = { workspace: makeDir('ws-above') };
+    const parent = makeDir('closed-parent', 0o755);
+    const hooks = path.join(parent, 'hooks');
+    fs.mkdirSync(hooks, { mode: 0o755 });
+    writeHook(hooks, 'pre-run', 'true');
+    fs.chmodSync(path.join(hooks, 'pre-run'), 0o755);
+    assert.equal(internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other).dir, fs.realpathSync(hooks));
+    fs.chmodSync(parent, 0o700);
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other), /cannot be read and executed by the runner's account/);
+    fs.chmodSync(parent, 0o755);
+  });
+
+  await check('a worker refuses to take a request while processes of its agent\'s account from an earlier run cannot be ended', async () => {
+    internals.setIdentity({ mode: 'root', runner: { uid: 1, gid: 1, home: '/' }, agent: { uid: 2, gid: 2, home: '/' } });
+    try {
+      let asked = 0;
+      await assert.rejects(
+        () => internals.reapAgentLeftovers(async () => (asked += 1, false)),
+        (error) => error.fatal === true && /will not take a request/.test(error.message)
+      );
+      await internals.reapAgentLeftovers(async () => (asked += 1, true));
+      assert.equal(asked, 2);
+      internals.setIdentity({ mode: 'none', runner: null, agent: null });
+      await internals.reapAgentLeftovers(async () => {
+        throw new Error('nothing to end without an agent account');
+      });
+    } finally {
+      internals.setIdentity({ mode: 'none', runner: null, agent: null });
+    }
   });
 
   await check('the settings the runner refuses to start with', () => {

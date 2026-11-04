@@ -165,6 +165,7 @@ function main(env = process.env) {
     for (const name of Object.keys(childEnv)) {
       if (/^SRE_AGENT_[0-9]+_(UID|GID|HOME|USER)$/.test(name)) delete childEnv[name];
     }
+    if (accounts) childEnv.SRE_AGENT_ACCOUNTS = accounts.map((account) => `${account.uid}:${account.gid}`).join(',');
     if (worker.account) {
       childEnv.SRE_AGENT_UID = String(worker.account.uid);
       childEnv.SRE_AGENT_GID = String(worker.account.gid);

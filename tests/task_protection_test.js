@@ -280,9 +280,54 @@ async function main() {
     }
   });
 
+  await check('a renewal in flight when the request is released leaves protection off and no marker behind', async () => {
+    const ecs = await agent();
+    const other = spawn('sleep', ['300']);
+    try {
+      const config = load({ ECS_AGENT_URI: ecs.uri, SRE_WORKSPACE_PER_INSTANCE: '1', SRE_RUNNER_INSTANCE: 'pool-1' });
+      const files = internals.taskProtectionFiles(config);
+      await internals.protection.hold('h-race');
+      assert.equal(ecs.calls.at(-1).body.ProtectionEnabled, true);
+      // Another worker holds the counting lock, so the renewal waits for it.
+      fs.writeFileSync(files.lock, `pool-2 ${other.pid} ${new Date().toISOString()}\n`);
+      internals.setTaskProtectionRenewMs(40);
+      await sleep(250);
+      const release = internals.protection.release('h-race');
+      await sleep(100);
+      fs.rmSync(files.lock, { force: true });
+      await release;
+      await sleep(200);
+      assert.equal(ecs.calls.at(-1).body.ProtectionEnabled, false, 'a late renewal turned it back on');
+      assert.deepEqual(fs.readdirSync(files.dir).filter((name) => name.endsWith('.hold')), [], 'a marker was written back after the release');
+    } finally {
+      internals.setTaskProtectionRenewMs(20 * 60 * 1000);
+      other.kill('SIGKILL');
+      ecs.close();
+    }
+  });
+
+  await check('at one runner the renewals stop with the release and the last call is the one that turns it off', async () => {
+    const ecs = await agent(() => ({ status: 200, body: {} }));
+    const calls = ecs.calls;
+    try {
+      load({ ECS_AGENT_URI: ecs.uri });
+      internals.setTaskProtectionRenewMs(30);
+      await internals.protection.hold('h-one');
+      await sleep(200);
+      await internals.protection.release('h-one');
+      const settled = calls.length;
+      await sleep(200);
+      assert.equal(calls.length, settled);
+      assert.equal(calls.at(-1).body.ProtectionEnabled, false);
+    } finally {
+      internals.setTaskProtectionRenewMs(20 * 60 * 1000);
+      ecs.close();
+    }
+  });
+
   await check('the ECS agent address is not in the agent\'s environment', () => {
     const source = fs.readFileSync(path.resolve(__dirname, '..', 'runner', 'runner.js'), 'utf8');
-    assert.ok(/'SRE_CONCURRENCY', 'ECS_AGENT_URI'/.test(source));
+    assert.ok(/'SRE_AGENT_ACCOUNTS', 'ECS_AGENT_URI'/.test(source));
   });
 }
 

@@ -455,6 +455,15 @@ d.yml"
     jq -cn --arg m "$long" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderError", data: {message: $m}}}'
     exit 1
     ;;
+  daemon)
+    # An agent that starts something that outlives it and then hangs: the daemon
+    # reads the environment of every process of its account for as long as it
+    # lives, and the test kills the runner while this is still going.
+    setsid nohup bash -c 'while :; do for proc in /proc/[0-9]*; do tr "\0" "\n" < "$proc/environ" 2>/dev/null; done >> "$STUB_DAEMON_LOG"; sleep 0.2; done' > /dev/null 2>&1 &
+    printf '%s\n' "$!" > "${STUB_DAEMON_PID:?}"
+    printf '%s\n' "${STUB_RUNNER_PID:?}" > "${STUB_WORKER_PID:?}"
+    sleep 120
+    ;;
   workers)
     # Two workers of one runner, each with an agent account of its own, for
     # tests/uid_split_test.sh. The run in acme/app is quick and ends while the
@@ -484,10 +493,12 @@ d.yml"
         done
         others=0
         readable=0
+        cmdlines=0
         for proc in /proc/[0-9]*; do
           if [ "$(stat -c %u "$proc" 2>/dev/null)" = "$other_uid" ]; then
             others=$((others + 1))
             if cat "$proc/environ" >/dev/null 2>&1; then readable=$((readable + 1)); fi
+            if [ -n "$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null)" ]; then cmdlines=$((cmdlines + 1)); fi
           fi
         done
         allowed() { if "$@" >/dev/null 2>&1; then echo allowed; else echo denied; fi; }
@@ -495,6 +506,7 @@ d.yml"
           printf 'own: %s\n' "$own"
           printf 'other_agent_processes: %s\n' "$others"
           printf 'other_environ_readable: %s\n' "$readable"
+          printf 'other_cmdline_readable: %s\n' "$cmdlines"
           printf 'other_checkout_list: %s\n' "$(allowed ls "$ws/instances/$other_instance/repos/acme/app")"
           printf 'other_checkout_read: %s\n' "$(allowed cat "$ws/instances/$other_instance/repos/acme/app/README.md")"
           printf 'other_checkout_write: %s\n' "$(allowed bash -c ": >> '$ws/instances/$other_instance/repos/acme/app/README.md'")"

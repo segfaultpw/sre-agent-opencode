@@ -52,7 +52,7 @@ function stage() {
 const fs = require('node:fs');
 const log = process.env.STUB_LOG;
 const instance = process.env.SRE_RUNNER_INSTANCE;
-fs.appendFileSync(log, JSON.stringify({ event: 'start', instance, pid: process.pid, perInstance: process.env.SRE_WORKSPACE_PER_INSTANCE, concurrency: process.env.SRE_CONCURRENCY === undefined ? null : process.env.SRE_CONCURRENCY, agent: { uid: process.env.SRE_AGENT_UID || null, gid: process.env.SRE_AGENT_GID || null, home: process.env.SRE_AGENT_HOME || null, user: process.env.SRE_AGENT_USER || null }, numbered: Object.keys(process.env).filter((name) => /^SRE_AGENT_[0-9]+_/.test(name)) }) + '\\n');
+fs.appendFileSync(log, JSON.stringify({ event: 'start', instance, pid: process.pid, perInstance: process.env.SRE_WORKSPACE_PER_INSTANCE, concurrency: process.env.SRE_CONCURRENCY === undefined ? null : process.env.SRE_CONCURRENCY, agent: { uid: process.env.SRE_AGENT_UID || null, gid: process.env.SRE_AGENT_GID || null, home: process.env.SRE_AGENT_HOME || null, user: process.env.SRE_AGENT_USER || null }, accounts: process.env.SRE_AGENT_ACCOUNTS || null, numbered: Object.keys(process.env).filter((name) => /^SRE_AGENT_[0-9]+_/.test(name)) }) + '\\n');
 console.log('hello from ' + instance);
 const mode = process.env.STUB_MODE || 'wait';
 if (mode === 'exit0') process.exit(0);
@@ -173,6 +173,7 @@ async function main() {
         [1, 2, 3].map((n) => ({ uid: String(20000 + n * 10), gid: String(20000 + n * 10), home: '/agents/home', user: n === 1 ? 'agent' : `agent-${n}` }))
       );
       for (const event of run.events()) assert.deepEqual(event.numbered, []);
+      for (const event of run.events()) assert.equal(event.accounts, '20010:20010,20020:20020,20030:20030', 'every worker is told the whole fleet\'s accounts, for judging the hooks');
     } finally {
       run.child.kill('SIGKILL');
     }
@@ -215,7 +216,10 @@ async function main() {
     const run = launch({ SRE_CONCURRENCY: '4' });
     try {
       assert.ok(await until(() => run.events().length === 4), run.err);
-      for (const event of run.events()) assert.deepEqual(event.agent, { uid: null, gid: null, home: null, user: null });
+      for (const event of run.events()) {
+        assert.deepEqual(event.agent, { uid: null, gid: null, home: null, user: null });
+        assert.equal(event.accounts, null);
+      }
     } finally {
       run.child.kill('SIGKILL');
     }

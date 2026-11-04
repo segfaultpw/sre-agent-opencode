@@ -521,12 +521,72 @@ prove_workers() {
   slow_end="$(awk '$1 == "end" && $3 ~ /acme\/other$/ { print $4 }' "$timing")"
   if [ -n "$quick_end" ] && [ -n "$slow_end" ] && [ "$quick_end" -lt "$slow_end" ]; then echo "ok   $label: the quick worker's run ended while the other's agent was still running"; else echo "FAIL $label: ends: quick=$quick_end slow=$slow_end"; fail=1; fi
   if grep -qE '^other_agent_processes: [1-9]' "$probe" && grep -qx 'other_environ_readable: 0' "$probe"; then echo "ok   $label: the other agent's processes were there to read and their environment is not readable"; else echo "FAIL $label: $(cat "$probe")"; fail=1; fi
+  # The documented residual, asserted so that a change is noticed: command lines
+  # are world-readable in a container (hidepid needs CAP_SYS_ADMIN), so one
+  # worker's agent can read another's, and the README tells operators so.
+  if grep -qE '^other_cmdline_readable: [1-9]' "$probe"; then echo "ok   $label: the other agent's command lines ARE readable, as the README says (a credential on a command line is visible to another worker's agent)"; else echo "FAIL $label: the documented residual is gone or the probe is blind: $(grep cmdline "$probe")"; fail=1; fi
   if grep -qx 'other_checkout_list: denied' "$probe" && grep -qx 'other_checkout_read: denied' "$probe" && grep -qx 'other_checkout_write: denied' "$probe"; then echo "ok   $label: the other worker's checkout can be neither listed, read nor written"; else echo "FAIL $label: $(grep checkout "$probe")"; fail=1; fi
   if grep -qx 'other_home_list: denied' "$probe" && grep -qx 'other_instance_list: denied' "$probe"; then echo "ok   $label: the other worker's agent home and instance directory cannot be listed"; else echo "FAIL $label: $(grep -E 'home|instance' "$probe")"; fail=1; fi
   if ! jq -e --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure.kind // empty' "$work/requests.jsonl" >/dev/null; then echo "ok   $label: neither request reports an agent that was stopped or survived"; else echo "FAIL $label: $(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure' "$work/requests.jsonl" | tr '\n' ' ')"; fail=1; fi
 }
 prove_workers root "$runner_uid" setpriv --groups=20001,20002 --
 prove_workers caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
+  --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
+
+# A worker that dies mid-run leaves its agent's processes (a daemon the agent
+# started) running; the supervisor restarts it with the same account. The
+# restarted worker ends them before it polls, so the daemon cannot read the
+# next request's environment.
+prove_crash() {
+  local label="$1" owner="$2"
+  shift 2
+  local prefix=("$@")
+  local ws="$work/$label-cr-ws" runner_home="$work/home/$label-cr-runner" agent_home="$work/home/$label-cr-agent"
+  local daemon_log="$work/$label.cr-daemon.log" daemon_pid_file="$work/$label.cr-daemon.pid" worker_pid_file="$work/$label.cr-worker.pid" scratch_log="$work/$label.cr-scratch"
+  local out1="$work/$label.cr1.out" out2="$work/$label.cr2.out" canary="canary-$(printf '%032d' 7)"
+  echo "--- $label: a worker killed mid-run leaves a daemon; the restarted worker ends it before it polls ---"
+  mkdir -p "$ws" "$runner_home" "$agent_home"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  : > "$daemon_log"; : > "$daemon_pid_file"; : > "$worker_pid_file"; : > "$scratch_log"
+  chmod 666 "$daemon_log" "$daemon_pid_file" "$worker_pid_file" "$scratch_log"
+  for ctl_file in git_uid_log gh_uid_log git_home_log gh_home_log git_cred_log gh_body_log; do
+    printf '%s' "$scratch_log" > "$work/ctl/$ctl_file"
+  done
+  runner_env=(SRE_ONCE=1 SRE_SERVER_URL= SRE_API_KEY="$api_key" SRE_MODEL="$model" SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=90
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home"
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" HOME="$runner_home")
+  start_fixture
+  queue_job "h-cr-$label-1" acme/app
+  timeout 120 "${prefix[@]}" env "${runner_env[@]/SRE_SERVER_URL=/SRE_SERVER_URL=$server_url}" \
+    STUB_OPENCODE_MODE=daemon STUB_DAEMON_LOG="$daemon_log" STUB_DAEMON_PID="$daemon_pid_file" STUB_WORKER_PID="$worker_pid_file" \
+    node "$runner" > "$out1" 2>&1 &
+  local first=$!
+  local waited=0
+  while { [ ! -s "$daemon_pid_file" ] || [ ! -s "$worker_pid_file" ]; } && [ "$waited" -lt 300 ]; do sleep 0.1; waited=$((waited + 1)); done
+  local daemon worker
+  daemon="$(cat "$daemon_pid_file")"
+  worker="$(cat "$worker_pid_file")"
+  if [ -n "$daemon" ] && [ -n "$worker" ]; then kill -9 "$worker" 2>/dev/null || true; fi
+  wait "$first" 2>/dev/null || true
+  stop_fixture
+  if [ -n "$daemon" ] && kill -0 "$daemon" 2>/dev/null; then echo "ok   $label: the worker was killed mid-run and the agent's daemon outlived it"; else echo "FAIL $label: the premise failed (daemon '$daemon', worker '$worker'): $(tail -n 3 "$out1")"; fail=1; return; fi
+  : > "$daemon_log"
+  start_fixture
+  queue_job "h-cr-$label-2" acme/app
+  local rc=0
+  timeout 120 "${prefix[@]}" env "${runner_env[@]/SRE_SERVER_URL=/SRE_SERVER_URL=$server_url}" \
+    LEAK_CANARY="$canary" STUB_OPENCODE_MODE=slowfix STUB_OPENCODE_SLEEP=2 \
+    node "$runner" > "$out2" 2>&1 || rc=$?
+  stop_fixture
+  local report
+  report="$(jq -c "select(.path | endswith(\"/h-cr-$label-2/report\")) | .body" "$work/requests.jsonl" | tail -n 1)"
+  if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "https://github.com/acme/app/pull/7" ]; then echo "ok   $label: the restarted worker takes the next request and ends in a pull request"; else echo "FAIL $label: rc=$rc report=$report out=$(tail -n 5 "$out2")"; fail=1; fi
+  if ! kill -0 "$daemon" 2>/dev/null; then echo "ok   $label: the daemon from the dead worker's run was ended when the restarted worker started"; else echo "FAIL $label: the daemon $daemon is still running"; kill -9 "$daemon" 2>/dev/null || true; fail=1; fi
+  if ! grep -qF "$canary" "$daemon_log"; then echo "ok   $label: the daemon read nothing of the next request's environment"; else echo "FAIL $label: the daemon read the next request's environment"; fail=1; fi
+}
+prove_crash root "$runner_uid" setpriv --groups=20001,20002 --
+prove_crash caps "$caps_uid" setpriv --reuid="$caps_uid" --regid="$caps_uid" --clear-groups \
   --inh-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --ambient-caps="+setuid,+setgid,+chown,+dac_override,+fowner,+kill" --
 
 # With the account split on, more workers than agent accounts is refused, and
@@ -747,11 +807,18 @@ prove_survivor() {
   : > "$work/$label.git-uids"; : > "$work/$label.gh-uids"; : > "$work/$label.git-creds"
   chmod 666 "$work/$label.git-uids" "$work/$label.gh-uids" "$work/$label.git-creds"
   : > "$work/ctl/git_home_log"; : > "$work/ctl/gh_home_log"
-  ( while :; do setpriv --reuid="$agent_uid" --regid="$agent_uid" --clear-groups sleep 6 </dev/null >/dev/null 2>&1 & sleep 0.01; done ) &
-  local spawner=$!
-  survivors+=("$spawner")
   start_fixture
   queue_job "h-$label" acme/app
+  # Started once the runner has collected its request (its brief is asked for):
+  # the runner ends whatever the agent's account holds before it polls, so a
+  # spawner that was already running at the start would stop it there, which the
+  # next case proves.
+  local briefs_before
+  briefs_before="$(jq -c 'select(.path | endswith("/brief"))' "$work/requests.jsonl" | wc -l)"
+  ( until [ "$(jq -c 'select(.path | endswith("/brief"))' "$work/requests.jsonl" | wc -l)" -gt "$briefs_before" ]; do sleep 0.02; done
+    while :; do setpriv --reuid="$agent_uid" --regid="$agent_uid" --clear-groups sleep 6 </dev/null >/dev/null 2>&1 & sleep 0.01; done ) &
+  local spawner=$!
+  survivors+=("$spawner")
   local rc=0
   timeout 120 setpriv --groups=20001,20002 -- env SRE_ONCE=1 \
     SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
@@ -771,6 +838,39 @@ prove_survivor() {
 }
 
 prove_survivor
+
+# The same loop already running when the runner starts: the start ends what it
+# can, and a worker that cannot end everything refuses to take a request.
+prove_survivor_at_start() {
+  local label="root-survivor-start" owner="$runner_uid"
+  local ws="$work/$label-ws" runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent" out="$work/$label.out"
+  echo "--- $label: a worker that cannot end the agent account's leftovers at its start does not poll ---"
+  mkdir -p "$ws" "$runner_home" "$agent_home"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  ( while :; do setpriv --reuid="$agent_uid" --regid="$agent_uid" --clear-groups sleep 6 </dev/null >/dev/null 2>&1 & sleep 0.01; done ) &
+  local spawner=$!
+  survivors+=("$spawner")
+  start_fixture
+  queue_job "h-$label" acme/app
+  local polls_before
+  polls_before="$(jq -c 'select(.path | endswith("/api/fix-runner/queue"))' "$work/requests.jsonl" | wc -l)"
+  local rc=0
+  timeout 120 setpriv --groups=20001,20002 -- env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=60 \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    HOME="$runner_home" STUB_OPENCODE_MODE=fix \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  kill "$spawner" 2>/dev/null || true
+  local polls_after
+  polls_after="$(jq -c 'select(.path | endswith("/api/fix-runner/queue"))' "$work/requests.jsonl" | wc -l)"
+  if [ "$rc" -ne 0 ] && grep -q 'will not take a request' "$out" && grep -q 'could not be ended after 20 attempts' "$out"; then echo "ok   $label: the runner stops with a sentence that names the processes"; else echo "FAIL $label: rc=$rc out=$(tail -n 4 "$out")"; fail=1; fi
+  if [ "$polls_after" -eq "$polls_before" ]; then echo "ok   $label: it did not poll"; else echo "FAIL $label: it polled"; fail=1; fi
+}
+prove_survivor_at_start
 
 # The pool layout: with SRE_WORKSPACE_PER_INSTANCE=1 this instance keeps its own
 # directories under instances/<id> on the shared volume, the agent's per-repository
