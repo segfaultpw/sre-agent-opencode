@@ -70,6 +70,9 @@
 //   FIXTURE_TOKEN_FORGET_FILE  when this file exists the platform forgets every
 //                          token it minted (and the file is removed), as when
 //                          it was replaced: the key still works
+//   FIXTURE_TOKEN_STATUS_FILE  when this file exists, its content is the status the
+//                          exchange answers with (404 for a platform rolled back
+//                          below the exchange, 503 for one that is failing)
 //   FIXTURE_TOKEN_STATUS   a status to answer the exchange with instead (503)
 
 const fs = require('node:fs');
@@ -95,6 +98,7 @@ const tokenCapMs = Number.parseInt(process.env.FIXTURE_TOKEN_CAP_MS || String(24
 const tokenRoute = process.env.FIXTURE_TOKEN_ROUTE === 'hyphen' ? '/api/fix-runner/token' : '/api/fix_runner/token';
 const tokenRevokeFile = process.env.FIXTURE_TOKEN_REVOKE_FILE || '';
 const tokenForgetFile = process.env.FIXTURE_TOKEN_FORGET_FILE || '';
+const tokenStatusFile = process.env.FIXTURE_TOKEN_STATUS_FILE || '';
 const tokenStatus = process.env.FIXTURE_TOKEN_STATUS ? Number.parseInt(process.env.FIXTURE_TOKEN_STATUS, 10) : null;
 const tokens = new Map();
 let tokenCount = 0;
@@ -195,8 +199,9 @@ const server = http.createServer((request, response) => {
     }
 
     if (request.method === 'POST' && url.pathname === tokenRoute && tokenLifetimeMs !== null) {
-      if (tokenStatus !== null) {
-        send(response, tokenStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
+      const fileStatus = tokenStatusFile && fs.existsSync(tokenStatusFile) ? Number.parseInt(fs.readFileSync(tokenStatusFile, 'utf8'), 10) : null;
+      if (fileStatus !== null || tokenStatus !== null) {
+        send(response, fileStatus !== null ? fileStatus : tokenStatus, 'application/json', JSON.stringify({ error: 'fixture' }));
         return;
       }
       const presented = authorization.replace(/^Bearer /, '');

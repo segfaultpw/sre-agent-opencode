@@ -82,13 +82,18 @@ function envOf(file) {
 
 async function main() {
   await check('loadCredentialEnv reads NAME=value lines, skipping blanks and comments, and keeps the value whole', () => {
-    const env = internals.loadCredentialEnv(`# comment\n\nDB_HOST=db.internal\r\nTOKEN=a=b=c\nEMPTY=\n`);
-    assert.deepEqual(env, { DB_HOST: 'db.internal', TOKEN: 'a=b=c', EMPTY: '' });
+    const env = internals.loadCredentialEnv(`# comment\n\nDB_HOST=db.internal\r\nTOKEN=a=b=c\nEMPTY=\nAWS_ACCESS_KEY_ID=AKIA\nKUBECONFIG=/run/kube\n`);
+    assert.deepEqual(env, { DB_HOST: 'db.internal', TOKEN: 'a=b=c', EMPTY: '', AWS_ACCESS_KEY_ID: 'AKIA', KUBECONFIG: '/run/kube' });
   });
 
   await check('loadCredentialEnv refuses every refused name and says which, never the value', () => {
-    const refused = ['PATH', 'HOME', 'ENV', 'BASH_ENV', 'NODE_OPTIONS', 'NODE_PATH', 'GH_TOKEN', 'GITHUB_TOKEN', 'SRE_API_KEY', 'SRE_ANYTHING', 'OPENCODE_CONFIG', 'GIT_SSH_COMMAND', 'GIT_CONFIG_COUNT'];
-    for (const name of refused) {
+    const refused = [
+      'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'IFS', 'PS4', 'ENV', 'TMPDIR', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+      'LD_PRELOAD', 'LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'NODE_OPTIONS', 'NODE_PATH',
+      'PYTHONPATH', 'PYTHONSTARTUP', 'RUBYOPT', 'PERL5LIB', 'BASH_ENV', 'BASH_FUNC_X', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_HOST', 'SRE_API_KEY',
+      'SRE_ANYTHING', 'OPENCODE_CONFIG', 'GIT_SSH_COMMAND', 'GIT_CONFIG_COUNT', 'SSH_AUTH_SOCK',
+    ];
+    for (const name of refused.filter((entry) => /^[A-Z][A-Z0-9_]*$/.test(entry))) {
       let message = null;
       try {
         internals.loadCredentialEnv(`OK_ONE=1\n${name}=${DISTINCT}\n`);
@@ -373,6 +378,117 @@ async function main() {
     }
   });
 
+  await check('the credentials hook\'s stderr is never logged, even when a shell traced the value into it', async () => {
+    const hooks = makeDir('hooks');
+    writeHook(hooks, 'credentials', `set -x\necho 'DB_PASSWORD=${DISTINCT}'`);
+    const { config } = load({ SRE_HOOKS_DIR: hooks });
+    const lines = [];
+    const writeOut = process.stdout.write.bind(process.stdout);
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stdout.write = (chunk) => (lines.push(String(chunk)), true);
+    process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+    try {
+      const prepared = await internals.prepareRequestEnv(config, job(), {});
+      assert.equal(prepared.extraEnv.DB_PASSWORD, DISTINCT);
+    } finally {
+      process.stdout.write = writeOut;
+      process.stderr.write = writeErr;
+      internals.clearRequestSecrets();
+    }
+    const text = lines.join('');
+    assert.equal(text.includes(DISTINCT), false, text);
+    assert.equal(text.includes('+ echo'), false, 'the trace was logged');
+    assert.match(text, /hook credentials: \d+ lines? on stderr not shown/);
+  });
+
+  await check('a credentials hook that fails after tracing a value logs its exit status and no stderr', async () => {
+    const hooks = makeDir('hooks');
+    writeHook(hooks, 'credentials', `set -x\necho 'DB_PASSWORD=${DISTINCT}' >&2\nexit 5`);
+    const { config } = load({ SRE_HOOKS_DIR: hooks });
+    const lines = [];
+    const writeOut = process.stdout.write.bind(process.stdout);
+    const writeErr = process.stderr.write.bind(process.stderr);
+    process.stdout.write = (chunk) => (lines.push(String(chunk)), true);
+    process.stderr.write = (chunk) => (lines.push(String(chunk)), true);
+    try {
+      await assert.rejects(() => internals.prepareRequestEnv(config, job(), {}), /the credentials hook exited 5/);
+    } finally {
+      process.stdout.write = writeOut;
+      process.stderr.write = writeErr;
+    }
+    assert.equal(lines.join('').includes(DISTINCT), false);
+    assert.ok(lines.join('').includes('the credentials hook exited 5'));
+  });
+
+  await check('a sticky world-writable hooks directory is refused: sticky stops deleting, not creating', () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const stranger = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const layout = { workspace: makeDir('ws-sticky') };
+    const sticky = makeDir('hooks', 0o1777);
+    fs.chmodSync(sticky, 0o1777);
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: sticky }, layout, stranger), /hooks directory .* is writable by every account/);
+    const groupSticky = makeDir('hooks', 0o1775);
+    fs.chmodSync(groupSticky, 0o1775);
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: groupSticky }, layout, { uid: me.uid + 4242, gid: me.gid }), /writable by the agent's group/);
+  });
+
+  await check('a hook that appears after the start is judged when it appears, and refused with its name if the agent could have written it', async () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const stranger = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const layout = { workspace: makeDir('ws-late') };
+    const hooks = makeDir('hooks', 0o755);
+    const settings = internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, stranger);
+    internals.setHookSettings(settings);
+    const marker = path.join(work, `late-ran-${counter}`);
+    const file = writeHook(hooks, 'pre-run', `touch '${marker}'`);
+    fs.chmodSync(file, 0o777);
+    const refused = await internals.runHook('pre-run', job(), {}, {});
+    assert.equal(refused.ok, false);
+    assert.match(refused.failure, /^the pre-run hook was not run: the pre-run hook .*pre-run is writable by every account/);
+    assert.equal(fs.existsSync(marker), false, 'a hook the agent could have written ran');
+    fs.chmodSync(file, 0o755);
+    const allowed = await internals.runHook('pre-run', job(), {}, {});
+    assert.equal(allowed.ok, true);
+    assert.equal(fs.existsSync(marker), true);
+  });
+
+  await check('a hook that is a link is judged by its target and the directory holding the target', async () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const stranger = { uid: me.uid + 4242, gid: me.gid + 4242 };
+    const layout = { workspace: makeDir('ws-link') };
+    const hooks = makeDir('hooks', 0o755);
+    const open = makeDir('open-tools', 0o777);
+    const target = writeHook(open, 'real-pre-run', 'true');
+    fs.symlinkSync(target, path.join(hooks, 'pre-run'));
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, stranger), /directory holding the pre-run hook .* is writable by every account/);
+    const closed = makeDir('closed-tools', 0o755);
+    const safe = writeHook(closed, 'real-pre-run', 'true');
+    const hooks2 = makeDir('hooks', 0o755);
+    fs.symlinkSync(safe, path.join(hooks2, 'pre-run'));
+    const settings = internals.loadHookSettings({ SRE_HOOKS_DIR: hooks2 }, layout, stranger);
+    internals.setHookSettings(settings);
+    assert.equal((await internals.runHook('pre-run', job(), {}, {})).ok, true);
+    fs.chmodSync(closed, 0o777);
+    const moved = await internals.runHook('pre-run', job(), {}, {});
+    assert.equal(moved.ok, false, 'the target\'s directory became writable after the start');
+    assert.match(moved.failure, /the pre-run hook was not run/);
+  });
+
+  await check('with the runner as another account (a root start), a hook that account cannot read and execute is refused at start', () => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    const layout = { workspace: makeDir('ws-runner') };
+    const hooks = makeDir('hooks', 0o755);
+    writeHook(hooks, 'pre-run', 'true');
+    fs.chmodSync(path.join(hooks, 'pre-run'), 0o700);
+    const other = { uid: me.uid + 77, gid: me.gid + 77 };
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other), /pre-run hook in SRE_HOOKS_DIR cannot be read and executed by the runner's account/);
+    assert.equal(internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, me).dir, fs.realpathSync(hooks));
+    fs.chmodSync(path.join(hooks, 'pre-run'), 0o755);
+    assert.equal(internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other).dir, fs.realpathSync(hooks));
+    fs.chmodSync(hooks, 0o700);
+    assert.throws(() => internals.loadHookSettings({ SRE_HOOKS_DIR: hooks }, layout, null, other), /cannot be read and executed/);
+  });
+
   await check('the settings the runner refuses to start with', () => {
     const hooks = makeDir('hooks');
     writeHook(hooks, 'pre-run', 'true');
@@ -382,7 +498,7 @@ async function main() {
     assert.throws(() => load({ SRE_HOOK_TIMEOUT_SECONDS: 'soon' }), /SRE_HOOK_TIMEOUT_SECONDS/);
     assert.throws(() => load({ SRE_AGENT_AWS_ROLE_ARN: 'not-an-arn' }), /SRE_AGENT_AWS_ROLE_ARN/);
     fs.chmodSync(path.join(hooks, 'pre-run'), 0o644);
-    assert.throws(() => load({ SRE_HOOKS_DIR: hooks }), /pre-run hook in SRE_HOOKS_DIR is not executable/);
+    assert.throws(() => load({ SRE_HOOKS_DIR: hooks }), /pre-run hook in SRE_HOOKS_DIR cannot be read and executed/);
     fs.chmodSync(path.join(hooks, 'pre-run'), 0o755);
     assert.equal(load({ SRE_HOOKS_DIR: hooks }).config.hooks.dir, fs.realpathSync(hooks));
   });

@@ -36,6 +36,10 @@ async function check(name, fn) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let counter = 0;
+// The renewal point is never sooner than 30 seconds after the last (no loop on
+// the exchange); the cases with a few seconds of life lower it, and one case
+// proves the floor.
+let minRenewMs = 0;
 
 async function startFixture(extraEnv = {}) {
   counter += 1;
@@ -106,6 +110,7 @@ function loadRunner(fixture, overrides = {}) {
   Object.assign(process.env, runnerEnv(fixture, overrides));
   delete require.cache[runnerPath];
   const runner = require(runnerPath);
+  runner.internals.setTokenMinRenewMs(minRenewMs);
   const config = runner.loadConfig();
   for (const name of Object.keys(process.env)) delete process.env[name];
   Object.assign(process.env, saved);
@@ -147,6 +152,9 @@ function mintByHand(fixture) {
 }
 
 async function main() {
+  // The renewal point is never sooner than 30 seconds after the last (no loop on
+  // the exchange); the cases with a few seconds of life lower it, and one case
+  // below proves the floor.
   await check('a start with the key exchanges it before the first poll and polls with the token', async () => {
     const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '600000' });
     try {
@@ -329,6 +337,103 @@ async function main() {
       assert.equal(calls[1].authorization, `Bearer ${KEY}`);
     } finally {
       output.restore();
+      fixture.stop();
+    }
+  });
+
+  await check('a queue that refuses the token while the exchange is gone (404, a platform rolled back) is polled with the key', async () => {
+    const forget = path.join(work, 'forget-3');
+    const status = path.join(work, 'status-3');
+    const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '600000', FIXTURE_TOKEN_FORGET_FILE: forget, FIXTURE_TOKEN_STATUS_FILE: status });
+    const output = captureOutput();
+    try {
+      const { runner, config } = loadRunner(fixture);
+      await runner.internals.apiCredential();
+      fs.writeFileSync(forget, '');
+      fs.writeFileSync(status, '404');
+      const answer = await runner.internals.poll(config);
+      assert.deepEqual(answer.jobs, []);
+      const queue = queueCalls(fixture);
+      assert.match(queue[0].authorization, /^Bearer sre_frt_/);
+      assert.equal(queue[queue.length - 1].authorization, `Bearer ${KEY}`, 'the retry used the key');
+      assert.equal(queue.length, 2);
+    } finally {
+      output.restore();
+      fixture.stop();
+    }
+  });
+
+  await check('a queue that refuses the token while the exchange fails (503) is polled with the key, not stopped', async () => {
+    const forget = path.join(work, 'forget-4');
+    const status = path.join(work, 'status-4');
+    const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '600000', FIXTURE_TOKEN_FORGET_FILE: forget, FIXTURE_TOKEN_STATUS_FILE: status });
+    const output = captureOutput();
+    try {
+      const { runner, config } = loadRunner(fixture);
+      await runner.internals.apiCredential();
+      fs.writeFileSync(forget, '');
+      fs.writeFileSync(status, '503');
+      const answer = await runner.internals.poll(config);
+      assert.deepEqual(answer.jobs, []);
+      assert.equal(queueCalls(fixture).at(-1).authorization, `Bearer ${KEY}`);
+    } finally {
+      output.restore();
+      fixture.stop();
+    }
+  });
+
+  await check('only the key being refused stops a runner that holds it, with the sentence about the key', async () => {
+    const revoke = path.join(work, 'revoke-2');
+    const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '600000', FIXTURE_TOKEN_REVOKE_FILE: revoke });
+    const output = captureOutput();
+    try {
+      const { runner, config } = loadRunner(fixture);
+      await runner.internals.apiCredential();
+      fs.writeFileSync(revoke, '');
+      let thrown = null;
+      try {
+        await runner.internals.poll(config);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown && thrown.fatal);
+      assert.match(thrown.message, /the queue refused SRE_API_KEY with HTTP 401/);
+    } finally {
+      output.restore();
+      fixture.stop();
+    }
+  });
+
+  await check('a token that lives no time does not make the runner loop on the exchange', async () => {
+    const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '1' });
+    const output = captureOutput();
+    try {
+      minRenewMs = 30_000;
+      const { runner } = loadRunner(fixture);
+      await runner.internals.apiCredential();
+      await sleep(1500);
+      assert.equal(exchanges(fixture).length, 1, 'renewal came sooner than the floor');
+    } finally {
+      minRenewMs = 0;
+      output.restore();
+      fixture.stop();
+    }
+  });
+
+  await check('only the most recent rotating secrets are kept for the redaction, the constant ones stay', async () => {
+    const fixture = await startFixture({ FIXTURE_TOKEN_LIFETIME_MS: '600000' });
+    try {
+      const { runner } = loadRunner(fixture);
+      const { internals } = runner;
+      for (let n = 0; n < 30; n += 1) internals.addRotatingSecret(`rotating-secret-value-${String(n).padStart(2, '0')}`);
+      internals.addRotatingSecret('rotating-secret-value-29');
+      const text = Array.from({ length: 30 }, (_, n) => `rotating-secret-value-${String(n).padStart(2, '0')}`).join(' ');
+      const out = internals.redact(`${text} ${KEY}`);
+      assert.ok(out.includes('rotating-secret-value-09'), 'an old one was dropped from the list');
+      assert.equal(out.includes('rotating-secret-value-10'), false);
+      assert.equal(out.includes('rotating-secret-value-29'), false);
+      assert.equal(out.includes(KEY), false, 'the key stays redacted');
+    } finally {
       fixture.stop();
     }
   });

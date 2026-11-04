@@ -89,6 +89,9 @@ const TOKEN_PREFIX = 'sre_frt_';
 const TOKEN_PATHS = ['/api/fix_runner/token', '/api/fix-runner/token'];
 const TOKEN_RENEW_FRACTION = 0.7;
 const TOKEN_RETRY_MS = 30_000;
+// However short a token's life, or wrong the clocks, renewal is never sooner than
+// this after the last one: no loop on the exchange.
+let tokenMinRenewMs = 30_000;
 const TOKEN_REQUEST_TIMEOUT_MS = 15_000;
 // A token this close to its expiry is treated as gone: a poll started on it
 // could be refused before the answer arrives.
@@ -103,6 +106,12 @@ const TOKEN_CLOCK_SKEW_MS = 5_000;
 const TASK_PROTECTION_MINUTES = 60;
 const TASK_PROTECTION_TIMEOUT_MS = 5_000;
 const TASK_PROTECTION_LOCK_WAIT_MS = 10_000;
+// While a request is held the protection is asked for again this often, so it
+// never lapses under a run longer than its expiry; the lock that counts a task's
+// requests is held for the length of one call to the ECS agent, so one older than
+// this is a worker that died holding it.
+let taskProtectionRenewMs = 20 * 60 * 1000;
+const TASK_PROTECTION_LOCK_STALE_MS = 2 * 60 * 1000;
 
 // The leases on the shared memory tree of a pool of runners, taken only with
 // SRE_WORKSPACE_PER_INSTANCE=1 (a single runner owns its workspace outright,
@@ -278,6 +287,20 @@ function describeIdentity() {
 // 24 hours it is valid.
 const constantSecrets = [];
 let jobSecret = null;
+// The secrets that are replaced while the process runs (the runner token, the
+// installation tokens App mode mints): the most recent few, without
+// duplicates, so a runner that is up for months does not carry every token it
+// ever held through every log line.
+const ROTATING_SECRETS_MAX = 20;
+const rotatingSecrets = [];
+
+function addRotatingSecret(value) {
+  if (!value) return;
+  const at = rotatingSecrets.indexOf(value);
+  if (at !== -1) rotatingSecrets.splice(at, 1);
+  rotatingSecrets.push(value);
+  while (rotatingSecrets.length > ROTATING_SECRETS_MAX) rotatingSecrets.shift();
+}
 // What the current request's credentials hook printed and the role it assumed,
 // redacted from every line like the secrets above for as long as the request lasts.
 let requestSecrets = [];
@@ -287,6 +310,7 @@ function redact(text) {
   for (const secret of constantSecrets) {
     if (secret) out = out.split(secret).join('[redacted]');
   }
+  for (const secret of rotatingSecrets) out = out.split(secret).join('[redacted]');
   if (jobSecret) out = out.split(jobSecret).join('[redacted]');
   for (const secret of requestSecrets) out = out.split(secret).join('[redacted]');
   return out;
@@ -500,7 +524,7 @@ function loadConfig() {
   }
   config.taskProtection = { mode: protectionMode, uri: (process.env.ECS_AGENT_URI || '').replace(/\/+$/, '') };
   taskProtectionState = { config, held: new Map(), disabled: false, announced: false };
-  config.hooks = loadHookSettings(process.env, layout, identity.agent);
+  config.hooks = loadHookSettings(process.env, layout, identity.agent, identity.mode === 'root' ? identity.runner : null);
   hookSettings = config.hooks;
   registerConfigSecrets(config);
   credential = newCredential(config.serverUrl, config.apiKey);
@@ -608,8 +632,8 @@ function adoptToken(c, answer) {
   c.dead = null;
   const life = Math.max(0, answer.expiresAt - answer.serverNow);
   c.margin = Math.min(TOKEN_EXPIRY_MARGIN_MS, Math.floor(life * 0.1));
-  c.renewAt = Date.now() + Math.floor(life * TOKEN_RENEW_FRACTION);
-  constantSecrets.push(answer.token);
+  c.renewAt = Date.now() + Math.max(tokenMinRenewMs, Math.floor(life * TOKEN_RENEW_FRACTION));
+  addRotatingSecret(answer.token);
   if (c.timer) clearTimeout(c.timer);
   c.timer = null;
   // A capped token is never renewed; the next poll after its expiry says so.
@@ -691,7 +715,10 @@ async function apiCredential() {
       throw fatal('the runner token reached its 24 hour cap and cannot be renewed. Start the runner again with a fresh SRE_API_KEY (a token from whatever mints them, or the key itself)');
     }
   }
-  if (!c.capped && Date.now() >= c.renewAt) {
+  // Also when the token is about to run out before the renewal point (a life
+  // shorter than the minimum delay): then every poll asks, which is slow, not a loop.
+  const running = c.kind === 'token' && c.expiresAt !== null && Date.now() >= c.expiresAt - c.margin;
+  if (!c.capped && (Date.now() >= c.renewAt || running)) {
     await renewCredential(c);
     if (c.dead) throw fatal(c.dead);
   }
@@ -701,15 +728,27 @@ async function apiCredential() {
   return c.bearer;
 }
 
-// After the queue refused the credential: with the key in hand, get a token
-// of its own again and say whether that happened.
+// After the queue refused the credential: with the key in hand, get a token of
+// its own again. Until the exchange has answered, the key is the bearer, so a
+// platform that cannot exchange (404, 5xx, no answer) is polled with the key.
 async function refreshFromKey() {
   const c = credential;
   if (!c || !c.key || c.unsupported) return false;
+  c.bearer = c.key;
+  c.kind = 'key';
   c.renewAt = 0;
   c.capped = false;
   await renewCredential(c);
   return c.kind === 'token';
+}
+
+// The token was refused again straight after a fresh exchange: use the key
+// itself, and ask for a token again later.
+function useKeyInstead() {
+  const c = credential;
+  c.bearer = c.key;
+  c.kind = 'key';
+  c.renewAt = Date.now() + TOKEN_RETRY_MS;
 }
 
 function httpRequest(target, options = {}) {
@@ -1039,7 +1078,7 @@ function gitAuthEnv(token) {
 async function runnerGitToken(config, repo) {
   if (!config.githubApp) return config.githubToken;
   const token = await config.githubApp.runnerToken(repo ? repo.owner : null, repo ? repo.name : null);
-  constantSecrets.push(token);
+  addRotatingSecret(token);
   return token;
 }
 
@@ -1050,7 +1089,7 @@ async function runnerGitToken(config, repo) {
 async function agentGitToken(config, repo) {
   if (!config.githubApp) return config.agentGithubToken || config.githubToken;
   const token = await config.githubApp.agentToken(repo ? repo.owner : null, repo ? repo.name : null);
-  constantSecrets.push(token);
+  addRotatingSecret(token);
   return token;
 }
 
@@ -1131,7 +1170,7 @@ async function poll(config) {
   // contract says, and the length is spelled out so the body is framed whatever
   // the platform reads it with.
   const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}`, capabilities: CAPABILITIES });
-  let freshToken = false;
+  let tokenRetries = 0;
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
     let failure = '';
@@ -1165,20 +1204,25 @@ async function poll(config) {
       return { jobs: [], heartbeatSeconds: null };
     }
 
-    // A token the queue no longer accepts (revoked with its key, or lost to a
-    // platform that was replaced) is exchanged again from the key when this
-    // start holds it, once; a start without the key has nothing to ask with.
+    // A token the queue no longer accepts (a platform that was replaced or rolled
+    // back, a chain that ended) is exchanged again from the key when this start
+    // holds it, once; if the exchange fails, or its token is refused too, the key
+    // itself is the bearer. Only the key being refused ends the runner with the
+    // sentence about the key. A start without the key has nothing to ask with.
     if (response && response.status === 401 && credential && credential.kind === 'token') {
-      if (credential.key && !freshToken) {
-        freshToken = true;
-        log('warn', 'the queue refused the runner token; exchanging SRE_API_KEY for a new one');
-        if (await refreshFromKey()) {
-          attempt -= 1;
-          continue;
+      if (credential.key && tokenRetries < 2) {
+        tokenRetries += 1;
+        if (tokenRetries === 1) {
+          log('warn', 'the queue refused the runner token; exchanging SRE_API_KEY for a new one');
+          await refreshFromKey();
+        } else {
+          log('warn', 'the queue refused the new runner token too; using SRE_API_KEY meanwhile');
+          useKeyInstead();
         }
-      } else if (!credential.key) {
-        throw fatal(tokenRefusal());
+        attempt -= 1;
+        continue;
       }
+      if (!credential.key) throw fatal(tokenRefusal());
     }
 
     if (response && (response.status === 401 || response.status === 403)) {
@@ -1971,8 +2015,8 @@ async function acquireLock(file, options = {}) {
     } else if (silent(mtimeAge)) {
       const minutes = Math.max(1, Math.round(staleMs / 60_000));
       log('warn', `the lock ${file} was held by instance ${held.instance || 'unknown'} (pid ${held.pid || 'unknown'}, taken ${new Date(held.takenMs).toISOString()}) more than ${minutes} minutes ago, so it is assumed gone and was replaced`);
-    } else if (held.instance === instance && !pidIsAlive(held.pid)) {
-      log('info', `the lock ${file} was left by this instance's own pid ${held.pid || 'unknown'}, which is gone, so it was taken back`);
+    } else if ((held.instance === instance || options.reclaimDeadPid) && !pidIsAlive(held.pid)) {
+      log('info', `the lock ${file} was left by ${held.instance === instance ? 'this instance\'s own' : 'a'} pid ${held.pid || 'unknown'}, which is gone, so it was taken back`);
     } else {
       if (Date.now() >= deadline) return { ok: false, file, holder: held };
       await sleep(Math.min(LOCK_POLL_MS, Math.max(0, deadline - Date.now())));
@@ -3016,8 +3060,18 @@ const HOOK_OUTPUT_LINE_MAX = 500;
 const CREDENTIAL_OUTPUT_MAX_BYTES = 65_536;
 const CREDENTIAL_MAX_COUNT = 64;
 const CREDENTIAL_NAME = /^[A-Z][A-Z0-9_]*$/;
-const CREDENTIAL_REFUSED_NAMES = new Set(['PATH', 'HOME', 'ENV', 'BASH_ENV', 'NODE_OPTIONS', 'NODE_PATH', 'GH_TOKEN', 'GITHUB_TOKEN']);
-const CREDENTIAL_REFUSED_PREFIXES = ['SRE_', 'OPENCODE_', 'GIT_'];
+// Names the credentials hook may not set, because each moves a boundary: the
+// search path, the dynamic loader, an interpreter's start-up and library
+// directories, the home and configuration directories the runner points the agent
+// at, git's and ssh's own settings, the proxies, the runner's variables and
+// opencode's. AWS_* and any other name are the hook's to set.
+const CREDENTIAL_REFUSED_NAMES = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'IFS', 'PS4', 'ENV', 'TMPDIR',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+]);
+const CREDENTIAL_REFUSED_PREFIXES = [
+  'LD_', 'DYLD_', 'XDG_', 'NODE_', 'PYTHON', 'RUBY', 'PERL', 'BASH_', 'GIT_', 'SSH_', 'GH_', 'GITHUB_', 'SRE_', 'OPENCODE_',
+];
 // A value shorter than this is not redacted: it is not a credential, and
 // replacing every "1" or "yes" in a log would only corrupt it.
 const REQUEST_SECRET_MIN_LENGTH = 6;
@@ -3033,18 +3087,82 @@ const AWS_KEEP = new Set(['AWS_REGION', 'AWS_DEFAULT_REGION', 'AWS_EC2_METADATA_
 // What load put in place: the hooks directory (or null) and the bound.
 let hookSettings = { dir: null, timeoutMs: HOOK_TIMEOUT_SECONDS_DEFAULT * 1000, roleArn: null };
 
-function whyAgentCouldWrite(stat, agent) {
-  const sticky = stat.isDirectory() && (stat.mode & 0o1000) !== 0;
+// Why the agent's account could write what `stat` describes, or null. A sticky
+// directory stops others deleting or renaming the entries it holds that they do
+// not own, so it is safe as a directory ON THE WAY to a hook (the hook's own
+// directory is then judged by its owner and mode), and never as the directory
+// that holds the hooks, where it would still let the agent create a new one.
+function whyAgentCouldWrite(stat, agent, holdsHooks = false) {
+  const sticky = !holdsHooks && stat.isDirectory() && (stat.mode & 0o1000) !== 0;
   if (stat.uid === agent.uid) return 'owned by the agent account';
   if ((stat.mode & 0o002) !== 0 && !sticky) return 'writable by every account';
   if ((stat.mode & 0o020) !== 0 && stat.gid === agent.gid && !sticky) return 'writable by the agent\'s group';
   return null;
 }
 
+// Whether `account` ({uid, gid}) holds every bit of `bits` (4 read, 2 write, 1
+// execute) on what `stat` describes, by the file's mode. Used for the runner's
+// account when this process is root, where access() would answer for root.
+function accountPermits(stat, account, bits) {
+  if (stat.uid === account.uid) return (((stat.mode >> 6) & bits) === bits);
+  if (stat.gid === account.gid) return (((stat.mode >> 3) & bits) === bits);
+  return ((stat.mode & bits) === bits);
+}
+
+function ancestorsOf(start) {
+  const parts = [];
+  for (let current = start; ; current = path.dirname(current)) {
+    parts.push(current);
+    if (current === path.dirname(current)) break;
+  }
+  return parts;
+}
+
+// A sentence when the agent's account could write the hooks directory `dir`
+// (already a real path), any directory above it, the hook `name` in it, the
+// target of that hook if it is a link, or the directory holding that target;
+// else null. Judged at start and again before every run of a hook, so a hook that
+// appears later is judged when it does, and a link cannot move to a place the
+// agent writes. Only an agent account that is not the runner's makes this a
+// question.
+function untrustedHook(dir, name, agent) {
+  if (!agent) return null;
+  const file = path.join(dir, name);
+  const checks = [[dir, true, 'the hooks directory']];
+  for (const above of ancestorsOf(path.dirname(dir))) checks.push([above, false, 'a directory on the way to the hooks']);
+  let target = null;
+  try {
+    target = fs.realpathSync(file);
+  } catch {
+    target = null;
+  }
+  if (target) {
+    checks.push([target, false, `the ${name} hook`]);
+    const holder = path.dirname(target);
+    if (holder !== dir) {
+      checks.push([holder, true, `the directory holding the ${name} hook`]);
+      for (const above of ancestorsOf(path.dirname(holder))) checks.push([above, false, 'a directory on the way to the hook']);
+    }
+  }
+  for (const [part, holdsHooks, what] of checks) {
+    let stat;
+    try {
+      stat = fs.statSync(part);
+    } catch {
+      return `${part} could not be read`;
+    }
+    const why = whyAgentCouldWrite(stat, agent, holdsHooks);
+    if (why) return `${what} ${part} is ${why}`;
+  }
+  return null;
+}
+
 // Validates SRE_HOOKS_DIR and SRE_HOOK_TIMEOUT_SECONDS at start, so a hooks
 // directory the runner could not use or must not trust refuses the start with
 // a sentence instead of failing the first request. Returns the settings.
-function loadHookSettings(env, layout, agent) {
+// `runnerAccount` is {uid, gid} when this process is root and the hooks run as
+// that other account, whose permissions are then judged by mode.
+function loadHookSettings(env, layout, agent, runnerAccount = null) {
   const timeoutRaw = env.SRE_HOOK_TIMEOUT_SECONDS;
   let timeoutSeconds = HOOK_TIMEOUT_SECONDS_DEFAULT;
   if (timeoutRaw !== undefined && timeoutRaw !== '') {
@@ -3059,7 +3177,7 @@ function loadHookSettings(env, layout, agent) {
     }
     roleArn = roleRaw;
   }
-  const settings = { dir: null, timeoutMs: timeoutSeconds * 1000, roleArn };
+  const settings = { dir: null, timeoutMs: timeoutSeconds * 1000, roleArn, agent: agent || null, runnerAccount };
   const named = env.SRE_HOOKS_DIR;
   if (named === undefined || named === '') return settings;
   if (!path.isAbsolute(named)) {
@@ -3086,24 +3204,11 @@ function loadHookSettings(env, layout, agent) {
       }
     }
   }
-  if (agent) {
-    const parts = [];
-    for (let current = real; ; current = path.dirname(current)) {
-      parts.push(current);
-      if (current === path.dirname(current)) break;
-    }
-    for (const name of HOOK_NAMES) {
-      const file = path.join(real, name);
-      if (fs.existsSync(file)) parts.push(fs.realpathSync(file));
-    }
-    for (const part of parts) {
-      const why = whyAgentCouldWrite(fs.statSync(part), agent);
-      if (why) {
-        throw fatal(`SRE_HOOKS_DIR names ${named}, and ${part} on the way to a hook is ${why}; the agent could replace a hook that runs with the runner's privileges, so put the hooks where only root or the runner's account writes`);
-      }
-    }
-  }
   for (const name of HOOK_NAMES) {
+    const why = untrustedHook(real, name, agent);
+    if (why) {
+      throw fatal(`SRE_HOOKS_DIR names ${named}, and ${why}; the agent could replace a hook that runs with the runner's privileges, so put the hooks where only root or the runner's account writes`);
+    }
     const file = path.join(real, name);
     let stat = null;
     try {
@@ -3112,11 +3217,20 @@ function loadHookSettings(env, layout, agent) {
       continue;
     }
     if (!stat.isFile()) throw fatal(`the ${name} hook in SRE_HOOKS_DIR is not a regular file`);
-    try {
-      fs.accessSync(file, fs.constants.X_OK);
-    } catch {
-      throw fatal(`the ${name} hook in SRE_HOOKS_DIR is not executable by the runner's account`);
+    // As the account that will run it: root's access() says yes to a file with
+    // any execute bit, and the hook runs as the runner's account.
+    let runnable;
+    if (runnerAccount) {
+      runnable = accountPermits(stat, runnerAccount, 5) && accountPermits(fs.statSync(real), runnerAccount, 1);
+    } else {
+      try {
+        fs.accessSync(file, fs.constants.R_OK | fs.constants.X_OK);
+        runnable = true;
+      } catch {
+        runnable = false;
+      }
     }
+    if (!runnable) throw fatal(`the ${name} hook in SRE_HOOKS_DIR cannot be read and executed by the runner's account`);
   }
   settings.dir = real;
   return settings;
@@ -3214,6 +3328,15 @@ async function runHook(name, job, extraEnv = {}, context = {}) {
   if (!hookSettings.dir) return { ran: false, ok: true };
   const file = path.join(hookSettings.dir, name);
   if (!fs.existsSync(file)) return { ran: false, ok: true };
+  // Judged again before every run, not only at start: a hook that did not exist
+  // then, or a link that now points somewhere the agent writes, is refused here
+  // with the hook's name.
+  const untrusted = untrustedHook(hookSettings.dir, name, hookSettings.agent);
+  if (untrusted) {
+    const failure = `the ${name} hook was not run: ${untrusted}, so the agent could have written it`;
+    log(name === 'post-run' ? 'warn' : 'error', failure);
+    return { ran: true, ok: false, code: null, stdout: '', stderr: '', aborted: false, failure };
+  }
   log('info', `running the ${name} hook`, { handoff_id: job && job.handoff_id });
   const result = await runProcess(file, [], {
     cwd: hookSettings.dir,
@@ -3223,8 +3346,16 @@ async function runHook(name, job, extraEnv = {}, context = {}) {
     signal: context.signal || null,
   });
   const ok = result.code === 0 && !result.timedOut && !result.abandoned;
-  if (name !== 'credentials') logHookOutput(name, result.stdout, 'info');
-  logHookOutput(name, result.stderr, ok ? 'info' : 'warn');
+  if (name === 'credentials') {
+    // Its stdout is the credentials and its stderr may trace them (a shell hook
+    // with set -x prints every value it handles) before any is known to the
+    // redaction, so neither is logged: only that there was output.
+    const hidden = String(result.stderr).split('\n').filter((line) => line.trim() !== '').length;
+    if (hidden > 0) log(ok ? 'info' : 'warn', `hook credentials: ${hidden} line${hidden === 1 ? '' : 's'} on stderr not shown, because they may hold the credentials`);
+  } else {
+    logHookOutput(name, result.stdout, 'info');
+    logHookOutput(name, result.stderr, ok ? 'info' : 'warn');
+  }
   const answer = { ran: true, ok, code: result.code, stdout: result.stdout, stderr: result.stderr, aborted: Boolean(result.aborted) };
   if (!ok && !answer.aborted) {
     answer.failure = hookFailure(name, result);
@@ -5273,11 +5404,29 @@ const protection = {
     } catch (error) {
       log('warn', `ECS task protection could not be turned on (${redact(error.message)}); the request goes on`);
     }
+    // Asked for again while the request lasts, so it cannot lapse under a long
+    // run; it stops with the release (or with the first refusal).
+    clearInterval(state.renewTimer);
+    if (!state.disabled) {
+      state.renewTimer = setInterval(() => {
+        if (state.disabled) {
+          clearInterval(state.renewTimer);
+          return;
+        }
+        protection.change(state, handoffId, true).catch((error) => {
+          log('warn', `ECS task protection could not be renewed (${redact(error.message)}); the request goes on`);
+        });
+      }, taskProtectionRenewMs);
+      state.renewTimer.unref();
+    }
   },
 
   async release(handoffId) {
     const state = taskProtectionState;
-    if (!state || state.disabled) return;
+    if (!state) return;
+    clearInterval(state.renewTimer);
+    state.renewTimer = null;
+    if (state.disabled) return;
     try {
       await protection.change(state, handoffId, false);
     } catch (error) {
@@ -5292,7 +5441,7 @@ const protection = {
     let remaining;
     if (config.layout.perInstance) {
       const files = taskProtectionFiles(config);
-      lock = await acquireLock(files.lock, { instance: config.layout.instance, waitMs: TASK_PROTECTION_LOCK_WAIT_MS, staleMs: config.lockStaleMs });
+      lock = await acquireLock(files.lock, { instance: config.layout.instance, waitMs: TASK_PROTECTION_LOCK_WAIT_MS, staleMs: TASK_PROTECTION_LOCK_STALE_MS, reclaimDeadPid: true });
       if (!lock.ok) throw new Error('the lock that counts this task\'s requests is held by another worker');
       try {
         settleDir(files.dir, 0o700);
@@ -5485,6 +5634,16 @@ module.exports = {
       githubApiBase = value;
     },
     // The pause between the replacement call's attempts, for the tests.
+    addRotatingSecret,
+    setHookSettings: (value) => {
+      hookSettings = value;
+    },
+    setTaskProtectionRenewMs: (value) => {
+      taskProtectionRenewMs = value;
+    },
+    setTokenMinRenewMs: (value) => {
+      tokenMinRenewMs = value;
+    },
     setReplacementRetryMs: (value) => {
       replacementRetryMs = value;
     },

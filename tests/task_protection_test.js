@@ -237,6 +237,49 @@ async function main() {
     }
   });
 
+  await check('protection is asked for again while the request lasts, and the asking stops with the release', async () => {
+    const ecs = await agent();
+    try {
+      load({ ECS_AGENT_URI: ecs.uri });
+      internals.setTaskProtectionRenewMs(120);
+      await internals.protection.hold('h-long');
+      await sleep(500);
+      const ons = ecs.calls.filter((call) => call.body.ProtectionEnabled === true);
+      assert.ok(ons.length >= 3, `${ons.length} calls turning it on`);
+      assert.ok(ons.every((call) => call.body.ExpiresInMinutes === 60));
+      await internals.protection.release('h-long');
+      const settled = ecs.calls.length;
+      assert.equal(ecs.calls.at(-1).body.ProtectionEnabled, false);
+      await sleep(400);
+      assert.equal(ecs.calls.length, settled, 'a renewal came after the release');
+    } finally {
+      internals.setTaskProtectionRenewMs(20 * 60 * 1000);
+      ecs.close();
+    }
+  });
+
+  await check('a worker that died holding the counting lock does not block the others', async () => {
+    const ecs = await agent();
+    const dead = spawn('true');
+    await new Promise((resolve) => dead.on('close', resolve));
+    try {
+      const config = load({ ECS_AGENT_URI: ecs.uri, SRE_WORKSPACE_PER_INSTANCE: '1', SRE_RUNNER_INSTANCE: 'pool-1' });
+      const files = internals.taskProtectionFiles(config);
+      fs.mkdirSync(config.layout.locks, { recursive: true });
+      fs.writeFileSync(files.lock, `pool-9 ${dead.pid} ${new Date().toISOString()}\n`);
+      fs.mkdirSync(files.dir, { recursive: true });
+      fs.writeFileSync(path.join(files.dir, 'pool-9.hold'), `${dead.pid} h-dead\n`);
+      const started = Date.now();
+      await internals.protection.hold('h-live');
+      assert.ok(Date.now() - started < 3000, 'the hold waited for a dead worker');
+      assert.equal(ecs.calls.at(-1).body.ProtectionEnabled, true);
+      await internals.protection.release('h-live');
+      assert.equal(ecs.calls.at(-1).body.ProtectionEnabled, false, 'the dead worker\'s marker does not keep it on');
+    } finally {
+      ecs.close();
+    }
+  });
+
   await check('the ECS agent address is not in the agent\'s environment', () => {
     const source = fs.readFileSync(path.resolve(__dirname, '..', 'runner', 'runner.js'), 'utf8');
     assert.ok(/'SRE_CONCURRENCY', 'ECS_AGENT_URI'/.test(source));
