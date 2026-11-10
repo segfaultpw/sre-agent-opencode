@@ -2,7 +2,7 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
-## Unreleased
+## v2.5.1
 
 The runner stops when the queue refuses its instance name, instead of retrying for ever.
 
