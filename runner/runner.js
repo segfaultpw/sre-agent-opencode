@@ -50,6 +50,9 @@ const APP_MODE_MAX_RUN_SECONDS = 3300;
 // off in SRE Agent, and the code the queue says so with.
 const DISABLED_POLL_MS = 60_000;
 const RUNNER_DISABLED_CODE = 'runner_disabled';
+// The code the queue answers a 400 with when the poll's `instance` is not a
+// printable string of 1 to 100 bytes. It is the one 400 that is a verdict.
+const INVALID_INSTANCE_CODE = 'invalid_instance';
 // The platform says how often to beat in the poll's answer (heartbeat_seconds).
 // An interval longer than this would let the platform's three minute lease run
 // out between two beats, so a longer value is beaten at this one.
@@ -1156,6 +1159,20 @@ function switchedOff(body) {
   return String(body).includes(RUNNER_DISABLED_CODE);
 }
 
+// True only for a 400 whose JSON body names invalid_instance. An empty body, a
+// body that is not JSON and a 400 with any other code are not: a proxy can
+// produce those, and they are retried like any other transient answer.
+function invalidInstance(body) {
+  if (!body) return false;
+  try {
+    const payload = JSON.parse(body);
+    const error = payload && payload.error;
+    return error === INVALID_INSTANCE_CODE || (error !== null && typeof error === 'object' && error.code === INVALID_INSTANCE_CODE);
+  } catch {
+    return false;
+  }
+}
+
 // How often the platform asked to be told this runner is still on its job, in
 // whole seconds, or null when the answer names no interval (a platform release
 // without heartbeats, which leases a job for 45 minutes instead).
@@ -1235,6 +1252,15 @@ async function poll(config) {
     if (response && (response.status === 401 || response.status === 403)) {
       throw fatal(
         `the queue refused SRE_API_KEY with HTTP ${response.status}; check the value of SRE_API_KEY and that it carries the fix_runner:poll scope`
+      );
+    }
+
+    // The queue's contract says to stop on this one: the instance name the
+    // runner built is the thing to fix, and retrying the same name forever
+    // only logs "HTTP 400".
+    if (response && response.status === 400 && invalidInstance(response.body)) {
+      throw fatal(
+        `the queue refused this runner's instance name ${JSON.stringify(config.instance)} (HTTP 400, ${INVALID_INSTANCE_CODE}); set SRE_RUNNER_INSTANCE to a string of at most 100 bytes (letters, digits, dots, underscores and hyphens), or unset it to use the hostname`
       );
     }
 
@@ -5658,6 +5684,7 @@ module.exports = {
   serveJob,
   PROVIDER_KEY_VARIABLES,
   internals: {
+    poll,
     openMemory,
     closeMemory,
     replaceMemory,

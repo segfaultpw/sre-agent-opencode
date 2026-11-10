@@ -2,6 +2,12 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## Unreleased
+
+The runner stops when the queue refuses its instance name, instead of retrying for ever.
+
+A poll answered with HTTP 400 and the body `{"error": "invalid_instance"}` means the `instance` the runner sent is not a printable string of 1 to 100 bytes, which no retry can fix. The runner now ends with a log line that names `SRE_RUNNER_INSTANCE` (the setting that sets the instance name; unset, the hostname is used) and the bound, where before it retried the poll six times and then polled again for ever, logging only "HTTP 400". Any other 400, such as an empty answer or an HTML page from a proxy, is still treated as transient and retried, and a 200 after one carries on as before. Nothing changes for a runner whose instance name is valid.
+
 ## v2.5.0
 
 The runner holds an expiring token instead of the poll key, runs your hooks around every request, reports its progress while it works, can work several requests at once, and tells ECS not to stop its task in the middle of a fix.
