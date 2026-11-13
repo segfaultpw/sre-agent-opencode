@@ -40,6 +40,10 @@
 //                          replacement call (POST /api/handoffs/<id>/replacement),
 //                          in order, the last one repeating; without it the call
 //                          is answered 404 like any route the fixture does not know
+//   FIXTURE_REPORT_STATUSES  a comma separated list of statuses to answer the
+//                          report with, in order, the last one repeating; unset,
+//                          every report is answered 201. Every report that
+//                          arrives is logged, whatever it was answered.
 //   FIXTURE_BRIEF_DELAY_MS  how long to hold the brief's answer
 //   FIXTURE_REPORT_DELAY_MS how long to hold the report's answer; the moment it
 //                          is sent is logged as its own entry, `answered_at`
@@ -92,6 +96,8 @@ let lastPhase = null;
 const heartbeatAfterFile = process.env.FIXTURE_HEARTBEAT_AFTER_FILE || '';
 const briefDelayMs = Number.parseInt(process.env.FIXTURE_BRIEF_DELAY_MS || '0', 10);
 const reportDelayMs = Number.parseInt(process.env.FIXTURE_REPORT_DELAY_MS || '0', 10);
+const reportStatuses = (process.env.FIXTURE_REPORT_STATUSES || '201').split(',').map((value) => Number.parseInt(value, 10));
+let reportCalls = 0;
 
 const tokenLifetimeMs = process.env.FIXTURE_TOKEN_LIFETIME_MS ? Number.parseInt(process.env.FIXTURE_TOKEN_LIFETIME_MS, 10) : null;
 const tokenCapMs = Number.parseInt(process.env.FIXTURE_TOKEN_CAP_MS || String(24 * 3600 * 1000), 10);
@@ -295,8 +301,10 @@ const server = http.createServer((request, response) => {
     }
 
     if (request.method === 'POST' && url.pathname.endsWith('/report')) {
+      const reportStatus = reportStatuses[Math.min(reportCalls, reportStatuses.length - 1)];
+      reportCalls += 1;
       setTimeout(() => {
-        send(response, 201, 'application/json', JSON.stringify({ data: { status: 'reported' } }));
+        send(response, reportStatus, 'application/json', JSON.stringify(reportStatus === 201 ? { data: { status: 'reported' } } : { error: 'fixture' }));
         record({ method: 'ANSWERED', path: `${url.pathname}#answered`, answered_at: Date.now() });
       }, reportDelayMs);
       return;

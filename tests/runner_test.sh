@@ -1609,6 +1609,7 @@ run_once test_model_long
 export STUB_OPENCODE_MODE=fix
 fail_step_check "a model whose error is a page long" model 'a long provider error' '[true, true, false, false, false, false, true]'
 if jq -e '(.test.steps[2].detail | length) == 300' <<<"$report" >/dev/null; then echo "ok   the sentence is cut at exactly 300 characters"; else echo "FAIL detail length: $(jq -r '.test.steps[2].detail | length' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps[2].detail | test("^opencode exited 1: ")' <<<"$report" >/dev/null; then echo "ok   an error that is not a refusal still names the exit status"; else echo "FAIL steps: $(jq -c '.test.steps[2]' <<<"$report")"; fail=1; fi
 stop_fixture
 
 start_fixture test_model_error
@@ -1616,7 +1617,7 @@ queue_test_job h-test-model-error acme/app
 export STUB_OPENCODE_MODE=provider_error
 run_once test_model_error
 fail_step_check "a model whose key is refused" model 'User not found\.' '[true, true, false, false, false, false, true]'
-if jq -e '.test.steps[2].detail | test("exited 1")' <<<"$report" >/dev/null; then echo "ok   the model step names the exit status too"; else echo "FAIL steps: $(jq -c '.test.steps[2]' <<<"$report")"; fail=1; fi
+if jq -e '.test.steps[2].detail == "refused (auth): User not found."' <<<"$report" >/dev/null; then echo "ok   a refused key is named as a refusal with its class, in the provider's words"; else echo "FAIL steps: $(jq -c '.test.steps[2]' <<<"$report")"; fail=1; fi
 if ! jq -r '.test.steps[].detail' <<<"$report" | grep -qF "$api_key"; then echo "ok   no secret is in any detail"; else echo "FAIL a secret is in a detail"; fail=1; fi
 stop_fixture
 
@@ -3424,6 +3425,160 @@ offs="$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == false) | .
 last_report="$(jq -r 'select(.path | endswith("/report")) | .at' "$fixture_log" | sort -n | tail -n 1)"
 off_at="$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == false) | .at' "$fixture_log" | head -n 1)"
 if [ "$rc" -eq 0 ] && [ "$offs" -eq 1 ] && [ -n "$off_at" ] && [ "$off_at" -ge "$last_report" ] && [ "$(jq -r 'select(.method == "PUT" and .body.ProtectionEnabled == true) | .at' "$fixture_log" | grep -c '')" -ge 2 ]; then echo "ok   both workers turned it on, and it was turned off once, after the last report"; else echo "FAIL rc=$rc offs=$offs off_at=$off_at last_report=$last_report sequence: $(sequence)"; fail=1; fi
+stop_fixture
+
+echo "--- 130. a refusal is reported as provider_refused to a platform that lists it ---"
+refused_kinds='{"failure_kinds":["provider_refused"]}'
+credit_words='Your credit balance is too low to access the Anthropic API.'
+start_fixture refused
+queue_one h-refused acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused
+export STUB_OPENCODE_MODE=fix
+if jq -e --arg m "$model" --arg w "$credit_words" '.failure.kind == "provider_refused" and .failure.provider == {class: "billing", status: 400, model: $m, message: $w}' <<<"$report" >/dev/null; then echo "ok   a refusal is reported as provider_refused with its class, status, model and words"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+if jq -e '.failure.detail | test("^opencode exited 1: Your credit balance")' <<<"$report" >/dev/null; then echo "ok   the detail is the one every release sent"; else echo "FAIL detail: $(jq -c '.failure.detail' <<<"$report")"; fail=1; fi
+if jq -e --arg m "$model" '.evidence.models == [{model: $m, outcome: "refused", class: "billing"}] and .evidence.model == $m' <<<"$report" >/dev/null; then echo "ok   the evidence says which model was refused, and keeps evidence.model"; else echo "FAIL evidence: $(jq -c '.evidence' <<<"$report")"; fail=1; fi
+if [ "$(count_path /report)" = "1" ] && jq -e 'has("pr_url") | not' <<<"$report" >/dev/null; then echo "ok   one report, and no pull request"; else echo "FAIL reports: $(count_path /report)"; fail=1; fi
+stop_fixture
+
+echo "--- 131. without failure_kinds it is agent_exit with the provider block ---"
+start_fixture refused_old
+queue_one h-refused-old acme/app
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_old
+export STUB_OPENCODE_MODE=fix
+if jq -e --arg m "$model" --arg w "$credit_words" '.failure.kind == "agent_exit" and .failure.provider == {class: "billing", status: 400, model: $m, message: $w} and (.failure.detail | test("^opencode exited 1: "))' <<<"$report" >/dev/null; then echo "ok   a job that names no failure_kinds gets agent_exit, with the block a newer platform reads"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+if jq -e --arg m "$model" '.evidence.models == [{model: $m, outcome: "refused", class: "billing"}]' <<<"$report" >/dev/null; then echo "ok   the evidence names the refusal there too"; else echo "FAIL evidence: $(jq -c '.evidence.models' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture refused_other_kinds
+queue_one h-refused-other acme/app "" '{"failure_kinds":["something_else"]}'
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_other_kinds
+export STUB_OPENCODE_MODE=fix
+if jq -e '.failure.kind == "agent_exit" and .failure.provider.class == "billing"' <<<"$report" >/dev/null; then echo "ok   a list that does not name provider_refused gets agent_exit"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture refused_bad_kinds
+queue_one h-refused-bad acme/app "" '{"failure_kinds":"provider_refused"}'
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_bad_kinds
+export STUB_OPENCODE_MODE=fix
+if jq -e '.failure.kind == "agent_exit"' <<<"$report" >/dev/null; then echo "ok   a failure_kinds that is not a list names nothing"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 132. each class, and a run that got past its refusal ---"
+refusal_case() {
+  local label="$1" mode="$2" klass="$3" status="$4"
+  start_fixture "$label"
+  queue_one "h-$label" acme/app "" "$refused_kinds"
+  export STUB_OPENCODE_MODE="$mode"
+  run_once "$label"
+  export STUB_OPENCODE_MODE=fix
+  if jq -e --arg c "$klass" --argjson s "$status" '.failure.kind == "provider_refused" and .failure.provider.class == $c and .failure.provider.status == $s' <<<"$report" >/dev/null; then echo "ok   $label: $klass ($status)"; else echo "FAIL $label: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+  stop_fixture
+}
+refusal_case refused_quota provider_quota quota 429
+refusal_case refused_rate provider_rate rate_limit 429
+refusal_case refused_model provider_model model_not_found 404
+refusal_case refused_auth provider_error auth null
+start_fixture refused_then_other
+queue_one h-refused-then-other acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_then_other
+run_once refused_then_other
+export STUB_OPENCODE_MODE=fix
+if jq -e '.failure.kind == "agent_exit" and (.failure | has("provider") | not) and .evidence.models[0].outcome == "ran" and (.evidence.models[0] | has("class") | not)' <<<"$report" >/dev/null; then echo "ok   a 402 followed by a 500 is not a refusal: agent_exit, no block, the model ran"; else echo "FAIL failure: $(jq -c '[.failure, .evidence.models]' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 133. a 422 to provider_refused is resent once as agent_exit, and no other 422 is ---"
+reports_in() { jq -c 'select(.path | endswith("/report")) | .body' "$work/$1.requests.jsonl"; }
+export FIXTURE_REPORT_STATUSES=422,201
+start_fixture refused_422
+queue_one h-refused-422 acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_422
+export STUB_OPENCODE_MODE=fix
+unset FIXTURE_REPORT_STATUSES
+if [ "$(reports_in refused_422 | grep -c '')" = "2" ] && [ "$(reports_in refused_422 | sed -n 1p | jq -r '.failure.kind')" = "provider_refused" ] && [ "$(reports_in refused_422 | sed -n 2p | jq -r '.failure.kind')" = "agent_exit" ]; then echo "ok   a 422 to provider_refused is answered by one resend as agent_exit"; else echo "FAIL reports: $(reports_in refused_422 | jq -c '.failure.kind')"; fail=1; fi
+if [ "$(reports_in refused_422 | sed -n 1p | jq -S 'del(.failure.kind)')" = "$(reports_in refused_422 | sed -n 2p | jq -S 'del(.failure.kind)')" ]; then echo "ok   the resend differs from the first report in the kind alone, the block included"; else echo "FAIL the resend changed more than the kind"; fail=1; fi
+if [ "$(grep -c "the platform did not accept provider_refused for handoff h-refused-422; sent it as agent_exit" "$out")" = "1" ]; then echo "ok   one warning names the handoff"; else echo "FAIL warnings: $(grep -c 'did not accept' "$out")"; fail=1; fi
+stop_fixture
+export FIXTURE_REPORT_STATUSES=422
+start_fixture timeout_422
+queue_one h-timeout-422 acme/app
+export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120
+run_timeout=1
+run_once timeout_422
+run_timeout=60
+unset STUB_OPENCODE_SLEEP FIXTURE_REPORT_STATUSES
+export STUB_OPENCODE_MODE=fix
+if [ "$(reports_in timeout_422 | grep -c '')" = "1" ] && [ "$(reports_in timeout_422 | jq -r '.failure.kind')" = "timeout" ]; then echo "ok   a 422 to any other kind is not resent"; else echo "FAIL reports: $(reports_in timeout_422 | jq -c '.failure.kind')"; fail=1; fi
+stop_fixture
+export FIXTURE_REPORT_STATUSES=422
+start_fixture agent_422
+queue_one h-agent-422 acme/app
+export STUB_OPENCODE_MODE=provider_billing
+run_once agent_422
+export STUB_OPENCODE_MODE=fix
+unset FIXTURE_REPORT_STATUSES
+if [ "$(reports_in agent_422 | grep -c '')" = "1" ] && [ "$(reports_in agent_422 | jq -r '.failure.kind')" = "agent_exit" ]; then echo "ok   a 422 to an agent_exit is not resent"; else echo "FAIL reports: $(reports_in agent_422 | jq -c '.failure.kind')"; fail=1; fi
+stop_fixture
+export FIXTURE_REPORT_STATUSES=422,422
+start_fixture refused_422_twice
+queue_one h-refused-422-twice acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_422_twice
+export STUB_OPENCODE_MODE=fix
+unset FIXTURE_REPORT_STATUSES
+if [ "$(reports_in refused_422_twice | grep -c '')" = "2" ] && [ "$rc" -eq 0 ]; then echo "ok   a second 422 ends it: exactly two reports, no loop"; else echo "FAIL reports: $(reports_in refused_422_twice | grep -c '') rc=$rc"; fail=1; fi
+stop_fixture
+
+echo "--- 134. a run that answered carries models with outcome ran ---"
+start_fixture models_ran
+queue_one h-models-ran acme/app "" "$refused_kinds"
+run_once models_ran
+if jq -e --arg m "$model" '.evidence.models == [{model: $m, outcome: "ran"}] and (has("failure") | not)' <<<"$report" >/dev/null; then echo "ok   a run that finished says its model ran"; else echo "FAIL evidence: $(jq -c '.evidence' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture models_timeout
+queue_one h-models-timeout acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=hang STUB_OPENCODE_SLEEP=120
+run_timeout=1
+run_once models_timeout
+run_timeout=60
+unset STUB_OPENCODE_SLEEP
+export STUB_OPENCODE_MODE=fix
+if jq -e --arg m "$model" '.failure.kind == "timeout" and .evidence.models == [{model: $m, outcome: "ran"}]' <<<"$report" >/dev/null; then echo "ok   a run the runner stopped is not a refusal, and says its model ran"; else echo "FAIL report: $(jq -c '[.failure, .evidence.models]' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 135. the test job's model step names a refusal ---"
+start_fixture refused_test
+queue_test_job h-refused-test ""
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_test
+export STUB_OPENCODE_MODE=fix
+if jq -e --arg w "refused (billing): $credit_words" '(.test.steps[] | select(.name == "model") | .detail) == $w and (.test.steps[] | select(.name == "model") | .ok) == false' <<<"$report" >/dev/null; then echo "ok   the model step says refused, with the class and the provider's words"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+if jq -e --arg m "$model" '.evidence.models == [{model: $m, outcome: "refused", class: "billing"}]' <<<"$report" >/dev/null; then echo "ok   the test job's evidence names the refusal"; else echo "FAIL evidence: $(jq -c '.evidence' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture refused_test_other
+queue_test_job h-refused-test-other ""
+export STUB_OPENCODE_MODE=provider_then_other
+run_once refused_test_other
+export STUB_OPENCODE_MODE=fix
+if jq -e '(.test.steps[] | select(.name == "model") | .detail) | test("^opencode exited 1: ")' <<<"$report" >/dev/null; then echo "ok   a test job that is not a refusal keeps its sentence"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 136. the provider's words are scrubbed of the runner's keys and of every key shape, and never logged by the runner ---"
+refusal_key="$(printf 'sk-or-v1-%064d' 6)"
+split_key="$(printf 'sk-ant-api03-%040d' 7)"
+export OPENROUTER_API_KEY="$refusal_key" STUB_PROVIDER_MESSAGE="Your credit balance is too low for key $refusal_key sent with $split_key.
+and a final line"
+start_fixture refused_secret
+queue_one h-refused-secret acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_secret
+export STUB_OPENCODE_MODE=fix
+unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE
+if jq -e '.failure.provider.message == "Your credit balance is too low for key [redacted] sent with [redacted]. and a final line"' <<<"$report" >/dev/null; then echo "ok   a held key and a key shape are masked, and the message is one line"; else echo "FAIL message: $(jq -c '.failure.provider.message' <<<"$report")"; fail=1; fi
+if ! grep -qF "$refusal_key" "$work/refused_secret.requests.jsonl" "$out" && ! jq -c '.failure.provider' <<<"$report" | grep -qF "$split_key"; then echo "ok   the held key is in no report and no line the runner wrote, and the key shape is not in the provider block"; else echo "FAIL a key was reported or logged"; fail=1; fi
+if ! grep -q 'and a final line' "$out"; then echo "ok   the runner logs none of the provider's words itself"; else echo "FAIL the provider's words were logged: $(grep 'and a final line' "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

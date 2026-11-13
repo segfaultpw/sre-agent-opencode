@@ -64,6 +64,11 @@ const HEARTBEAT_NOT_FOUND_LIMIT = 2;
 const HEARTBEAT_RETRY_DIVISOR = 5;
 // What the platform keeps of a report's failure detail, in bytes.
 const FAILURE_DETAIL_MAX_BYTES = 500;
+// The platform drops a provider block whose model is longer than this.
+const PROVIDER_MODEL_MAX_BYTES = 200;
+// The failure kind a platform that reads it asks to be sent (the job's
+// failure_kinds), and the one a platform that does not gets instead.
+const PROVIDER_REFUSED = 'provider_refused';
 // What this runner can do beyond a fix request, named to the platform in every
 // poll. A job kind is offered only to a runner that declares it, so a platform
 // release that adds one is inert against the runners that predate it.
@@ -3632,6 +3637,8 @@ async function runAgent(config, workspace, prompt, options = {}) {
 
   const texts = [];
   const errors = [];
+  // What the classifier reads: the last error events of the run, structured.
+  const errorEvents = [];
   for (const line of result.stdout.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('{')) continue;
@@ -3648,6 +3655,7 @@ async function runAgent(config, workspace, prompt, options = {}) {
     if (event.type === 'error') {
       const detail = (event.error && ((event.error.data && event.error.data.message) || event.error.name)) || 'unknown';
       errors.push(String(detail));
+      providerRefusal.remember(errorEvents, event);
     }
   }
 
@@ -3658,8 +3666,38 @@ async function runAgent(config, workspace, prompt, options = {}) {
     abandoned: Boolean(result.abandoned),
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
+    errorEvents,
     stderr: result.stderr,
     opencodeLogLines,
+  };
+}
+
+// Whether the run ended because the AI provider refused the request, and how:
+// {class, status, message} or null (see runner/provider_refusal.js). A run the
+// runner itself stopped is never one.
+function providerRefusalOf(agent) {
+  return providerRefusal.classify(
+    agent.errorEvents,
+    { exitCode: agent.code, stopped: Boolean(agent.timedOut || agent.aborted || agent.abandoned) },
+    { redact, secrets: heldSecrets() }
+  );
+}
+
+// evidence.models: which model ran and how it ended. One entry in this release;
+// the platform reads its presence as "this runner classifies its own failures".
+function modelsEvidence(config, refusal) {
+  const model = providerRefusal.cutBytes(oneLine(config.model, Infinity), PROVIDER_MODEL_MAX_BYTES);
+  return [refusal ? { model, outcome: 'refused', class: refusal.class } : { model, outcome: 'ran' }];
+}
+
+// The failure's block for the platform: what the provider said, in its own
+// words, scrubbed. The model is the one that was refused.
+function providerBlock(config, refusal) {
+  return {
+    class: refusal.class,
+    status: refusal.status,
+    model: modelsEvidence(config, refusal)[0].model,
+    message: refusal.message,
   };
 }
 
@@ -4666,17 +4704,26 @@ function withinBytes(text, max) {
 // a finally: a crash between the run and the report leaves the platform
 // waiting 45 minutes for its sweep to fail the row.
 async function report(job, result) {
-  const body = JSON.stringify({
-    outcome: result.outcome,
-    summary: result.summary,
-    actions: result.actions,
-    evidence: result.evidence,
-    ...(result.pr_url ? { pr_url: result.pr_url } : {}),
-    ...(result.change ? { change: result.change } : {}),
-    ...(result.failure ? { failure: result.failure } : {}),
-    ...memoryReport(result),
-    ...testReport(result),
-  });
+  // A failure that carries what the AI provider said is told as provider_refused
+  // only to a platform whose job lists the kind. Any other platform gets
+  // agent_exit with the same block, which an older one ignores and a newer one
+  // reads whatever the kind.
+  const wantsRefusal = Array.isArray(job.failure_kinds) && job.failure_kinds.includes(PROVIDER_REFUSED);
+  const bodyFor = (kind) =>
+    JSON.stringify({
+      outcome: result.outcome,
+      summary: result.summary,
+      actions: result.actions,
+      evidence: result.evidence,
+      ...(result.pr_url ? { pr_url: result.pr_url } : {}),
+      ...(result.change ? { change: result.change } : {}),
+      ...(result.failure ? { failure: kind && result.failure.provider ? { ...result.failure, kind } : result.failure } : {}),
+      ...memoryReport(result),
+      ...testReport(result),
+    });
+  let sentKind = wantsRefusal && result.failure && result.failure.provider ? PROVIDER_REFUSED : null;
+  let body = bodyFor(sentKind);
+  let resent = false;
 
   for (let attempt = 1; attempt <= REPORT_ATTEMPTS; attempt += 1) {
     let response = null;
@@ -4702,6 +4749,18 @@ async function report(job, result) {
     if (response && response.status === 409) {
       log('warn', `a different result already stands for handoff ${job.handoff_id}; this one was not recorded`);
       return;
+    }
+    // A rolling deploy can answer the poll from a task that reads the kind and
+    // the report from one that does not, which refuses an unknown kind with a
+    // 422. Once, and only for that kind: everything else about the report is
+    // unchanged.
+    if (response && response.status === 422 && sentKind === PROVIDER_REFUSED && !resent) {
+      log('warn', `the platform did not accept ${PROVIDER_REFUSED} for handoff ${job.handoff_id}; sent it as agent_exit`);
+      resent = true;
+      sentKind = 'agent_exit';
+      body = bodyFor(sentKind);
+      attempt -= 1;
+      continue;
     }
     if (response && response.status >= 400 && response.status < 500) {
       log('error', `the report for handoff ${job.handoff_id} was refused with HTTP ${response.status}`);
@@ -4765,8 +4824,8 @@ function newResult(config) {
 // the platform queues a job of the ordinary shape with `"test": true`, a null
 // repo_full_name and the repository to clone in test_repo_full_name (null:
 // scratch). Nothing in it is a fix request: no pull request is opened and
-// nothing is pushed. The report carries six steps, in the order collected,
-// cloned, model, memory, bucket, reported, so a person can see that collection,
+// nothing is pushed. The report carries seven steps, in the order collected,
+// cloned, model, memory, bucket, pull_request, reported, so a person can see that collection,
 // the clone, the model, the memory directory and the bucket all work from this
 // machine. The first step that fails is reported with its sentence and every
 // step after it as not run; `reported` is always ok, because the report
@@ -4830,6 +4889,8 @@ function modelVerdict(agent, timeoutMs) {
     return { ok: false, detail: `the model did not answer within ${seconds} second${seconds === 1 ? '' : 's'}${stray}` };
   }
   if (agent.code !== 0) {
+    const refusal = providerRefusalOf(agent);
+    if (refusal) return { ok: false, detail: `refused (${refusal.class}): ${refusal.message || 'the provider gave no words'}`, refusal };
     const why = agent.errors.join('; ') || oneLine(agent.stderr || '', 160) || 'no error was printed';
     // A null code means the process never ran (spawn failed) or a signal ended it.
     const how = agent.code === null || agent.code === undefined ? 'could not be started or was stopped' : `exited ${agent.code}`;
@@ -4934,6 +4995,7 @@ async function runTestJob(config, job, heartbeat) {
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
+      result.evidence.models = modelsEvidence(config, null);
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
       if (!quiet) {
@@ -4941,6 +5003,7 @@ async function runTestJob(config, job, heartbeat) {
         return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
       }
       const verdict = modelVerdict(agent, timeoutMs);
+      if (verdict.refusal) result.evidence.models = modelsEvidence(config, verdict.refusal);
       if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       return verdict;
     });
@@ -5191,6 +5254,7 @@ async function handleJob(config, job, options = {}) {
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
     if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors.map(redact);
+    result.evidence.models = modelsEvidence(config, null);
 
     if (!agentProcessesEnded) {
       // A process of the agent's account outlived every attempt to end it. It
@@ -5251,6 +5315,14 @@ async function handleJob(config, job, options = {}) {
       const how = agent.code === null || agent.code === undefined ? 'opencode could not be started or was stopped by a signal' : `opencode exited ${agent.code}`;
       const why = agent.errors.length > 0 ? agent.errors.join('; ') : redact(agent.stderr).trim().slice(-300);
       recordFailure(result, 'agent_exit', why ? `${how}: ${why}` : how);
+      // Told as a refusal only to a platform that reads the kind (report());
+      // the block goes to every platform, and an older one ignores it.
+      const refusal = providerRefusalOf(agent);
+      if (refusal) {
+        result.failure.provider = providerBlock(config, refusal);
+        result.evidence.models = modelsEvidence(config, refusal);
+        log('warn', `handoff ${job.handoff_id}: the AI provider refused the request (${refusal.class}${refusal.status ? `, HTTP ${refusal.status}` : ''})`);
+      }
       return result;
     }
     if (isDecline(agent.finalMessage)) {

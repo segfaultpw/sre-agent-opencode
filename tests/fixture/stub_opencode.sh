@@ -448,6 +448,33 @@ d.yml"
     echo "opencode: the provider refused the key" >&2
     exit 1
     ;;
+  provider_billing)
+    # What an account with no credit looks like to opencode: an APIError event
+    # (HTTP 400, Anthropic's sentence) and a non-zero exit. STUB_PROVIDER_MESSAGE
+    # replaces the words, for the cases that put a secret in them.
+    jq -cn --arg m "${STUB_PROVIDER_MESSAGE:-Your credit balance is too low to access the Anthropic API.}" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: $m, statusCode: 400, isRetryable: false, responseBody: ({type: "error", error: {type: "invalid_request_error", message: $m}} | tojson)}}}'
+    echo "opencode: the provider refused the request" >&2
+    exit 1
+    ;;
+  provider_quota)
+    jq -cn --arg b '{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","param":null,"code":"insufficient_quota"}}' '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: "Too many requests", statusCode: 429, isRetryable: false, responseBody: $b}}}'
+    exit 1
+    ;;
+  provider_rate)
+    jq -cn '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: "Rate limit reached for requests", statusCode: 429, isRetryable: true}}}'
+    exit 1
+    ;;
+  provider_model)
+    jq -cn --arg b '{"type":"error","error":{"type":"not_found_error","message":"model: nope"}}' '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: "model: nope", statusCode: 404, isRetryable: false, responseBody: $b}}}'
+    exit 1
+    ;;
+  provider_then_other)
+    # A refusal the run got past: the last error is a server error, which is
+    # not a refusal.
+    jq -cn '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: "Insufficient credits", statusCode: 402, isRetryable: false}}}'
+    jq -cn '{type: "error", timestamp: 1, sessionID: "stub", error: {name: "APIError", data: {message: "Internal server error", statusCode: 500, isRetryable: true}}}'
+    exit 1
+    ;;
   provider_error_long)
     # The same ending with an error message far longer than a test step's
     # sentence may be: the runner must cut it, not forward a page of it.
