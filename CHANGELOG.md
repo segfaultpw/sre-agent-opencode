@@ -2,6 +2,22 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.6.0
+
+The runner tells SRE Agent when your AI provider refused a request, in the provider's own words, and says which model ran.
+
+What an operator gets. When opencode exits non-zero and the last error it printed is the provider refusing the request, the report says so instead of a bare `agent_exit`: the class of the refusal, the HTTP status, the model, and the provider's message with every secret taken out. SRE Agent shows those words on the card, in the Control Tower and in the queue view, and does not retry a refused request on another machine of the same runner, since a second try meets the same refusal. A run that is not clearly a refusal is reported exactly as before, as `agent_exit`: a 5xx, an overload, a network fault, a context overflow, a content filter, a refusal the run got past (the last error decides), a run the runner stopped, and a run that exited 0.
+
+- The five classes, read from the last JSON error event of the run only (never from stderr): `auth` (a `ProviderAuthError`, HTTP 401 or 403), `billing` (HTTP 402, or HTTP 400 with the provider's credit or billing sentence), `quota` (HTTP 429 with the provider's quota sentence or code, such as `insufficient_quota`), `rate_limit` (any other HTTP 429) and `model_not_found` (HTTP 404, or HTTP 400 with `not_found_error`, `model_not_found`, `unknown model`, `model not found` or a model that does not exist).
+- The message is scrubbed twice: the secrets this runner holds are removed by value (the poll key, the GitHub credentials and every provider key variable), then every credential shape (provider keys, cloud access key ids, bearer and basic credentials, JWTs, a secret in a URL, a header or a JSON field, any unbroken run of 48 or more key characters) is masked, escape sequences and invisible characters are removed, and the rest is cut to one line of at most 500 bytes on a character. The runner logs none of it; its log forwarding of opencode's own structured log is unchanged.
+- The report's `failure` gains `provider: {class, status, model, message}`, and `evidence` gains `models`, a list with one entry, `{model, outcome: "ran"}` or `{model, outcome: "refused", class}`. Every fix request, change and test job report carries `evidence.models`. `failure.detail` is the text it has always been.
+- Negotiation. A newer platform lists the kinds it reads in `failure_kinds` on every job it hands out. The runner sends `failure.kind: "provider_refused"` only when the job lists it; otherwise it sends `agent_exit` with the same `detail` and the same `provider` block, which an older platform ignores and a newer one reads. If a platform answers a report of kind `provider_refused` with HTTP 422 (a rolling deploy can hand out the job from a task that reads the kind and take the report on one that does not), the runner sends the same report once more as `agent_exit` and logs one warning. No other 422 is retried.
+- The test job's `model` step says `refused (<class>): <the provider's words>` when the configured key or account is refused, so the test is the quickest way to check a key.
+
+Corrected: a code comment said the test job has six steps (it has seven), and the README said that a model with a provider prefix the runner does not map refuses the start. It does not: the runner starts and passes the model to opencode, and no key is trimmed or redacted for that prefix, so set the provider's key variable yourself and prefer a mapped provider.
+
+What a customer must change on upgrade: nothing. The wire contract only grows (one job key the runner reads, one optional block in the failure, one evidence entry), and a platform older than the SRE Agent release that reads `provider_refused` ignores the block and shows `agent_exit` as it always did.
+
 ## v2.5.1
 
 The runner stops when the queue refuses its instance name, instead of retrying for ever.
