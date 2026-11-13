@@ -24,6 +24,7 @@ const { ciPaths } = require('./ci_config.js');
 const memory = require('./memory.js');
 const bucket = require('./bucket.js');
 const githubApp = require('./github_app.js');
+const providerRefusal = require('./provider_refusal.js');
 
 const PACKAGE_ROOT = path.resolve(__dirname, '..');
 
@@ -317,6 +318,13 @@ function redact(text) {
   if (jobSecret) out = out.split(jobSecret).join('[redacted]');
   for (const secret of requestSecrets) out = out.split(secret).join('[redacted]');
   return out;
+}
+
+// The values redact() removes, for the one reader that has to see through a
+// line break (the provider refusal scrubber), which needs the values and not
+// the function.
+function heldSecrets() {
+  return [...constantSecrets, ...rotatingSecrets, jobSecret, ...requestSecrets].filter((secret) => typeof secret === 'string' && secret !== '');
 }
 
 let logLevel = LEVELS.info;
@@ -5717,6 +5725,7 @@ module.exports = {
     prepareRequestEnv,
     assumeAgentRole,
     redact,
+    heldSecrets,
     rememberRequestSecrets,
     clearRequestSecrets,
     setIdentity: (value) => {

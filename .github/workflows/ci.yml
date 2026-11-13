@@ -44,6 +44,8 @@ jobs:
       - run: node --check runner/conventional_title.js
       - run: node --check runner/ci_config.js
       - run: node tests/ci_config_test.js
+      - run: node --check runner/provider_refusal.js
+      - run: node tests/provider_refusal_test.js
       - run: node --check runner/memory.js
       - run: node --check runner/bucket.js
       - run: node --check runner/github_app.js
@@ -165,6 +167,7 @@ jobs:
             node --check /opt/sre-agent-opencode/runner/runner.js
             node --check /opt/sre-agent-opencode/runner/conventional_title.js
             node --check /opt/sre-agent-opencode/runner/ci_config.js
+            node --check /opt/sre-agent-opencode/runner/provider_refusal.js
             node --check /opt/sre-agent-opencode/runner/memory.js
             node --check /opt/sre-agent-opencode/runner/bucket.js
             node --check /opt/sre-agent-opencode/runner/github_app.js

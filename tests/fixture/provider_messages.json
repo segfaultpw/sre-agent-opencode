@@ -1,0 +1,519 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "anthropic credit",
+      "input": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.",
+      "secrets": [],
+      "output": "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits."
+    },
+    {
+      "name": "a known secret",
+      "input": "Invalid API key: KEY{{repeat:9:12}}",
+      "secrets": [
+        "KEY{{repeat:9:12}}"
+      ],
+      "output": "Invalid API key: [redacted]"
+    },
+    {
+      "name": "a known secret twice",
+      "input": "{{repeat:Q:12}} was refused, retry with {{repeat:Q:12}}?",
+      "secrets": [
+        "{{repeat:Q:12}}"
+      ],
+      "output": "[redacted] was refused, retry with [redacted]?"
+    },
+    {
+      "name": "an anthropic key shape",
+      "input": "key sk-ant-api03-{{repeat:A:40}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "an openai key shape",
+      "input": "Incorrect API key provided: sk-proj-{{repeat:a:30}}. You can find your API key at the provider.",
+      "secrets": [],
+      "output": "Incorrect API key provided: [redacted]. You can find your API key at the provider."
+    },
+    {
+      "name": "an access key id",
+      "input": "AWS key AKIA{{repeat:B:16}} denied",
+      "secrets": [],
+      "output": "AWS key [redacted] denied"
+    },
+    {
+      "name": "a temporary access key id",
+      "input": "session ASIA{{repeat:C:16}} expired",
+      "secrets": [],
+      "output": "session [redacted] expired"
+    },
+    {
+      "name": "a google key",
+      "input": "API key AIza{{repeat:D:35}} not valid",
+      "secrets": [],
+      "output": "API key [redacted] not valid"
+    },
+    {
+      "name": "a github token",
+      "input": "token ghp_{{repeat:e:36}} bad",
+      "secrets": [],
+      "output": "token [redacted] bad"
+    },
+    {
+      "name": "a github fine grained token",
+      "input": "token github_pat_{{repeat:f:30}} bad",
+      "secrets": [],
+      "output": "token [redacted] bad"
+    },
+    {
+      "name": "a slack token",
+      "input": "bot xoxb-{{repeat:1:12}}-abc revoked",
+      "secrets": [],
+      "output": "bot [redacted] revoked"
+    },
+    {
+      "name": "a bearer word",
+      "input": "sent Bearer abc.def",
+      "secrets": [],
+      "output": "sent Bearer [redacted]"
+    },
+    {
+      "name": "a lower case bearer word",
+      "input": "authorization: bearer abc.def refused",
+      "secrets": [],
+      "output": "authorization: Bearer [redacted] refused"
+    },
+    {
+      "name": "a generic bearer key in a sentence",
+      "input": "Authorization: Bearer {{repeat:z:60}} was refused",
+      "secrets": [],
+      "output": "Authorization: Bearer [redacted] was refused"
+    },
+    {
+      "name": "a jwt",
+      "input": "token eyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} expired",
+      "secrets": [],
+      "output": "token [redacted] expired"
+    },
+    {
+      "name": "a long run",
+      "input": "gw {{repeat:x:48}}",
+      "secrets": [],
+      "output": "gw [redacted]"
+    },
+    {
+      "name": "a run one short of the limit is kept",
+      "input": "gw {{repeat:x:47}} ok",
+      "secrets": [],
+      "output": "gw {{repeat:x:47}} ok"
+    },
+    {
+      "name": "a key split by a line break",
+      "input": "key sk-ant-api03-{{repeat:A:30}}\n{{repeat:B:30}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a long key split by a line break",
+      "input": "gw {{repeat:a:30}}\r\n    {{repeat:b:30}} end",
+      "secrets": [],
+      "output": "gw [redacted] end"
+    },
+    {
+      "name": "a url with a query token",
+      "input": "GET https://api.example.com/v1/models?access_token={{repeat:t:20}}&x=1 failed",
+      "secrets": [],
+      "output": "GET https://api.example.com/v1/models?access_token=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a url with an api key in the query",
+      "input": "https://gw.example.com/chat?model=m&api_key=abc123&stream=true",
+      "secrets": [],
+      "output": "https://gw.example.com/chat?model=m&api_key=[redacted]&stream=true"
+    },
+    {
+      "name": "a url with a user and a password",
+      "input": "proxy https://user:hunter2@proxy.example.com:8080/path failed",
+      "secrets": [],
+      "output": "proxy https://[redacted]@proxy.example.com:8080/path failed"
+    },
+    {
+      "name": "a url with no secret is kept",
+      "input": "see https://docs.example.com/errors?page=2&limit=10 for details",
+      "secrets": [],
+      "output": "see https://docs.example.com/errors?page=2&limit=10 for details"
+    },
+    {
+      "name": "base64 that is not a key",
+      "input": "payload aGVsbG8gd29ybGQ= ok",
+      "secrets": [],
+      "output": "payload aGVsbG8gd29ybGQ= ok"
+    },
+    {
+      "name": "a commit sha is kept",
+      "input": "commit 0123456789abcdef0123456789abcdef01234567 not found",
+      "secrets": [],
+      "output": "commit 0123456789abcdef0123456789abcdef01234567 not found"
+    },
+    {
+      "name": "a uuid is kept",
+      "input": "request 123e4567-e89b-12d3-a456-426614174000 failed",
+      "secrets": [],
+      "output": "request 123e4567-e89b-12d3-a456-426614174000 failed"
+    },
+    {
+      "name": "a request id is kept",
+      "input": "request_id req_011CUa1b2c3d4e5f6g7h8i9j0k",
+      "secrets": [],
+      "output": "request_id req_011CUa1b2c3d4e5f6g7h8i9j0k"
+    },
+    {
+      "name": "control characters and lines",
+      "input": "a\u0007b\nc\r\nd",
+      "secrets": [],
+      "output": "a b c d"
+    },
+    {
+      "name": "whitespace runs",
+      "input": "a   b\t\tc",
+      "secrets": [],
+      "output": "a b c"
+    },
+    {
+      "name": "ansi escapes",
+      "input": "\u001b[31mError\u001b[0m: bad key",
+      "secrets": [],
+      "output": "Error: bad key"
+    },
+    {
+      "name": "bidirectional marks are removed",
+      "input": "pay\u202eload\u202c ok",
+      "secrets": [],
+      "output": "payload ok"
+    },
+    {
+      "name": "a zero width character inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\u200b{{repeat:A:10}}",
+      "secrets": [],
+      "output": "[redacted]"
+    },
+    {
+      "name": "cut at 500 bytes",
+      "input": "{{repeat:\u00e9:400}}",
+      "secrets": [],
+      "output": "{{repeat:\u00e9:250}}"
+    },
+    {
+      "name": "markup is kept as text",
+      "input": "<!here> [x](https://e) *b* `c`",
+      "secrets": [],
+      "output": "<!here> [x](https://e) *b* `c`"
+    },
+    {
+      "name": "text in another language is kept",
+      "input": "Su saldo de cr\u00e9dito es demasiado bajo",
+      "secrets": [],
+      "output": "Su saldo de cr\u00e9dito es demasiado bajo"
+    },
+    {
+      "name": "an access key id after a line break",
+      "input": "Request from\nAKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "Request from [redacted] failed"
+    },
+    {
+      "name": "a jwt after a line break",
+      "input": "error at line\nabc\neyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} done",
+      "secrets": [],
+      "output": "error at line abc [redacted] done"
+    },
+    {
+      "name": "a bearer word and its token on two lines",
+      "input": "Authorization: Bearer\nabc123def456",
+      "secrets": [],
+      "output": "Authorization: Bearer [redacted]"
+    },
+    {
+      "name": "a github token after a line break",
+      "input": "user\nghp_{{repeat:a:30}} x",
+      "secrets": [],
+      "output": "user [redacted] x"
+    },
+    {
+      "name": "a bearer token split by a line break",
+      "input": "Bearer abc123\ndef456 end",
+      "secrets": [],
+      "output": "Bearer [redacted] end"
+    },
+    {
+      "name": "a bearer word split by a line break",
+      "input": "Bea\nrer abc123def456 end",
+      "secrets": [],
+      "output": "Bearer [redacted] end"
+    },
+    {
+      "name": "a known key split by a line break",
+      "input": "key KEY1234\n5678 rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a known key split by a tab",
+      "input": "key KEY1234\t5678 rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a known key split by a nul",
+      "input": "key KEY1234\u00005678 rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a known key split by a line break and indentation",
+      "input": "key KEY1234\r\n    5678 rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a short known secret is ignored",
+      "input": "x and ollama and none",
+      "secrets": [
+        "x",
+        "ollama",
+        "none"
+      ],
+      "output": "x and ollama and none"
+    },
+    {
+      "name": "a key split by a line break after its prefix",
+      "input": "key sk-ant-\n{{repeat:A:40}} end",
+      "secrets": [],
+      "output": "key [redacted] end"
+    },
+    {
+      "name": "a key split by two line breaks after a word",
+      "input": "gw\nAKIA{{repeat:B:8}}\n{{repeat:B:8}} end",
+      "secrets": [],
+      "output": "gw [redacted] end"
+    },
+    {
+      "name": "a long key wrapped over three lines",
+      "input": "gw {{repeat:a:20}}\n{{repeat:b:20}}\n{{repeat:c:20}} end",
+      "secrets": [],
+      "output": "gw [redacted] end"
+    },
+    {
+      "name": "a query secret split by a line break",
+      "input": "GET /v1?token={{repeat:t:10}}\n{{repeat:u:10}}&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1?token=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a url password split by a line break",
+      "input": "proxy https://user:hunt\ner2@proxy.example.com failed",
+      "secrets": [],
+      "output": "proxy https://[redacted]@proxy.example.com failed"
+    },
+    {
+      "name": "an osc sequence is removed",
+      "input": "\u001b]0;secret title\u0007plain text",
+      "secrets": [],
+      "output": "plain text"
+    },
+    {
+      "name": "an osc hyperlink with a string terminator is removed",
+      "input": "\u001b]8;;https://e.example\u001b\\link\u001b]8;;\u001b\\ ok",
+      "secrets": [],
+      "output": "link ok"
+    },
+    {
+      "name": "other escape sequences are removed",
+      "input": "\u001b(Bhello\u001b=\u001bM world",
+      "secrets": [],
+      "output": "hello world"
+    },
+    {
+      "name": "an x-api-key header",
+      "input": "x-api-key: {{repeat:a:32}} sent",
+      "secrets": [],
+      "output": "x-api-key: [redacted] sent"
+    },
+    {
+      "name": "an api-key header",
+      "input": "API-Key: {{repeat:b:32}} sent",
+      "secrets": [],
+      "output": "API-Key: [redacted] sent"
+    },
+    {
+      "name": "a google api key header",
+      "input": "x-goog-api-key={{repeat:c:30}} sent",
+      "secrets": [],
+      "output": "x-goog-api-key=[redacted] sent"
+    },
+    {
+      "name": "a json api key",
+      "input": "{\"api_key\": \"{{repeat:d:40}}\", \"model\": \"m\"}",
+      "secrets": [],
+      "output": "{\"api_key\": \"[redacted]\", \"model\": \"m\"}"
+    },
+    {
+      "name": "a json authorization value with a scheme",
+      "input": "{\"Authorization\":\"Basic abc123def456\"}",
+      "secrets": [],
+      "output": "{\"Authorization\":\"Basic [redacted]\"}"
+    },
+    {
+      "name": "an aws secret access key in json",
+      "input": "{\"SecretAccessKey\": \"{{repeat:a:20}}/{{repeat:B:19}}\"}",
+      "secrets": [],
+      "output": "{\"SecretAccessKey\": \"[redacted]\"}"
+    },
+    {
+      "name": "a json field that is not a secret is kept",
+      "input": "{\"type\": \"authentication_error\", \"token_type\": \"bearer_x\"}",
+      "secrets": [],
+      "output": "{\"type\": \"authentication_error\", \"token_type\": \"bearer_x\"}"
+    },
+    {
+      "name": "a basic authorization header",
+      "input": "Authorization: Basic dXNlcjpwYXNzd29yZA== refused",
+      "secrets": [],
+      "output": "Authorization: Basic [redacted] refused"
+    },
+    {
+      "name": "a token authorization header",
+      "input": "Authorization: token {{repeat:d:24}} bad",
+      "secrets": [],
+      "output": "Authorization: token [redacted] bad"
+    },
+    {
+      "name": "an apikey authorization header",
+      "input": "Authorization: ApiKey {{repeat:e:24}} bad",
+      "secrets": [],
+      "output": "Authorization: ApiKey [redacted] bad"
+    },
+    {
+      "name": "an authorization header with no scheme",
+      "input": "Authorization: {{repeat:f:24}} bad",
+      "secrets": [],
+      "output": "Authorization: [redacted] bad"
+    },
+    {
+      "name": "a url fragment token",
+      "input": "redirect https://app.example.com/cb#access_token={{repeat:t:30}}&state=1 end",
+      "secrets": [],
+      "output": "redirect https://app.example.com/cb#access_token=[redacted]&state=1 end"
+    },
+    {
+      "name": "a hugging face token",
+      "input": "token hf_{{repeat:a:34}} bad",
+      "secrets": [],
+      "output": "token [redacted] bad"
+    },
+    {
+      "name": "a replicate token",
+      "input": "model r8_{{repeat:b:37}} bad",
+      "secrets": [],
+      "output": "model [redacted] bad"
+    },
+    {
+      "name": "a fireworks key",
+      "input": "key fw_{{repeat:c:24}} bad",
+      "secrets": [],
+      "output": "key [redacted] bad"
+    },
+    {
+      "name": "a gitlab token",
+      "input": "token glpat-{{repeat:d:20}} bad",
+      "secrets": [],
+      "output": "token [redacted] bad"
+    },
+    {
+      "name": "a stripe style live key",
+      "input": "key sk_live_{{repeat:e:24}} bad",
+      "secrets": [],
+      "output": "key [redacted] bad"
+    },
+    {
+      "name": "an npm token",
+      "input": "token npm_{{repeat:f:36}} bad",
+      "secrets": [],
+      "output": "token [redacted] bad"
+    },
+    {
+      "name": "sk- inside a hyphenated word is kept",
+      "input": "the risk-assessment-of-the-very-long-word stays",
+      "secrets": [],
+      "output": "the risk-assessment-of-the-very-long-word stays"
+    },
+    {
+      "name": "a variation selector inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\ufe0f{{repeat:A:10}}",
+      "secrets": [],
+      "output": "[redacted]"
+    },
+    {
+      "name": "a tag character inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\udb40\udc41{{repeat:A:10}}",
+      "secrets": [],
+      "output": "[redacted]"
+    },
+    {
+      "name": "a combining grapheme joiner inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\u034f{{repeat:A:10}}",
+      "secrets": [],
+      "output": "[redacted]"
+    },
+    {
+      "name": "a mongolian vowel separator inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\u180e{{repeat:A:10}}",
+      "secrets": [],
+      "output": "[redacted]"
+    },
+    {
+      "name": "a line separator inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\u2028{{repeat:A:10}} end",
+      "secrets": [],
+      "output": "[redacted] end"
+    },
+    {
+      "name": "a no-break space before a key",
+      "input": "Request from\u00a0AKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "Request from [redacted] failed"
+    },
+    {
+      "name": "a no-break space after a bearer word",
+      "input": "Authorization:\u00a0Bearer\u00a0abc123def456 x",
+      "secrets": [],
+      "output": "Authorization: Bearer [redacted] x"
+    },
+    {
+      "name": "two short words on two lines stay two words",
+      "input": "foo\nbar",
+      "secrets": [],
+      "output": "foo bar"
+    },
+    {
+      "name": "a header value on the next line",
+      "input": "x-api-key:\n{{repeat:a:32}} sent",
+      "secrets": [],
+      "output": "x-api-key: [redacted] sent"
+    },
+    {
+      "name": "a key after text with no space and a break",
+      "input": "error:\nAKIA{{repeat:B:16}}\nfailed",
+      "secrets": [],
+      "output": "error: [redacted] failed"
+    }
+  ]
+}
