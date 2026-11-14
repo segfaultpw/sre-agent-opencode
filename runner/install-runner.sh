@@ -272,6 +272,12 @@ SRE_MODEL=
 # openrouter/... it is the one below.
 # OPENROUTER_API_KEY=
 
+# Optional. A second model, provider/model, for when the first is refused before
+# anything was changed, and its key. Set both or neither; the key has its own
+# variable, so the second model can be the same provider on another account.
+# SRE_MODEL_FALLBACK=
+# SRE_MODEL_FALLBACK_KEY=
+
 # A token that may push a branch and open a pull request in the repositories
 # this runner is asked to fix. Without one it can still answer a request that
 # names no repository, which is a diagnosis rather than a change.
