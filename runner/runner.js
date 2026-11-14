@@ -3672,6 +3672,32 @@ async function runAgent(config, workspace, prompt, options = {}) {
   };
 }
 
+// What an opencode run that exited non-zero said about it: the provider's own
+// error events, else the tail of what the process printed. It is free text a
+// provider or a gateway wrote, so it goes through the scrubber the refusal's
+// words go through (the secrets the runner holds by value, every credential
+// shape, account identifiers), and only then is it cut: a key shape the runner
+// holds no value of is masked whole, and a cut cannot halve one. Error events
+// are read from their start; what the process printed is read from its end,
+// and `limit` is how many characters of that end are kept.
+const STDERR_READ_CHARS = 8000;
+const STDERR_TAIL_CHARS = 300;
+// Room for the whole of what was read, so the scrubber's own cut (which keeps
+// the start) never takes the end that is wanted.
+const STDERR_WORDS_MAX_BYTES = STDERR_READ_CHARS * 4;
+
+function exitWords(agent, limit = STDERR_TAIL_CHARS) {
+  if (agent.errors.length > 0) return providerRefusal.scrub(agent.errors.join('; '), redact, heldSecrets());
+  const printed = redact(String(agent.stderr || '')).trim();
+  if (printed === '') return '';
+  // The end of a long stream, from the first whole word: a cut that starts
+  // inside a key leaves a piece no mask can know.
+  const tail = printed.length > STDERR_READ_CHARS ? printed.slice(-STDERR_READ_CHARS).replace(/^\S*(?:\s+|$)/u, '') : printed;
+  const words = providerRefusal.scrub(tail, redact, heldSecrets(), STDERR_WORDS_MAX_BYTES);
+  const kept = Array.from(words);
+  return (kept.length > limit ? kept.slice(-limit) : kept).join('').trim();
+}
+
 // Whether the run ended because the AI provider refused the request, and how:
 // {class, status, message} or null (see runner/provider_refusal.js). A run the
 // runner itself stopped is never one.
@@ -4891,7 +4917,7 @@ function modelVerdict(agent, timeoutMs) {
   if (agent.code !== 0) {
     const refusal = providerRefusalOf(agent);
     if (refusal) return { ok: false, detail: `refused (${refusal.class}): ${refusal.message || 'the provider gave no words'}`, refusal };
-    const why = agent.errors.join('; ') || oneLine(agent.stderr || '', 160) || 'no error was printed';
+    const why = exitWords(agent, 160) || 'no error was printed';
     // A null code means the process never ran (spawn failed) or a signal ended it.
     const how = agent.code === null || agent.code === undefined ? 'could not be started or was stopped' : `exited ${agent.code}`;
     return { ok: false, detail: `opencode ${how}: ${why}` };
@@ -5313,7 +5339,7 @@ async function handleJob(config, job, options = {}) {
       // process printed stands in when it sent none. Redacted before the cut:
       // a secret the cut halved is no longer a string redact() can find.
       const how = agent.code === null || agent.code === undefined ? 'opencode could not be started or was stopped by a signal' : `opencode exited ${agent.code}`;
-      const why = agent.errors.length > 0 ? agent.errors.join('; ') : redact(agent.stderr).trim().slice(-300);
+      const why = exitWords(agent);
       recordFailure(result, 'agent_exit', why ? `${how}: ${why}` : how);
       // Told as a refusal only to a platform that reads the kind (report());
       // the block goes to every platform, and an older one ignores it.

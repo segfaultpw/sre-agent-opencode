@@ -2408,7 +2408,7 @@ run_once stderr_secret
 unset STUB_OPENCODE_LEAK
 export STUB_OPENCODE_MODE=fix
 token_tail="${github_token: -20}"
-if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*\\[redacted\\]z+$"))' <<<"$report" >/dev/null && ! grep -qF "$token_tail" "$work/stderr_secret.requests.jsonl"; then echo "ok   a secret the 300 character cut of stderr would halve is redacted whole before the cut"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report" | sed -e "s#$token_tail#[token tail]#g")"; fail=1; fi
+if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*the provider said \\[redacted\\]\\[redacted\\]$"))' <<<"$report" >/dev/null && ! grep -qF "$token_tail" "$work/stderr_secret.requests.jsonl"; then echo "ok   a secret the 300 character cut of stderr would halve is redacted whole before the cut (the 280 characters after it are a long run, masked as one)"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report" | sed -e "s#$token_tail#[token tail]#g")"; fail=1; fi
 stop_fixture
 start_fixture long_failure
 queue_one h-long-failure acme/app
@@ -3579,6 +3579,31 @@ unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE
 if jq -e '.failure.provider.message == "Your credit balance is too low for key [redacted] sent with [redacted]. and a final line"' <<<"$report" >/dev/null; then echo "ok   a held key and a key shape are masked, and the message is one line"; else echo "FAIL message: $(jq -c '.failure.provider.message' <<<"$report")"; fail=1; fi
 if ! grep -qF "$refusal_key" "$work/refused_secret.requests.jsonl" "$out" && ! jq -c '.failure.provider' <<<"$report" | grep -qF "$split_key"; then echo "ok   the held key is in no report and no line the runner wrote, and the key shape is not in the provider block"; else echo "FAIL a key was reported or logged"; fail=1; fi
 if ! grep -q 'and a final line' "$out"; then echo "ok   the runner logs none of the provider's words itself"; else echo "FAIL the provider's words were logged: $(grep 'and a final line' "$out")"; fail=1; fi
+if jq -e --arg k "$split_key" '.failure.detail | (contains($k) | not) and test("^opencode exited 1: Your credit balance is too low for key \\[redacted\\] sent with \\[redacted\\]\\. and a final line$")' <<<"$report" >/dev/null; then echo "ok   the failure detail is scrubbed like the provider block: a key shape the runner holds no value of is masked in it, and it stays one line with its prefix"; else echo "FAIL detail: $(jq -c '.failure.detail' <<<"$report" | sed -e "s#$split_key#[key shape]#g")"; fail=1; fi
+stop_fixture
+account_arn='arn:aws:iam::123456789012:role/sre-agent-task'
+export STUB_PROVIDER_MESSAGE="Your credit balance is too low: $account_arn and account 123456789012 were refused"
+start_fixture refused_account
+queue_one h-refused-account acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing
+run_once refused_account
+export STUB_OPENCODE_MODE=fix
+unset STUB_PROVIDER_MESSAGE
+if jq -e '.failure.provider.message == "Your credit balance is too low: [redacted] and account [redacted] were refused" and .failure.detail == "opencode exited 1: Your credit balance is too low: [redacted] and account [redacted] were refused"' <<<"$report" >/dev/null && ! jq -c '.failure' <<<"$report" | grep -q '123456789012'; then echo "ok   an account identifier (an ARN, a twelve digit number) is masked in the provider block and in the detail"; else echo "FAIL account words: $(jq -c '[.failure.provider.message, .failure.detail]' <<<"$report")"; fail=1; fi
+stop_fixture
+export STUB_OPENCODE_MODE=stderr_shape
+start_fixture stderr_shape
+queue_one h-stderr-shape acme/app
+run_once stderr_shape
+export STUB_OPENCODE_MODE=fix
+if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*the provider said \\[redacted\\] and then stopped$"))' <<<"$report" >/dev/null && ! jq -c '.failure' <<<"$report" | grep -q 'sk-ant-api03'; then echo "ok   the tail of stderr that holds a key shape the runner has no value of is masked in the detail"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+export STUB_OPENCODE_MODE=stderr_long
+start_fixture stderr_long
+queue_one h-stderr-long acme/app
+run_once stderr_long
+export STUB_OPENCODE_MODE=fix
+if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*the cause was this ending$")) and ((.failure.detail | length) <= 500)' <<<"$report" >/dev/null; then echo "ok   a long stderr is read from its end: the detail ends with the last words the process printed, within the bound"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report")"; fail=1; fi
 stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

@@ -267,6 +267,12 @@ check('a secret holding a control character is removed from its JSON-escaped for
   assert.equal(scrub(`echoed ${JSON.stringify(slashed).slice(1, -1)} in the body`, null, [slashed]), 'echoed [redacted] in the body');
 });
 
+check('the limit of the output is the caller\'s when it names one', () => {
+  const out = scrub('word '.repeat(400), null, [], 1000);
+  assert.ok(Buffer.byteLength(out) <= 1000 && Buffer.byteLength(out) > 500);
+  assert.equal(scrub('a b', null, []), 'a b');
+});
+
 // A hostile shape costs linear work in what is read, and a multi-megabyte body
 // costs what its first 64 KiB cost. A wall clock cannot be exact, so each bound
 // is far from both the measured cost and the cost of a search per start (the
@@ -378,6 +384,45 @@ for (const [name, event, klass, status, message] of rows) {
     assert.ok(CLASSES.includes(got.class));
   });
 }
+
+const GEMINI_KEY = 'API key not valid. Please pass a valid API key.';
+check('classified: a 400 that says the key is not valid is auth (Gemini)', () => {
+  const got = verdict([apiError(400, GEMINI_KEY, { responseBody: JSON.stringify({ error: { code: 400, message: GEMINI_KEY, status: 'INVALID_ARGUMENT' } }) })]);
+  assert.deepEqual({ class: got.class, status: got.status, message: got.message }, { class: 'auth', status: 400, message: GEMINI_KEY });
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { code: 400, status: 'API_KEY_INVALID' } }) })]).class, 'auth');
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { code: 'api_key_invalid' } }) })]).class, 'auth');
+});
+
+// A 400 holds up to three signals; one alone decides, two or more is not a refusal.
+const SIGNALS = { billing: 'credit balance is too low', model_not_found: 'unknown model gpt-nope', auth: 'API key not valid' };
+check('a 400 that carries one signal is that class, and two or three signals are not a refusal', () => {
+  const names = Object.keys(SIGNALS);
+  for (let mask = 1; mask < 8; mask += 1) {
+    const chosen = names.filter((_name, at) => mask & (1 << at));
+    const got = verdict([apiError(400, chosen.map((name) => SIGNALS[name]).join('; '))]);
+    if (chosen.length === 1) assert.equal(got && got.class, chosen[0], chosen.join('+'));
+    else assert.equal(got, null, chosen.join('+'));
+  }
+});
+
+check('the sentence that says a model does not exist reads at most 120 bytes and no full stop between the two words', () => {
+  assert.equal(verdict([apiError(400, `The model ${'x'.repeat(100)} does not exist`)]).class, 'model_not_found');
+  assert.equal(verdict([apiError(400, `The model ${'x'.repeat(130)} does not exist`)]), null);
+  assert.equal(verdict([apiError(400, 'The model is fine. The field does not exist')]), null);
+  assert.equal(verdict([apiError(400, 'The model \u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9 does not exist')]), null);
+});
+
+check('only 401 and 403 are auth, 402 billing, 404 model_not_found, and a 429 is quota only on a quota word', () => {
+  const table = [[401, 'auth'], [403, 'auth'], [402, 'billing'], [404, 'model_not_found'], [429, 'rate_limit'], [400, null], [408, null], [409, null], [422, null], [500, null], [503, null], [529, null]];
+  for (const [status, klass] of table) {
+    const got = verdict([apiError(status, 'nothing that names a class')]);
+    assert.equal(got && got.class, klass, String(status));
+  }
+  for (const words of ['insufficient_quota', 'You exceeded your current quota', 'quota exceeded', 'on the free tier', 'RESOURCE_EXHAUSTED: no quota left']) {
+    assert.equal(verdict([apiError(429, words)]).class, 'quota', words);
+  }
+  assert.equal(verdict([apiError(429, 'RESOURCE_EXHAUSTED: slow down')]).class, 'rate_limit');
+});
 
 const notRefusals = [
   ['a 500', [apiError(500, 'Internal server error')]],

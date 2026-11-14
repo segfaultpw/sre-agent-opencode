@@ -428,6 +428,19 @@ d.yml"
     head -c 280 /dev/zero | tr '\0' 'z' >&2
     exit 3
     ;;
+  stderr_shape)
+    # Exits non-zero with no error event, its last words holding a key shape
+    # the runner holds no value of.
+    printf 'the provider said sk-ant-api03-%s and then stopped' "$(head -c 40 /dev/zero | tr '\0' 'Q')" >&2
+    exit 3
+    ;;
+  stderr_long)
+    # Exits non-zero with no error event and a long stderr, whose end is the
+    # part that names the cause.
+    printf 'some words that fill the stream %.0s' $(seq 1 600) >&2
+    printf '\nthe cause was this ending' >&2
+    exit 3
+    ;;
   nochange)
     emit "Read the brief and the repository and found the behaviour already correct on this branch."
     ;;

@@ -112,14 +112,18 @@ function bodyCodeOf(body) {
   return parts.length > 0 ? parts.join(' ') : null;
 }
 
-// What a billing, quota or model signal looks like in the lower-cased message
-// and body code. Loose words are not here on purpose: a bare "billing" or "does
-// not exist" appears in a bug in our own request as easily as in a refusal.
+// What a billing, quota, model or key signal looks like in the lower-cased
+// message and body code of a 400. Loose words are not here on purpose: a bare
+// "billing" or "does not exist" appears in a bug in our own request as easily
+// as in a refusal. Gemini answers a key it does not know with a 400 and the
+// auth words, not a 401.
 const BILLING_400 = ['credit balance', 'billing_hard_limit', 'billing hard limit', 'billing account', 'insufficient funds', 'purchase credits', 'payment required', 'account is not active'];
 const MODEL_400 = ['not_found_error', 'model_not_found', 'unknown model', 'model not found'];
+const AUTH_400 = ['api key not valid', 'api_key_invalid'];
 const MODEL_MISSING_SENTENCE = /\bmodel\b[^.]{0,120}\bdoes not exist\b/;
+// The platform counts the 120 in bytes, so the sentence is read as bytes too.
 function missingModelSentence(text) {
-  return MODEL_MISSING_SENTENCE.test(text);
+  return MODEL_MISSING_SENTENCE.test(Buffer.from(text, 'utf8').toString('latin1'));
 }
 const QUOTA_429 = ['insufficient_quota', 'exceeded your current quota', 'quota exceeded', 'free tier'];
 
@@ -143,6 +147,7 @@ function classOf(event) {
       const found = [];
       if (holdsAny(text, BILLING_400)) found.push('billing');
       if (holdsAny(text, MODEL_400) || missingModelSentence(text)) found.push('model_not_found');
+      if (holdsAny(text, AUTH_400)) found.push('auth');
       return found.length === 1 ? found[0] : null;
     }
     case 429:
@@ -500,26 +505,26 @@ function cutBytes(text, max) {
   return out;
 }
 
-function finish(text) {
+function finish(text, maxBytes) {
   const oneLine = text.split(GAP).join(' ').split(REMOVED).join('').split(' ').filter(Boolean).join(' ');
-  return cutBytes(oneLine, MESSAGE_MAX_BYTES).trim();
+  return cutBytes(oneLine, maxBytes).trim();
 }
 
 // message: the provider's words. redact: the runner's own redact(), which
 // removes by value every secret the runner holds, run on the raw text and again
 // on the result. secrets: those values, for the removal that sees through a line
-// break. Returns one line of at most 500 bytes, or '' when nothing is left. It
-// never throws and never logs.
-function scrub(message, redact, secrets) {
+// break. Returns one line of at most maxBytes bytes (500 unless a caller needs
+// more room), or '' when nothing is left. It never throws and never logs.
+function scrub(message, redact, secrets, maxBytes = MESSAGE_MAX_BYTES) {
   if (typeof message !== 'string') return '';
   const own = typeof redact === 'function' ? redact : (text) => text;
   try {
     const known = readBounded(own(message));
-    const text = finish(maskShapes(removeKnown(gaps(strip(known)), secrets)));
+    const text = finish(maskShapes(removeKnown(gaps(strip(known)), secrets)), maxBytes);
     return own(text);
   } catch {
     return '';
   }
 }
 
-module.exports = { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes };
+module.exports = { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes, cutRaw };
