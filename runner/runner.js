@@ -6312,7 +6312,15 @@ async function handleJob(config, job, options = {}) {
     }
 
     progress.phase('checks');
-    const { changed, flagged, memoryCopies, embedded } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
+    const { changed, flagged, memoryCopies, embedded, removed } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
+    if (removed.length > 0) {
+      // Not a reason to refuse: a repository in a path the base keeps for a
+      // submodule, or under an ignored directory, is in no pull request. Said, so
+      // that whoever reads the report knows it was there and is gone.
+      result.evidence.removed_repositories = removed;
+      result.actions.push(`removed ${removed.join(', ')}, where the agent left a git repository (a submodule it initialised, or one a tool made under an ignored path); the runner never reads one, and no pull request holds it`);
+      result.summary = `${result.summary}\n\nThe git repository the agent left in ${removed.join(', ')} was removed from the checkout and is not part of the change.`;
+    }
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
       recordFailure(result, 'no_changes', 'the agent left the working tree unchanged and did not decline, so there was nothing to publish');
