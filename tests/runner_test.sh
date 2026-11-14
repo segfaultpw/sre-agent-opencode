@@ -3889,6 +3889,26 @@ unset STUB_OPENCODE_SECOND_MODE
 if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed"' <<<"$report" >/dev/null; then echo "ok   and one that used a shell is not run again"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
 stop_fixture
 
+echo "--- 148b. a provider key a credentials hook prints belongs to the first run alone ---"
+second_hooks="$work/hooks-second"
+mkdir -p "$second_hooks"
+hook_anthropic="$(printf 'sk-ant-hook-%048d' 8)"
+hook_openai="$(printf 'sk-openai-hook-%048d' 9)"
+cat > "$second_hooks/credentials" <<EOF
+#!/usr/bin/env bash
+echo "ANTHROPIC_API_KEY=${hook_anthropic}"
+echo "OPENAI_API_KEY=${hook_openai}"
+EOF
+chmod +x "$second_hooks/credentials"
+export SRE_HOOKS_DIR="$second_hooks"
+second_run_case second_hook provider_billing_after_read fix
+unset SRE_HOOKS_DIR
+want_env="env_ANTHROPIC_API_KEY: ${hook_anthropic};env_OPENAI_API_KEY: unset;env_ANTHROPIC_API_KEY: unset;env_OPENAI_API_KEY: ${second_key};"
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ] && [ "$(grep '^env_' "$opencode_log" | tr '\n' ';')" = "$want_env" ]; then echo "ok   the first run holds the hook's key for its variable and no other provider key; the second run holds SRE_MODEL_FALLBACK_KEY, not the hook's"; else echo "FAIL rc=$rc runs=$(runs_of) env: $(grep '^env_' "$opencode_log" | tr '\n' ';' | sed -e "s#${hook_anthropic}#[hook anthropic]#" -e "s#${hook_openai}#[hook openai]#" -e "s#${second_key}#[second key]#")"; fail=1; fi
+if [ "$(grep -c "the credentials hook set OPENAI_API_KEY, which this run's model does not read, so it was left out of the run" "$out")" = "1" ]; then echo "ok   the log names the variable the first run left out, once, and no value"; else echo "FAIL log: $(grep 'credentials hook' "$out")"; fail=1; fi
+if ! grep -qF -e "$hook_anthropic" -e "$hook_openai" "$out" "$fixture_log" "$work/second_hook.requests.jsonl"; then echo "ok   a key the hook printed is in no log line and no report"; else echo "FAIL a hook key leaked"; fail=1; fi
+stop_fixture
+
 echo "--- 140 to 148. no key value in any request, log line or recorded command line ---"
 if ! grep -qF -e "$second_key" -e "$anthropic_key" -e "$openai_key" "$work"/second_*.out "$work"/second_*.requests.jsonl "$work/git_argv.log" "$work/gh_argv.log" "$git_log" "$gh_log"; then echo "ok   neither provider key nor the second key appears anywhere the second model cases wrote"; else echo "FAIL a key leaked: $(grep -lF -e "$second_key" -e "$anthropic_key" -e "$openai_key" "$work"/second_*.out "$work"/second_*.requests.jsonl 2>/dev/null)"; fail=1; fi
 

@@ -3635,9 +3635,10 @@ async function prepareRequestEnv(config, job, context) {
 // another account of the same provider is used). A model it does not map keeps
 // today's environment, every provider key the runner holds, because narrowing it
 // would break an install that works. What the credentials hook printed is applied
-// last: a provider key it printed for another variable than the run's is left out
-// (its name is pushed to options.leftOut), and the hook's value for the variable
-// both models read was set for the first run, so the second run keeps its own key.
+// last, and a provider key it printed is the first run's alone (the owner's ruling:
+// the second run's key is SRE_MODEL_FALLBACK_KEY): in the first run the hook's value
+// for the run's variable wins and one for another variable is left out (its name is
+// pushed to options.leftOut); the second run takes none of them.
 // SRE_MODEL_FALLBACK and its key never reach any agent. Pure: `env` is not changed.
 function runEnvForModel(env, model, config, extraEnv = {}, options = {}) {
   const out = { ...env };
@@ -3647,17 +3648,16 @@ function runEnvForModel(env, model, config, extraEnv = {}, options = {}) {
   const extra = extraEnv || {};
   const variable = providerKeyVariable(model);
   if (variable === null) return Object.assign(out, extra);
-  const firstVariable = providerKeyVariable(config && config.model);
   const own = options.second ? fallbackKey : env[variable];
   for (const name of PROVIDER_KEY_VARIABLES) delete out[name];
   if (typeof own === 'string' && own !== '') out[variable] = own;
   for (const [name, value] of Object.entries(extra)) {
     if (PROVIDER_KEY_VARIABLES.includes(name)) {
+      if (options.second) continue;
       if (name !== variable) {
         if (options.leftOut) options.leftOut.push(name);
         continue;
       }
-      if (options.second && variable === firstVariable) continue;
     }
     out[name] = value;
   }

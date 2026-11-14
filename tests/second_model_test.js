@@ -143,7 +143,7 @@ async function main() {
     assert.equal(runEnvForModel(env, config.fallbackModel, config, {}, { second: true }).ANTHROPIC_API_KEY, 'second-account');
   });
 
-  await check('one key per run: a hook\'s key reaches the run that reads it and is left out of a run that does not', async () => {
+  await check('one key per run: a hook\'s key reaches the first run that reads it, is left out of a first run that does not, and never reaches the second run', async () => {
     const config = { model: 'anthropic/claude-sonnet-4-5', fallbackModel: 'openai/gpt-5' };
     const env = { ANTHROPIC_API_KEY: 'a-key', SRE_MODEL_FALLBACK: 'openai/gpt-5', SRE_MODEL_FALLBACK_KEY: 'second-key' };
     const left = [];
@@ -152,9 +152,12 @@ async function main() {
     assert.equal('OPENAI_API_KEY' in first, false, 'an openai key is left out of an anthropic run');
     assert.equal(first.AWS_REGION, 'eu-west-1', 'a name that is not a provider key is applied');
     assert.deepEqual(left, ['OPENAI_API_KEY']);
-    const second = runEnvForModel(env, config.fallbackModel, config, { OPENAI_API_KEY: 'hook-openai', ANTHROPIC_API_KEY: 'hook-anthropic' }, { second: true });
-    assert.equal(second.OPENAI_API_KEY, 'hook-openai', 'a hook\'s key for the variable only the second model reads is applied');
+    const secondLeft = [];
+    const second = runEnvForModel(env, config.fallbackModel, config, { OPENAI_API_KEY: 'hook-openai', ANTHROPIC_API_KEY: 'hook-anthropic', AWS_REGION: 'eu-west-1' }, { second: true, leftOut: secondLeft });
+    assert.equal(second.OPENAI_API_KEY, 'second-key', 'a provider key the hook printed is the first run\'s: the second run holds SRE_MODEL_FALLBACK_KEY');
     assert.equal('ANTHROPIC_API_KEY' in second, false);
+    assert.equal(second.AWS_REGION, 'eu-west-1', 'what is not a provider key still reaches the second run');
+    assert.deepEqual(secondLeft, [], 'nothing is said about a value that was never meant for the second run');
   });
 
   await check('one key per run: a hook\'s value for the variable both models read is the first run\'s, and the second run keeps SRE_MODEL_FALLBACK_KEY', async () => {
