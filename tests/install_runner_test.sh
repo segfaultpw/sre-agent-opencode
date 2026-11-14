@@ -123,7 +123,7 @@ if [ "${STUB_ACCOUNT_EXISTS:-no}" = yes ]; then
 fi
 exit 2
 EOF
-for tool in node git gh opencode setpriv; do
+for tool in node git gh opencode setpriv setfacl getfacl; do
   cat > "$work/bin/$tool" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -241,7 +241,7 @@ if grep -qF 'has to run as root' <<<"$out"; then echo "ok   the refusal says it 
 # A machine with the tools but no systemd is a container host, and the refusal
 # points it at the image rather than leaving it stuck.
 mkdir -p "$work/without-systemctl"
-for tool in id groupadd useradd chown getent node git gh opencode setpriv; do
+for tool in id groupadd useradd chown getent node git gh opencode setpriv setfacl getfacl; do
   cp "$work/bin/$tool" "$work/without-systemctl/$tool"
 done
 refusal no-systemd PATH="$work/without-systemctl:$work/coreutils"
@@ -249,7 +249,7 @@ if grep -qF 'no systemctl' <<<"$out"; then echo "ok   a machine without systemd 
 if grep -qF 'sre-agent-opencode-runner' <<<"$out"; then echo "ok   the refusal names the container image"; else echo "FAIL output: $out"; fail=1; fi
 
 mkdir -p "$work/without-opencode"
-for tool in id systemctl groupadd useradd chown getent node git gh setpriv; do
+for tool in id systemctl groupadd useradd chown getent node git gh setpriv setfacl getfacl; do
   cp "$work/bin/$tool" "$work/without-opencode/$tool"
 done
 refusal no-opencode PATH="$work/without-opencode:$work/coreutils"
@@ -257,11 +257,18 @@ if grep -qF 'opencode is not on PATH' <<<"$out"; then echo "ok   a missing openc
 if grep -qF 'https://opencode.ai/install' <<<"$out"; then echo "ok   the refusal carries the command that installs it"; else echo "FAIL output: $out"; fail=1; fi
 
 mkdir -p "$work/without-setpriv"
-for tool in id systemctl groupadd useradd chown getent node git gh opencode; do
+for tool in id systemctl groupadd useradd chown getent node git gh opencode setfacl getfacl; do
   cp "$work/bin/$tool" "$work/without-setpriv/$tool"
 done
 refusal no-setpriv PATH="$work/without-setpriv:$work/coreutils"
 if grep -qF 'setpriv is not on PATH' <<<"$out" && grep -qF 'util-linux' <<<"$out"; then echo "ok   a missing setpriv refuses, naming the package that has it"; else echo "FAIL output: $out"; fail=1; fi
+
+mkdir -p "$work/without-acl"
+for tool in id systemctl groupadd useradd chown getent node git gh opencode setpriv; do
+  cp "$work/bin/$tool" "$work/without-acl/$tool"
+done
+refusal no-acl PATH="$work/without-acl:$work/coreutils"
+if grep -qF 'setfacl is not on PATH' <<<"$out" && grep -qF 'getfacl is not on PATH' <<<"$out" && grep -qF 'acl package' <<<"$out"; then echo "ok   a missing setfacl and getfacl refuses, naming the package that has them"; else echo "FAIL output: $out"; fail=1; fi
 
 # A clone missing the files the runner reads at run time would install a runner
 # that starts and fails its first job.
@@ -281,7 +288,7 @@ if grep -qF 'runner/memory.js' <<<"$out"; then echo "ok   the refusal names the 
 # a home directory is invisible to the service: the install reports success and
 # the unit lands in failed on its first start.
 mkdir -p "$work/home/operator/bin" "$work/bin-home-hidden"
-for tool in id systemctl groupadd useradd chown getent node git gh setpriv; do
+for tool in id systemctl groupadd useradd chown getent node git gh setpriv setfacl getfacl; do
   cp "$work/bin/$tool" "$work/bin-home-hidden/$tool"
 done
 cp "$work/bin/opencode" "$work/home/operator/bin/opencode"
@@ -310,7 +317,7 @@ echo "--- a copy that fails leaves the working install alone ---"
 install_into fragile
 before="$(cat "${root}/opt/sre-agent-opencode/VERSION")"
 mkdir -p "$work/failing-cp"
-for tool in id systemctl groupadd useradd chown getent node git gh opencode setpriv; do
+for tool in id systemctl groupadd useradd chown getent node git gh opencode setpriv setfacl getfacl; do
   cp "$work/bin/$tool" "$work/failing-cp/$tool"
 done
 cat > "$work/failing-cp/cp" <<EOF

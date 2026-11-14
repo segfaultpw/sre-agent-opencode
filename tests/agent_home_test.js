@@ -393,6 +393,26 @@ function settleInChild(setup, home) {
     assert.equal(found.mode, 'root');
   });
 
+  await check('a start whose agent account shares its group with another account, or lists one as a member, is refused', () => {
+    const etc = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-home-etc-'));
+    try {
+      const write = (passwd, group) => {
+        fs.writeFileSync(path.join(etc, 'passwd'), passwd);
+        fs.writeFileSync(path.join(etc, 'group'), group);
+      };
+      write('agent:x:10002:10002::/h:/bin/false\nrunner:x:10001:10001::/h:/bin/false\n', 'agent:x:10002:\nrunner:x:10001:\n');
+      assert.equal(internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, six, etc).mode, 'root');
+      write('agent:x:10002:10002::/h:/bin/false\nagent-2:x:10004:10002::/h:/bin/false\n', 'agent:x:10002:\n');
+      assert.throws(() => internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, six, etc), /agent-2 \(uid 10004\) has group 10002 as its primary group/);
+      write('agent:x:10002:10002::/h:/bin/false\nagent-2:x:10004:10004::/h:/bin/false\n', 'agent:x:10002:agent-2\n');
+      assert.throws(() => internals.loadIdentity(accountEnv, { uid: 0, gid: 0 }, six, etc), /agent-2 is listed as a member of group agent/);
+      write('agent:x:10002:10002::/h:/bin/false\nagent-2:x:10004:10004::/h:/bin/false\n', 'agent:x:10002:agent-2\n');
+      assert.throws(() => internals.loadIdentity({ ...accountEnv, SRE_RUNNER_UID: '10001' }, { uid: 10003, gid: 10003 }, six, etc), /agent-2 is listed as a member/, 'the caps mode asks the same');
+    } finally {
+      fs.rmSync(etc, { recursive: true, force: true });
+    }
+  });
+
   await check('a root start without the account ids is still refused, with or without capabilities', () => {
     assert.throws(() => internals.loadIdentity({}, { uid: 0, gid: 0 }, 0n), /SRE_RUNNER_UID/);
     assert.throws(() => internals.loadIdentity({}, { uid: 0, gid: 0 }, six), /SRE_RUNNER_UID/);

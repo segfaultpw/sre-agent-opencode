@@ -61,7 +61,7 @@ function workerInstances(base, count) {
 // accounts than workers is refused, never shared. With the split off there is
 // no agent account and nothing to hand over. Answers null (split off), an array
 // of { uid, gid, home, user } or throws an Error whose message is the refusal.
-function workerAccounts(env, count) {
+function workerAccounts(env, count, etc = '/etc') {
   const split = env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '';
   if (!split) return null;
   const accounts = [];
@@ -85,6 +85,11 @@ function workerAccounts(env, count) {
   if (uids.has(runnerUid) || gids.has(runnerGid) || uids.has(0)) {
     throw new Error('an agent account of a worker is the runner\'s own account or root; the agent accounts must be distinct from the runner and from each other');
   }
+  // One worker's agent must not be able to search another worker's directory,
+  // which only the group of its own agent opens: no account of the pool may be a
+  // member of another's group, whatever the ids say.
+  const sharing = memory.agentGroupProblem(accounts, { etc, ignoreUids: [runnerUid] });
+  if (sharing) throw new Error(sharing);
   return accounts;
 }
 

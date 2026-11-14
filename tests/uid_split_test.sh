@@ -124,7 +124,14 @@ chmod 777 "$work/markers"
 "$real_git" init -q --bare -b main "$remote"
 "$real_git" init -q -b main "$work/seed"
 printf 'the fixture repository\n' > "$work/seed/README.md"
+# Tracked names that are not valid UTF-8 (a Latin-1 name in an old repository): a
+# file and a file in a directory. Every request below clones them, hands them to
+# the agent, takes them back, closes them and publishes the repository.
+printf 'a file whose name is not UTF-8\n' > "$work/seed/"$'caf\xe9.txt'
+mkdir -p "$work/seed/"$'d\xffir'
+printf 'a file in a directory whose name is not UTF-8\n' > "$work/seed/"$'d\xffir'/inner.txt
 "$real_git" -C "$work/seed" add README.md
+"$real_git" -C "$work/seed" add -A
 "$real_git" -C "$work/seed" -c user.name=seed -c user.email=seed@example.invalid -c commit.gpgsign=false commit -q -m "seed"
 "$real_git" -C "$work/seed" push -q "$remote" main
 chmod -R a+rX "$work/remote"
@@ -321,7 +328,7 @@ prove() {
       STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe_file" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor_file" \
       STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" STUB_RUNNER_TOKEN="$github_token" \
       "${extra_runner_env[@]}" \
-      STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" STUB_ACL_UID="$caps_uid" \
+      STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" STUB_ACL_UID="$caps_uid" STUB_PLANT_BYTES=dirs \
       node "$runner" > "$out" 2>&1 || rc=$?
     stop_fixture
   }
@@ -366,6 +373,13 @@ prove() {
   if [ -s "$ghuidlog" ] && ! grep -qvx "$owner" "$ghuidlog"; then echo "ok   $label: gh ran as the runner's account"; else echo "FAIL $label: gh uids: $(sort -u "$ghuidlog" | tr '\n' ' ')"; fail=1; fi
   if grep -qF -- '<!-- sre-agent-opencode:v' "$ghbodylog" && grep -qF -- 'sre-agent:remediation:99999999-8888-7777-6666-555555555555' "$ghbodylog"; then echo "ok   $label: gh opened and read the pull request body as the runner's account, and it is the agent's message with the markers"; else echo "FAIL $label: gh could not read the body, or it is not the body: $(cat "$ghbodylog")"; fail=1; fi
   if [ "$(stat -c %u "$ws/repos/acme/app")" = "$owner" ] && [ "$(stat -c %u "$ws/repos/acme/app/README.md")" = "$owner" ] && [ ! -e "$ws/repos/acme/app/.git" ]; then echo "ok   $label: the checkout is the runner's again once the run ends, and the .git the agent planted is gone"; else echo "FAIL $label: $(stat -c '%u %n' "$ws/repos/acme/app" "$ws/repos/acme/app/README.md"; ls -a "$ws/repos/acme/app")"; fail=1; fi
+  # Names that are not valid UTF-8: tracked by the repository, and made by the
+  # agent (a directory open to every account, a repository below a directory
+  # whose name is one). The request ended in a pull request above; what is left is
+  # the runner's, closed, and what the agent planted is gone.
+  local checkout="$ws/repos/acme/app"
+  if [ -f "$checkout/"$'caf\xe9.txt' ] && [ -f "$checkout/"$'d\xffir'/inner.txt ] && [ "$(stat -c %u "$checkout/"$'caf\xe9.txt')" = "$owner" ] && [ "$(stat -c '%u %a' "$checkout/"$'d\xffir')" = "$owner 700" ]; then echo "ok   $label: the files the repository tracks under names that are not UTF-8 were handed over, taken back and are the runner's, closed"; else echo "FAIL $label: $(ls -la "$checkout" | cat -v)"; fail=1; fi
+  if [ "$(stat -c '%u %a' "$checkout/"$'dir\xfe/sub')" = "$owner 700" ] && [ -z "$(find "$checkout" \( ! -uid "$owner" -o \( ! -type l -a -perm /077 \) \) -print -quit)" ]; then echo "ok   $label: the directories the agent opened to every account under a name that is not UTF-8 are closed, and nothing in the checkout is left to another account"; else echo "FAIL $label: $(find "$checkout" -path '*/.git' -prune -o -printf '%u %m %p\n' | cat -v | head -n 12)"; fail=1; fi
   # The agent left a directory open to every account (and named one account in an
   # ACL). Another account's process that still held it could write in it after
   # the run, while the runner reads and stages the tree, so the runner takes
@@ -487,6 +501,14 @@ prove_workers() {
   mkdir -p "$ws" "$runner_home" "$agent_home"
   chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
   chmod 700 "$ws"
+  # What an operator can leave on the volume: a default ACL on instances/ (a new
+  # worker directory inherits it) and a named entry on worker 1's directory, both
+  # giving the OTHER worker's agent search. A mode and an owner say nothing about
+  # either, so the runner takes them off before any checkout is handed over.
+  local acl_set=0
+  mkdir -p "$ws/instances/pool-1"
+  chown "$owner:$owner" "$ws/instances" "$ws/instances/pool-1"
+  if command -v setfacl >/dev/null 2>&1 && setfacl -d -m "u:$agent_uid:rx,u:$agent2_uid:rx" "$ws/instances" 2>/dev/null && setfacl -m "u:$agent2_uid:rx" "$ws/instances/pool-1" 2>/dev/null; then acl_set=1; fi
   : > "$probe"; : > "$timing"; : > "$scratch_log"
   chmod 666 "$probe" "$timing" "$scratch_log"
   for ctl_file in git_uid_log gh_uid_log git_home_log gh_home_log git_cred_log gh_body_log; do
@@ -586,6 +608,9 @@ prove_workers() {
   gate1="$(stat -c '%u:%g %a' "$ws/instances/pool-1" 2>&1)"
   gate2="$(stat -c '%u:%g %a' "$ws/instances/pool-2" 2>&1)"
   if [ "$gate1" = "$owner:$agent_uid 710" ] && [ "$gate2" = "$owner:$agent2_uid 710" ]; then echo "ok   $label: each worker's instance directory is the runner's with the group of that worker's agent alone, mode 0710 (walked into by that agent only)"; else echo "FAIL $label: pool-1 $gate1, pool-2 $gate2"; fail=1; fi
+  if [ "$acl_set" -eq 0 ]; then
+    echo "ok   $label: (ACLs cannot be set on this file system or setfacl is missing, so the ACL premise was not made)"
+  elif [ "$(getfacl -c -p -n "$ws/instances/pool-1" | grep -c .)" -eq 3 ] && [ "$(getfacl -c -p -n "$ws/instances/pool-2" | grep -c .)" -eq 3 ] && [ -z "$(getfacl -c -p -n "$ws/instances/pool-1" "$ws/instances/pool-2" | grep -E '^(default:|user:[0-9]|group:[0-9]|mask)' || true)" ]; then echo "ok   $label: the named entry on one worker's directory and the default ACL the other inherited, both giving the other worker's agent search, were removed before any hand-over"; else echo "FAIL $label: $(getfacl -c -p -n "$ws/instances/pool-1" "$ws/instances/pool-2" | tr '\n' ' ')"; fail=1; fi
   # The entries a process of the other account made inside the open directory
   # while it still could are the runner's now, nothing of it can write there once
   # the run is over, and nothing outside the tree was touched.
@@ -704,7 +729,7 @@ prove_bucket() {
       SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
       HOME="$runner_home" SRE_MEMORY_BUCKET=acme-sre-memory SRE_MEMORY_PREFIX=fleet \
       AWS_ACCESS_KEY_ID=fixture-key AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/fixture \
-      STUB_OPENCODE_MODE=diagnose STUB_OPENCODE_LOG="$agent_log" STUB_OPENCODE_MEMORY="$edit" \
+      STUB_OPENCODE_MODE=diagnose STUB_OPENCODE_LOG="$agent_log" STUB_OPENCODE_MEMORY="$edit" STUB_PLANT_BYTES=files \
       node "$runner" > "$out" 2>&1 || rc=$?
     stop_fixture
   }
@@ -724,6 +749,11 @@ prove_bucket() {
   if [ -s "$awsroot/ctl/uploaded/acme-sre-memory/fleet/_estate/NOTES.md" ]; then echo "ok   $label: the runner's account could read what it uploaded"; else echo "FAIL $label: nothing was uploaded: $(find "$awsroot/ctl" -type f)"; fail=1; fi
   if grep -qx 'memory_env: ' "$agent_log"; then echo "ok   $label: no SRE_MEMORY_ variable reaches the agent"; else echo "FAIL $label: $(grep memory_env "$agent_log")"; fail=1; fi
   if grep -qx 'aws_env: ' "$agent_log"; then echo "ok   $label: and no AWS variable either"; else echo "FAIL $label: $(grep aws_env "$agent_log")"; fail=1; fi
+  # The first request's scratch directory held names that are not UTF-8 (a file, a
+  # directory open to every account, a repository below another); the second
+  # request removed all of it to make its own, and made the same again, which is
+  # the runner's and closed once the run is over.
+  if [ -f "$ws/scratch/"$'bad\xff' ] && [ -z "$(find "$ws/scratch" \( ! -uid "$owner" -o \( ! -type l -a -perm /077 \) \) -print -quit)" ] && [ ! -e "$ws/scratch/"$'par\xe8/inner/.git' ]; then echo "ok   $label: the scratch directory of an earlier request, with names that are not UTF-8 in it, was removed for the next, and what the last run made there is the runner's and closed"; else echo "FAIL $label: $(find "$ws/scratch" -printf '%u %m %p\n' | cat -v | head -n 12)"; fail=1; fi
 }
 
 prove_bucket root "$runner_uid" setpriv --groups=20001,20002 --

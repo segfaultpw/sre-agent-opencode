@@ -249,7 +249,16 @@ function degradedIdentity(own, env, missing) {
   };
 }
 
-function loadIdentity(env, own, effective = readEffectiveCapabilities()) {
+// The worker's directory is closed to every other agent by the group of its own
+// agent account alone (settleInstanceGate), so a start where another account has
+// that group, or is a member of it, is refused: what the runner can read of the
+// account database is checked, and the README says what it cannot.
+function refuseSharedGroup(agent, runner, etc) {
+  const problem = memory.agentGroupProblem([agent], { etc, ignoreUids: [runner.uid] });
+  if (problem) throw fatal(problem);
+}
+
+function loadIdentity(env, own, effective = readEffectiveCapabilities(), etc = '/etc') {
   const agent = accountFrom(env, 'SRE_AGENT');
   const missing = missingCapabilities(effective);
   if (own.uid === 0) {
@@ -273,12 +282,14 @@ function loadIdentity(env, own, effective = readEffectiveCapabilities()) {
         `this start is root but lacks ${missing.join(', ')}, which switching to the agent's account takes; the agent would run as root, so the runner will not start. Give the container the capabilities (${REQUIRED_CAPABILITIES.map(([name]) => name.replace(/^CAP_/, '')).join(', ')}; Docker's default set holds them, and a Kubernetes securityContext that drops ALL has to add them back), or start it as a non-root user, which runs the agent in one account as v1.4.0 did`
       );
     }
+    refuseSharedGroup(agent, runner, etc);
     return { mode: 'root', runner, agent };
   }
   if (env.SRE_AGENT_UID !== undefined && env.SRE_AGENT_UID !== '') {
     if (!agent.complete) throw fatal('SRE_AGENT_UID needs SRE_AGENT_GID and an absolute SRE_AGENT_HOME with it');
     if (agent.uid === own.uid) throw fatal('SRE_AGENT_UID is the runner\'s own account, which would split nothing');
     if (missing.length > 0) return degradedIdentity(own, env, missing);
+    refuseSharedGroup(agent, { uid: own.uid }, etc);
     return { mode: 'caps', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent };
   }
   return { mode: 'none', runner: { uid: own.uid, gid: own.gid, home: env.HOME || '' }, agent: null };
@@ -974,7 +985,7 @@ function launch(command, args, env, as, home) {
 // and the answer says `aborted` rather than `timedOut`. A signal already
 // aborted starts nothing.
 function runProcess(command, args, options = {}) {
-  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null, signal: abortSignal = null, onStdout = null } = options;
+  const { cwd, env: requestedEnv, input = null, timeoutMs = PROCESS_TIMEOUT_MS, as = 'runner', home = null, signal: abortSignal = null, onStdout = null, binary = false } = options;
   if (abortSignal && abortSignal.aborted) {
     return Promise.resolve({ code: null, stdout: '', stderr: '', timedOut: false, aborted: true });
   }
@@ -998,7 +1009,11 @@ function runProcess(command, args, options = {}) {
       return;
     }
 
+    // `binary`: stdout comes back as a Buffer, undecoded, for output that names
+    // files (git -z) and so can hold bytes that are not UTF-8.
     let stdout = '';
+    const chunks = [];
+    const output = () => (binary ? Buffer.concat(chunks) : stdout);
     let stderr = '';
     let timedOut = false;
     let aborted = false;
@@ -1039,16 +1054,20 @@ function runProcess(command, args, options = {}) {
           child.stderr.destroy();
           child.stdin.destroy();
           child.unref();
-          done({ code: null, signal: 'SIGKILL', stdout, stderr, timedOut, abandoned: true });
+          done({ code: null, signal: 'SIGKILL', stdout: output(), stderr, timedOut, abandoned: true });
         }, ABANDON_GRACE_MS);
       }, KILL_GRACE_MS);
     };
 
     // Decoded by the stream rather than by concatenation, so a multi-byte
     // character split across two chunks does not come back mangled.
-    child.stdout.setEncoding('utf8');
+    if (!binary) child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => {
+      if (binary) {
+        chunks.push(chunk);
+        return;
+      }
       stdout += chunk;
       if (onStdout) onStdout(chunk);
     });
@@ -1056,10 +1075,10 @@ function runProcess(command, args, options = {}) {
       stderr += chunk;
     });
     child.on('error', (error) => {
-      done({ code: null, stdout, stderr: `${stderr}${error.message}`, timedOut });
+      done({ code: null, stdout: output(), stderr: `${stderr}${error.message}`, timedOut });
     });
     child.on('close', (code, signal) => {
-      done({ code, signal, stdout, stderr, timedOut });
+      done({ code, signal, stdout: output(), stderr, timedOut });
     });
 
     if (timeoutMs > 0) {
@@ -1797,6 +1816,40 @@ async function chownTree(dir, who) {
 // out, and with no split).
 let instanceGate = null;
 
+// The directory carries no access control list. An access ACL with a named
+// entry for another account survives a chmod of the mode bits (the group bits
+// become the mask, and the named entry keeps its own search permission), and a
+// default ACL on `instances/` or on the volume is inherited by a directory made
+// below it, so the mode and the owner say nothing about who else can search the
+// directory. Nobody but the runner can set one on this directory, so the case is
+// an operator's (a default ACL on the volume, one that EFS or a backup tool
+// carries over), and the answer is to take them off and to read, afterwards, that
+// none is left: getfacl prints the three entries of the mode and nothing else for
+// a directory with none. Without the two tools (the acl package) the check cannot
+// be made, and no checkout is handed over.
+function clearAccessLists(dir) {
+  const run = (tool, args, tolerate = null) => {
+    const done = spawnSync(tool, args, { env: minimalEnv(), encoding: 'utf8', timeout: 10_000 });
+    if (done.error && done.error.code === 'ENOENT') {
+      throw new Error(`${dir} cannot be checked for an access control list because ${tool} is not installed (it is in the acl package), so no checkout is handed over`);
+    }
+    if (done.status !== 0 && !(tolerate && tolerate.test(done.stderr || ''))) {
+      throw new Error(`${dir} could not be cleared of access control lists (${tool}: ${oneLine(redact(done.stderr || (done.error && done.error.message) || ''), 160)}), so no checkout is handed over`);
+    }
+    return done.stdout || '';
+  };
+  // A file system that cannot hold an ACL (EFS, NFS) refuses the removal, which
+  // is the right answer there; the read below is what says none is left.
+  run('setfacl', ['-b', '-k', '--', dir], /not supported/i);
+  return () => {
+    const entries = run('getfacl', ['-c', '-p', '-n', '--', dir]).split('\n').filter(Boolean);
+    const plain = entries.length === 3 && /^user::/.test(entries[0]) && /^group::/.test(entries[1]) && /^other::/.test(entries[2]);
+    if (!plain) {
+      throw new Error(`${dir} still carries an access control list (${oneLine(entries.join(' '), 160)}), so no checkout is handed over`);
+    }
+  };
+}
+
 // Makes the gate what it must be, through one descriptor opened without
 // following a link, and says so with a throw when it cannot: run at the start
 // and again before every hand-over, so a directory something replaced or
@@ -1805,6 +1858,7 @@ function settleInstanceGate(dir = instanceGate) {
   if (identity.mode === 'none' || !dir) return;
   const descriptor = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
   try {
+    const readBack = clearAccessLists(dir);
     const before = fs.fstatSync(descriptor);
     if (before.uid !== identity.runner.uid || before.gid !== identity.agent.gid) fs.fchownSync(descriptor, identity.runner.uid, identity.agent.gid);
     if ((before.mode & 0o7777) !== 0o710) fs.fchmodSync(descriptor, 0o710);
@@ -1812,6 +1866,7 @@ function settleInstanceGate(dir = instanceGate) {
     if (after.uid !== identity.runner.uid || after.gid !== identity.agent.gid || (after.mode & 0o7777) !== 0o710) {
       throw new Error(`${dir} is not the runner's directory for this worker's agent alone (uid ${after.uid}, gid ${after.gid}, mode ${(after.mode & 0o7777).toString(8)}), so no checkout is handed over`);
     }
+    readBack();
   } finally {
     fs.closeSync(descriptor);
   }
@@ -1841,14 +1896,48 @@ function isClosedUnder(target) {
   return false;
 }
 
+// A name is bytes. A repository can track a file whose name is not valid UTF-8
+// (a Latin-1 name in an old repository), an agent can make one, and Node decodes
+// such a name lossily when it is read as a string, so the name read back names
+// nothing. Every walk of a tree an agent touched therefore reads names as
+// Buffers, builds paths from them as Buffers (every fs call that takes a path
+// takes one) and hands them to the removal on its standard input, never in an
+// argument, which Node would turn into text on the way.
+const SLASH_BYTE = 0x2f;
+const NUL_BYTE = 0x00;
+
+function joinBytes(...parts) {
+  return Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(String(part), 'utf8'))));
+}
+
+// A name as text for a message or a report: lossy, which is fine for being shown
+// and never for being used.
+function shown(name) {
+  return Buffer.isBuffer(name) ? name.toString('utf8') : String(name);
+}
+
+function dirnameBytes(target) {
+  const at = target.lastIndexOf(SLASH_BYTE);
+  if (at < 0) return Buffer.from('.');
+  return at === 0 ? Buffer.from('/') : target.subarray(0, at);
+}
+
+function basenameBytes(target) {
+  return target.subarray(target.lastIndexOf(SLASH_BYTE) + 1);
+}
+
 // The descriptors one close pass holds: a directory is found again through
 // /proc/self/fd/<parent>/<name>, so a path never has to be named whole, and a
-// tree nested deeper than a path can be (PATH_MAX) is still reached: a
-// descriptor is kept as an anchor once the path below it grows past this many
-// bytes, so the number of descriptors held is the depth in bytes over this, not
-// the depth.
+// tree nested deeper than a path can be (PATH_MAX, counted in bytes) is still
+// reached: a descriptor is kept as an anchor once the path below it grows past
+// this many bytes, so the number of descriptors held is the depth in bytes over
+// this, not the depth.
 const CLOSE_ANCHOR_BYTES = 2000;
-const CLOSE_YIELD_EVERY = 2000;
+// How long one stretch of the pass may hold the event loop before it gives it
+// back. By elapsed time and not by count: an entry costs a few microseconds on a
+// local disk and a round trip on a network file system, and the heartbeat has to
+// go on in both. (Exported for the tests, which set the slice and read `yields`.)
+const closeTuning = { sliceMs: 10, yields: 0 };
 
 // Opens a directory without following a link at its last component. An owner
 // that cannot open its own unreadable directory (no capability: a start where
@@ -1883,7 +1972,13 @@ function openClosing(target) {
 // removed nothing, when anything foreign-owned or open is left. Done by the
 // runner itself (root, or the capabilities of the caps mode) and not by a chown
 // and a chmod run one after the other, which left a window between the two.
-async function closeTree(dir) {
+//
+// `shared`: the tree is one the runner shares with another worker of its own
+// account (the memory), where an entry can vanish between the listing and the
+// look. In a tree an agent had, closed directory by directory, nothing but a
+// process of the agent's account that is still alive can remove one, and that is
+// said and fails the pass.
+async function closeTree(dir, { shared = false } = {}) {
   if (identity.mode === 'none') return;
   const owner = identity.runner;
   const root = path.resolve(dir);
@@ -1894,7 +1989,7 @@ async function closeTree(dir) {
   // nobody else can make an entry in a closed directory, so a second finding there
   // would be a real one and is raised.
   for (let attempt = 1; ; attempt += 1) {
-    await closePass(dir, root, owner);
+    await closePass(dir, root, owner, shared);
     const check = await runProcess(
       'find',
       [root, '(', '!', '-uid', String(owner.uid), '-o', '(', '!', '-type', 'l', '-a', '-perm', '/077', ')', ')', '-print', '-quit'],
@@ -1908,7 +2003,7 @@ async function closeTree(dir) {
   closedTrees.add(root);
 }
 
-async function closePass(dir, root, owner) {
+async function closePass(dir, root, owner, shared) {
   const held = new Set();
   const close = (anchor) => {
     if (held.delete(anchor)) fs.closeSync(anchor.fd);
@@ -1917,22 +2012,28 @@ async function closePass(dir, root, owner) {
     anchor.pending -= 1;
     if (anchor.pending === 0) close(anchor);
   };
-  let entries = 0;
+  let sliceStart = performance.now();
+  const yieldWhenDue = async () => {
+    if (performance.now() - sliceStart < closeTuning.sliceMs) return;
+    closeTuning.yields += 1;
+    await new Promise((resolve) => setImmediate(resolve));
+    sliceStart = performance.now();
+  };
+  const gone = (name) => new Error(`${shown(name)} is gone from a directory the runner had already closed, so a process is still working in the tree`);
   try {
     const first = { fd: openClosing(root), pending: 1 };
     held.add(first);
-    const stack = [{ anchor: first, rel: '' }];
+    const stack = [{ anchor: first, rel: Buffer.alloc(0), name: Buffer.alloc(0) }];
     while (stack.length > 0) {
       const frame = stack.pop();
       let own = null;
       let descriptor = frame.anchor.fd;
-      if (frame.rel !== '') {
+      if (frame.rel.length > 0) {
         try {
-          descriptor = openClosing(`/proc/self/fd/${frame.anchor.fd}/${frame.rel}`);
+          descriptor = openClosing(joinBytes('/proc/self/fd/', String(frame.anchor.fd), '/', frame.rel));
         } catch (error) {
-          // Gone since it was listed (only a tree the runner shares with another
-          // worker of its own account can lose an entry meanwhile).
           if (error.code !== 'ENOENT') throw error;
+          if (!shared) throw gone(frame.name);
           release(frame.anchor);
           continue;
         }
@@ -1943,36 +2044,43 @@ async function closePass(dir, root, owner) {
       if (me.uid !== owner.uid || me.gid !== owner.gid) fs.fchownSync(descriptor, owner.uid, owner.gid);
       if ((me.mode & 0o7777) !== 0o700) fs.fchmodSync(descriptor, 0o700);
       const base = `/proc/self/fd/${descriptor}`;
-      for (const name of fs.readdirSync(base)) {
-        const entry = `${base}/${name}`;
-        let stat;
-        try {
-          stat = fs.lstatSync(entry);
-        } catch (error) {
-          if (error.code === 'ENOENT') continue;
-          throw error;
-        }
-        entries += 1;
-        if (entries % CLOSE_YIELD_EVERY === 0) await new Promise((resolve) => setImmediate(resolve));
-        if (stat.isDirectory()) {
-          let anchor = frame.anchor;
-          let rel = frame.rel === '' ? name : `${frame.rel}/${name}`;
-          if (own && rel.length > CLOSE_ANCHOR_BYTES) {
-            anchor = own;
-            rel = name;
+      const listing = fs.opendirSync(base, { encoding: 'buffer', bufferSize: 256 });
+      try {
+        for (let item = listing.readSync(); item !== null; item = listing.readSync()) {
+          const name = item.name;
+          const entry = joinBytes(base, '/', name);
+          let stat;
+          try {
+            stat = fs.lstatSync(entry);
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+            if (!shared) throw gone(name);
+            continue;
           }
-          anchor.pending += 1;
-          stack.push({ anchor, rel });
-          continue;
+          await yieldWhenDue();
+          if (stat.isDirectory()) {
+            let anchor = frame.anchor;
+            let rel = frame.rel.length === 0 ? name : joinBytes(frame.rel, '/', name);
+            if (own && rel.length > CLOSE_ANCHOR_BYTES) {
+              anchor = own;
+              rel = name;
+            }
+            anchor.pending += 1;
+            stack.push({ anchor, rel, name });
+            continue;
+          }
+          try {
+            if (stat.uid !== owner.uid || stat.gid !== owner.gid) fs.lchownSync(entry, owner.uid, owner.gid);
+            if (stat.isSymbolicLink()) continue;
+            const wanted = stat.isFile() ? (stat.mode & 0o700) | 0o600 : stat.mode & 0o700;
+            if ((stat.mode & 0o7777) !== wanted) fs.chmodSync(entry, wanted);
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+            if (!shared) throw gone(name);
+          }
         }
-        try {
-          if (stat.uid !== owner.uid || stat.gid !== owner.gid) fs.lchownSync(entry, owner.uid, owner.gid);
-          if (stat.isSymbolicLink()) continue;
-          const wanted = stat.isFile() ? (stat.mode & 0o700) | 0o600 : stat.mode & 0o700;
-          if ((stat.mode & 0o7777) !== wanted) fs.chmodSync(entry, wanted);
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-        }
+      } finally {
+        listing.closeSync();
       }
       if (own && own.pending === 0) close(own);
       release(frame.anchor);
@@ -1984,61 +2092,110 @@ async function closePass(dir, root, owner) {
   }
 }
 
-// What `rm` takes: GNU rm names every directory it enters by a descriptor and
-// opens each child without following a link, so a path component swapped for a
-// link while it works is unlinked as a link and never walked into, which neither
-// Node 22's fs.rmSync (it resolves each child by its whole path) nor a walk of
-// our own can promise. --one-file-system keeps it from entering a mount that was
-// put in the tree. A system whose rm lacks it (not Linux) gets the plain flags.
+// What removes entries: GNU rm names every directory it enters by a descriptor
+// and opens each child without following a link, so a path component swapped for
+// a link while it works is unlinked as a link and never walked into, which
+// neither Node 22's fs.rmSync (it resolves each child by its whole path) nor a
+// walk of our own can promise. --one-file-system keeps it from entering a mount
+// that was put in the tree. A system whose rm lacks it (not Linux) gets the plain
+// flags. It is run by xargs -0 with the names on its standard input, because a
+// name that is not valid UTF-8 cannot travel in an argument (Node turns each
+// argument into text), and from the holder directory named by a descriptor the
+// runner holds open (/proc/self/fd/<n>, which the child resolves before it
+// changes account), so no path above a name is ever resolved by the removal.
 let removalFlags = null;
-function removalArguments(names) {
+function removalCommand() {
   if (removalFlags === null) {
     const version = spawnSync('rm', ['--version'], { encoding: 'utf8' });
     removalFlags = /GNU/.test(`${version.stdout || ''}`) ? ['-rf', '--one-file-system'] : ['-rf'];
   }
+  return ['-0', '-r', 'rm', ...removalFlags, '--'];
+}
+
+// The names, NUL separated, after the checks: one name at a time, never a path.
+function removalInput(names) {
+  const parts = [];
   for (const name of names) {
-    if (typeof name !== 'string' || name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
+    const bytes = Buffer.isBuffer(name) ? name : typeof name === 'string' ? Buffer.from(name, 'utf8') : null;
+    if (!bytes || bytes.length === 0 || bytes.includes(SLASH_BYTE) || bytes.includes(NUL_BYTE) || bytes.equals(Buffer.from('.')) || bytes.equals(Buffer.from('..'))) {
       throw new Error('a removal takes one name at a time, never a path');
     }
+    parts.push(bytes, Buffer.from([NUL_BYTE]));
   }
-  return [...removalFlags, '--', ...names];
+  return Buffer.concat(parts);
 }
 
-// Removes `names` (single names, never paths) from `holder` with rm, run from
-// holder as the runner's own account: after a close, every entry of a tree the
-// agent had is the runner's, so nothing here needs a privileged account, and a
-// tree that was not closed is refused rather than removed from.
+// A directory held open for the length of a removal, or null when it is not
+// there (nothing to remove from it).
+function openHolder(holder) {
+  try {
+    return fs.openSync(holder, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return null;
+    throw error;
+  }
+}
+
+function removalFailure(names, holder, detail) {
+  return new Error(`${oneLine(names.map(shown).join(' '), 120)} could not be removed from ${shown(holder)}: ${oneLine(redact(detail || ''), 200)}`);
+}
+
+// Removes `names` (single names, never paths; strings or Buffers) from `holder`
+// with rm, run from holder with the runner's capabilities as they are (root in
+// the container, the capabilities of the caps mode on a host, and the process's
+// own account with no split), never as the agent's. After a close every entry of
+// a tree the agent had is the runner's, so the removal needs nothing a runner
+// does not hold, and a tree that was not closed is refused rather than removed
+// from (removeEntries).
 async function removeNames(holder, names) {
-  if (names.length === 0 || !statOrNull(holder)) return;
-  for (let at = 0; at < names.length; at += 100) {
-    const chunk = names.slice(at, at + 100);
-    const done = await runProcess('rm', removalArguments(chunk), { cwd: holder });
-    if (done.code !== 0) throw new Error(`${oneLine(chunk.join(' '), 120)} could not be removed from ${holder}: ${oneLine(redact(done.stderr || ''), 200)}`);
+  if (names.length === 0) return;
+  const descriptor = openHolder(holder);
+  if (descriptor === null) return;
+  try {
+    for (let at = 0; at < names.length; at += 100) {
+      const chunk = names.slice(at, at + 100);
+      const done = await runProcess('xargs', removalCommand(), { cwd: `/proc/self/fd/${descriptor}`, input: removalInput(chunk) });
+      if (done.code !== 0) throw removalFailure(chunk, holder, done.stderr);
+    }
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 
-// The same for the few small things removed where nothing can wait: the
-// memory copy at the end of a run, whose size the memory bounds already limit,
-// and what the runner removes from the agent's own home and database directory
-// (`as` 'root': those are the agent's, not the runner's, and a swap while rm works
-// is still unlinked as a link and never followed).
+// The same for the few small things removed where nothing can wait: the memory
+// copy at the end of a run, whose size the memory bounds already limit, and what
+// the runner removes from the agent's own home and the database
+// directory (`as` 'root': those are the agent's, not the runner's, so they are
+// removed with the account that can remove them, root in the container and the
+// capabilities of the caps mode; a swap while rm works is still unlinked as a
+// link and never followed).
 function removeNamesSync(holder, names, as = 'runner') {
-  if (names.length === 0 || !statOrNull(holder)) return;
-  const launched = launch('rm', removalArguments(names), minimalEnv(), as);
-  const done = spawnSync(launched.command, launched.args, { cwd: holder, env: launched.env, encoding: 'utf8', timeout: 60_000, ...launched.ids });
-  if (done.status !== 0) throw new Error(`${oneLine(names.join(' '), 120)} could not be removed from ${holder}: ${oneLine(redact(done.stderr || done.error?.message || ''), 200)}`);
+  if (names.length === 0) return;
+  const descriptor = openHolder(holder);
+  if (descriptor === null) return;
+  try {
+    const launched = launch('xargs', removalCommand(), minimalEnv(), as);
+    const done = spawnSync(launched.command, launched.args, { cwd: `/proc/self/fd/${descriptor}`, env: launched.env, input: removalInput(names), encoding: 'utf8', timeout: 60_000, ...launched.ids });
+    if (done.status !== 0) throw removalFailure(names, holder, done.stderr || (done.error && done.error.message));
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 // Removes entries of a directory inside a tree the runner has taken back and
 // closed. The refusal is the point: no recursive removal of what an agent made
 // runs over a tree that is not closed, whoever asks.
+function assertClosed(holder) {
+  if (!isClosedUnder(shown(holder))) throw new Error(`${shown(holder)} is not closed to other accounts, so nothing is removed from it`);
+}
+
 async function removeEntries(holder, names) {
-  if (!isClosedUnder(holder)) throw new Error(`${holder} is not closed to other accounts, so nothing is removed from it`);
+  assertClosed(holder);
   await removeNames(holder, names);
 }
 
 function removeEntriesSync(holder, names) {
-  if (!isClosedUnder(holder)) throw new Error(`${holder} is not closed to other accounts, so nothing is removed from it`);
+  assertClosed(holder);
   removeNamesSync(holder, names);
 }
 
@@ -2219,7 +2376,7 @@ function ensureDirectory(target, who, mode) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  if (stat && !stat.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
+  if (stat && !stat.isDirectory()) removeNamesSync(path.dirname(target), [path.basename(target)], 'root');
   fs.mkdirSync(target, { recursive: true });
   fs.lchownSync(target, who.uid, who.gid);
   fs.chmodSync(target, mode);
@@ -2287,7 +2444,7 @@ function writeAgentGitconfig(home) {
   const gitconfig = path.join(home, '.gitconfig');
   const found = readSmallRegularFile(gitconfig, AGENT_FILE_MAX_BYTES);
   if (found.state === 'ok' && found.content.toString('utf8') === AGENT_GITCONFIG) return;
-  fs.rmSync(gitconfig, { recursive: true, force: true });
+  removeNamesSync(home, ['.gitconfig'], 'root');
   const fd = fs.openSync(gitconfig, 'wx', 0o600);
   try {
     fs.writeSync(fd, AGENT_GITCONFIG);
@@ -2754,13 +2911,14 @@ function chmodDirectory(target) {
   return true;
 }
 
+// Entries come back as Dirents whose names are Buffers (see joinBytes).
 function readDirectory(dir) {
   try {
-    return fs.readdirSync(dir, { withFileTypes: true });
+    return fs.readdirSync(dir, { withFileTypes: true, encoding: 'buffer' });
   } catch (error) {
     if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error;
     if (!chmodDirectory(dir)) throw error;
-    return fs.readdirSync(dir, { withFileTypes: true });
+    return fs.readdirSync(dir, { withFileTypes: true, encoding: 'buffer' });
   }
 }
 
@@ -2769,38 +2927,36 @@ function readDirectory(dir) {
 // while the runner reads it.
 async function listDirectory(dir) {
   try {
-    return await fs.promises.readdir(dir, { withFileTypes: true });
+    return await fs.promises.readdir(dir, { withFileTypes: true, encoding: 'buffer' });
   } catch (error) {
     if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error;
     if (!chmodDirectory(dir)) throw error;
-    return fs.promises.readdir(dir, { withFileTypes: true });
+    return fs.promises.readdir(dir, { withFileTypes: true, encoding: 'buffer' });
   }
 }
 
-// Whether `place`, with every link in it followed, is `realRoot` or below it.
+// Whether `place`, with every link in it followed, is `realRoot` or below it
+// (both as bytes).
 function insideRealRoot(realRoot, place) {
-  return place === realRoot || place.startsWith(realRoot.endsWith(path.sep) ? realRoot : `${realRoot}${path.sep}`);
+  if (place.equals(realRoot)) return true;
+  const prefix = realRoot[realRoot.length - 1] === SLASH_BYTE ? realRoot : joinBytes(realRoot, '/');
+  return place.length >= prefix.length && place.subarray(0, prefix.length).equals(prefix);
 }
 
 // Whether a directory the runner is about to read still is, right now, a
 // directory inside the checkout: a path component that became a link after the
-// path was first judged shows here.
+// path was first judged shows here. The path is resolved by the system's own
+// realpath, which hands the answer back as bytes (Node's own would decode every
+// name on the way and fail on one that is not UTF-8).
 function directoryInside(realRoot, dir) {
   try {
-    return insideRealRoot(realRoot, fs.realpathSync(dir));
+    return insideRealRoot(realRoot, fs.realpathSync.native(dir, { encoding: 'buffer' }));
   } catch (error) {
     // Gone, or a link that goes nowhere: not inside. Anything else (a path longer
     // than the system allows) is a failure to read the tree, not an answer.
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR' || error.code === 'ELOOP') return false;
     throw error;
   }
-}
-
-// Whether the directory that holds `target` is inside the checkout right now, so
-// that taking `target` out (a file, a directory, or a link, which goes as a link
-// and is never followed) cannot land anywhere else.
-function holderInside(realRoot, target) {
-  return directoryInside(realRoot, path.dirname(target));
 }
 
 // Gives every directory under `target` back to the runner (0700) so it can be
@@ -2814,7 +2970,7 @@ function makeTreeWritable(realRoot, target) {
     if (!stat || !stat.isDirectory()) continue;
     if (!directoryInside(realRoot, current)) continue;
     if (!chmodDirectory(current)) continue;
-    for (const entry of readDirectory(current)) stack.push(path.join(current, entry.name));
+    for (const entry of readDirectory(current)) stack.push(joinBytes(current, '/', entry.name));
   }
 }
 
@@ -2832,14 +2988,14 @@ async function forceRemoveNames(realRoot, holder, names) {
   } catch (error) {
     if (/is not closed to other accounts/.test(error.message)) throw error;
   }
-  for (const name of names) makeTreeWritable(realRoot, path.join(holder, name));
+  for (const name of names) makeTreeWritable(realRoot, joinBytes(holder, '/', name));
   if (!directoryInside(realRoot, holder)) return false;
   await removeEntries(holder, names);
   return true;
 }
 
 function forceRemove(realRoot, target) {
-  return forceRemoveNames(realRoot, path.dirname(target), [path.basename(target)]);
+  return forceRemoveNames(realRoot, dirnameBytes(target), [basenameBytes(target)]);
 }
 
 // The gitlink paths of the runner's own index. Only the index is read: no file
@@ -2868,24 +3024,36 @@ function pathInside(root, relative) {
   return path.join(current, parts[parts.length - 1]);
 }
 
-// Of the directories that hold a `.git`, the ones the repository's ignore rules
-// cover (its .gitignore files and the runner's own excludes: patterns only, no
-// file is read as content, and nothing starts a driver). Judged by path alone
-// (--no-index), with the directory's own trailing slash, so a rule such as
-// `vendor/` covers `vendor/pkg/`. When git cannot answer, nothing is ignored:
-// the paths are refused as a repository the pull request cannot hold.
+// Of the directories that hold a `.git` (as bytes), the ones the repository's
+// ignore rules cover (its .gitignore files and the runner's own excludes:
+// patterns only, no file is read as content, and nothing starts a driver). Judged
+// by path alone (--no-index), with the directory's own trailing slash, so a rule
+// such as `vendor/` covers `vendor/pkg/`. When git cannot answer, nothing is
+// ignored: the paths are refused as a repository the pull request cannot hold.
+// Answers the set of the covered ones as hex strings, which is what a name made
+// of bytes can be compared by.
 async function ignoredDirectories(workspace, directories) {
   if (directories.length === 0) return new Set();
+  const input = Buffer.concat(directories.flatMap((directory) => [directory, Buffer.from('/'), Buffer.from([NUL_BYTE])]));
   const asked = await runProcess(
     'git',
     [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`, 'check-ignore', '--no-index', '-z', '--stdin'],
-    { env: gitEnv(), cwd: workspace.dir, input: `${directories.map((directory) => `${directory}/`).join('\0')}\0` }
+    { env: gitEnv(), cwd: workspace.dir, input, binary: true }
   );
   if (asked.code !== 0 && asked.code !== 1) {
     log('warn', `${workspace.repo ? workspace.repo.fullName : workspace.dir}: git could not say which directories holding a repository are ignored (${oneLine(redact(asked.stderr || ''), 160)}), so none is read as ignored`);
     return new Set();
   }
-  return new Set(asked.stdout.split('\0').filter(Boolean).map((entry) => entry.replace(/\/$/, '')));
+  const covered = new Set();
+  let from = 0;
+  for (let at = asked.stdout.indexOf(NUL_BYTE, from); at !== -1; at = asked.stdout.indexOf(NUL_BYTE, from)) {
+    let entry = asked.stdout.subarray(from, at);
+    from = at + 1;
+    if (entry.length === 0) continue;
+    if (entry[entry.length - 1] === SLASH_BYTE) entry = entry.subarray(0, entry.length - 1);
+    covered.add(entry.toString('hex'));
+  }
+  return covered;
 }
 
 // What the agent's account can leave in a checkout that git would read as a
@@ -2929,15 +3097,20 @@ async function scrubPlantedRepositories(workspace) {
   // write in: a tree not taken back and closed is closed first, and when that
   // fails the scrub does not run.
   if (!isClosedUnder(root)) await closeTree(root);
-  const realRoot = fs.realpathSync(root);
+  // Paths below the root are bytes, like the names they are made of (see
+  // joinBytes); only what is told is text, lossy where a name is not UTF-8.
+  const rootBytes = Buffer.from(root, 'utf8');
+  const realRoot = fs.realpathSync.native(root, { encoding: 'buffer' });
   const plants = { submodule: new Set(), ignored: new Set(), embedded: new Set(), escaped: new Set() };
   const escaped = (relative) => {
-    plants.escaped.add(`${relative}/`);
-    log('error', `${workspace.repo ? workspace.repo.fullName : root}: ${relative}/ resolved to a place outside the checkout while it was being cleaned, so nothing there was touched and the request is refused`);
+    const text = shown(relative);
+    plants.escaped.add(`${text}/`);
+    log('error', `${workspace.repo ? workspace.repo.fullName : root}: ${text}/ resolved to a place outside the checkout while it was being cleaned, so nothing there was touched and the request is refused`);
   };
   if (workspace.gitdir) {
     for (const relative of await gitlinkPaths(workspace)) {
-      const target = pathInside(root, relative);
+      const inside = pathInside(root, relative);
+      const target = inside ? Buffer.from(inside, 'utf8') : null;
       const stat = target ? statOrNull(target) : null;
       if (!stat) continue;
       if (stat.isDirectory()) {
@@ -2959,31 +3132,33 @@ async function scrubPlantedRepositories(workspace) {
     }
   }
   const nested = [];
-  const stack = [{ dir: root, relative: '' }];
+  const stack = [{ dir: rootBytes, relative: Buffer.alloc(0) }];
   while (stack.length > 0) {
     const { dir, relative } = stack.pop();
-    if (dir !== root && !directoryInside(realRoot, dir)) {
+    if (!dir.equals(rootBytes) && !directoryInside(realRoot, dir)) {
       escaped(relative);
       continue;
     }
     for (const entry of await listDirectory(dir)) {
-      const target = path.join(dir, entry.name);
-      if (entry.name.toLowerCase() === '.git') {
+      const target = joinBytes(dir, '/', entry.name);
+      if (entry.name.length === 4 && entry.name.toString('latin1').toLowerCase() === '.git') {
         nested.push({ target, relative });
       } else if (entry.isDirectory()) {
-        stack.push({ dir: target, relative: relative === '' ? entry.name : `${relative}/${entry.name}` });
+        stack.push({ dir: target, relative: relative.length === 0 ? entry.name : joinBytes(relative, '/', entry.name) });
       }
     }
   }
-  const held = [...new Set(nested.filter((entry) => entry.relative !== '').map((entry) => entry.relative))];
-  const ignored = workspace.gitdir ? await ignoredDirectories(workspace, held) : new Set(held);
+  const heldByHex = new Map();
+  for (const entry of nested) if (entry.relative.length > 0) heldByHex.set(entry.relative.toString('hex'), entry.relative);
+  const held = [...heldByHex.values()];
+  const ignored = workspace.gitdir ? await ignoredDirectories(workspace, held) : new Set(heldByHex.keys());
   for (const { target, relative } of nested) {
     if (!(await forceRemove(realRoot, target))) {
-      escaped(relative === '' ? '.git' : `${relative}/.git`);
+      escaped(relative.length === 0 ? '.git' : `${shown(relative)}/.git`);
       continue;
     }
-    if (relative === '') continue;
-    plants[ignored.has(relative) ? 'ignored' : 'embedded'].add(`${relative}/`);
+    if (relative.length === 0) continue;
+    plants[ignored.has(relative.toString('hex')) ? 'ignored' : 'embedded'].add(`${shown(relative)}/`);
   }
   return { submodule: [...plants.submodule].sort(), ignored: [...plants.ignored].sort(), embedded: [...plants.embedded].sort(), escaped: [...plants.escaped].sort() };
 }
@@ -3132,7 +3307,7 @@ async function settleWorkspace(config) {
   }
   settleDir(lay.memory, 0o700);
   settleDir(lay.scratch, 0o700);
-  await closeTree(lay.memory);
+  await closeTree(lay.memory, { shared: true });
 }
 
 async function refExists(workspace, ref) {
@@ -7152,6 +7327,7 @@ module.exports = {
     reclaim,
     stageAndGate,
     closeTree,
+    closeTuning,
     removeTree,
     removeEntries,
     settleInstanceGate,

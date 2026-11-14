@@ -47,6 +47,7 @@ ARG MISE_VERSION=2026.10.12
 # direction for the one package here that talks to a network.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        acl \
         bash \
         build-essential \
         ca-certificates \

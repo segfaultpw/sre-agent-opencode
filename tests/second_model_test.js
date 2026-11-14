@@ -730,16 +730,16 @@ async function main() {
     asSplit();
     try {
     // What a directory looks like at the moment its listing is read: closed already.
-    const realList = fs.readdirSync;
+    const realList = fs.opendirSync;
     const atListing = [];
-    fs.readdirSync = function patched(target, ...rest) {
+    fs.opendirSync = function patched(target, ...rest) {
       if (String(target).startsWith('/proc/self/fd/')) atListing.push(fs.statSync(target).mode & 0o7777);
       return realList.call(fs, target, ...rest);
     };
     try {
       await closeTree(root);
     } finally {
-      fs.readdirSync = realList;
+      fs.opendirSync = realList;
       noSplit();
     }
     assert.ok(atListing.length >= 6, `every directory was listed through its descriptor (${atListing.length})`);
@@ -779,6 +779,218 @@ async function main() {
     } finally {
       noSplit();
       scrub(root);
+    }
+  });
+
+  // A name is bytes: a repository can track a file whose name is not UTF-8 (a
+  // Latin-1 name in an old repository), and an agent can make one. Every walk of
+  // a tree an agent touched reads names as bytes and hands them on as bytes.
+  const raw = (...parts) => Buffer.concat(parts.map((part) => (Buffer.isBuffer(part) ? part : Buffer.from(part))));
+  const odd = (label, byte) => raw(label, Buffer.from([byte]));
+  const slash = Buffer.from('/');
+
+  await check('closeTree and removeTree take a tree whose names are not valid UTF-8, and the scratch directory with one', async () => {
+    const { closeTree, removeTree } = runner.internals;
+    const root = path.join(work, 'close-bytes');
+    scrub(root);
+    fs.mkdirSync(root);
+    const badFile = raw(root, slash, odd('bad', 0xff));
+    const badDir = raw(root, slash, odd('dir', 0xfe));
+    const deeper = raw(badDir, slash, odd('sub', 0xe9));
+    fs.writeFileSync(badFile, 'x\n', { mode: 0o666 });
+    fs.mkdirSync(badDir);
+    fs.mkdirSync(deeper);
+    fs.writeFileSync(raw(deeper, slash, odd('f', 0xc0)), 'x\n', { mode: 0o666 });
+    fs.writeFileSync(raw(badDir, slash, 'ok.txt'), 'x\n', { mode: 0o666 });
+    fs.chmodSync(deeper, 0o777);
+    fs.chmodSync(badDir, 0o777);
+    // A link whose name is not UTF-8, to a directory outside: given away, never followed.
+    const outside = path.join(work, 'close-bytes-outside');
+    scrub(outside);
+    fs.mkdirSync(outside, { mode: 0o777 });
+    fs.chmodSync(outside, 0o777);
+    fs.symlinkSync(outside, raw(badDir, slash, odd('link', 0xfd)));
+    asSplit();
+    try {
+      await closeTree(root);
+      const found = spawnSync('find', [root, '(', '!', '-uid', String(process.getuid()), '-o', '(', '!', '-type', 'l', '-a', '-perm', '/077', ')', ')', '-print', '-quit'], { encoding: 'utf8' });
+      assert.equal(found.stdout, '', 'nothing is left open');
+      assert.equal(fs.statSync(badDir).mode & 0o7777, 0o700, 'the directory with a name that is not UTF-8 is closed');
+      assert.equal(fs.statSync(deeper).mode & 0o7777, 0o700, 'and so is the one below it');
+      assert.equal(fs.statSync(raw(deeper, slash, odd('f', 0xc0))).mode & 0o7077, 0, 'and the file in it');
+      assert.equal(fs.statSync(outside).mode & 0o7777, 0o777, 'what the link names is not changed');
+      await removeTree(root);
+      assert.equal(fs.existsSync(root), false, 'the whole of it is removed, names that are not UTF-8 included');
+    } finally {
+      noSplit();
+      scrub(root);
+      scrub(outside);
+    }
+  });
+
+  await check('removeEntries removes entries named by bytes, and refuses a name that is a path', async () => {
+    const { closeTree, removeEntries } = runner.internals;
+    const root = path.join(work, 'remove-bytes');
+    scrub(root);
+    fs.mkdirSync(root);
+    const first = odd('one', 0xff);
+    const second = odd('two', 0xfe);
+    fs.mkdirSync(raw(root, slash, first));
+    fs.writeFileSync(raw(root, slash, first, '/inner'), 'x\n');
+    fs.writeFileSync(raw(root, slash, second), 'x\n');
+    fs.writeFileSync(path.join(root, 'keep'), 'x\n');
+    asSplit();
+    try {
+      await closeTree(root);
+      await removeEntries(root, [first, second]);
+      assert.deepEqual(fs.readdirSync(root), ['keep'], 'both were removed, and nothing else');
+      await assert.rejects(removeEntries(root, [raw('a/', Buffer.from([0xff]))]), /one name/);
+      await assert.rejects(removeEntries(root, [Buffer.alloc(0)]), /one name/);
+    } finally {
+      noSplit();
+      scrub(root);
+    }
+  });
+
+  await check('a repository planted below a directory whose name is not UTF-8 is found, removed and told, and the checkout is taken back', async () => {
+    const { reclaim, setAgentKiller } = runner.internals;
+    const root = path.join(work, 'scrub-bytes');
+    scrub(root);
+    fs.mkdirSync(root);
+    const parent = raw(root, slash, odd('p', 0xff));
+    fs.mkdirSync(raw(parent, slash, 'inner', slash, '.git'), { recursive: true });
+    fs.writeFileSync(raw(parent, slash, 'inner', slash, '.git', slash, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(raw(parent, slash, 'inner', slash, 'tracked.txt'), 'x\n');
+    fs.writeFileSync(raw(root, slash, odd('f', 0xe9)), 'x\n', { mode: 0o666 });
+    fs.mkdirSync(raw(root, slash, odd('g', 0xe8), slash, '.git'), { recursive: true });
+    const workspace = { dir: root, gitdir: null, repo: null };
+    asSplit();
+    setAgentKiller(async () => true);
+    try {
+      assert.equal(await reclaim(root, null, workspace), true);
+    } finally {
+      setAgentKiller(null);
+      noSplit();
+    }
+    assert.equal(fs.existsSync(raw(parent, slash, 'inner', slash, '.git')), false, 'the repository below the odd name is removed');
+    assert.equal(fs.existsSync(raw(root, slash, odd('g', 0xe8), slash, '.git')), false, 'and so is one directly in a directory with an odd name');
+    assert.equal(fs.existsSync(raw(parent, slash, 'inner', slash, 'tracked.txt')), true, 'the files around them stay');
+    assert.equal(fs.existsSync(raw(root, slash, odd('f', 0xe9))), true, 'a file with an odd name stays');
+    assert.equal(workspace.plants.escaped.length, 0, 'nothing is told as escaped: the odd name is not a path that left the checkout');
+    assert.equal(workspace.plants.ignored.length + workspace.plants.embedded.length, 2, 'both are told, by a name that can be shown');
+    assert.ok(workspace.planted.every((entry) => entry.endsWith('/')), 'as paths of directories');
+    scrub(root);
+  });
+
+  await check('a tree of multibyte names deeper than a path can be, in bytes, is closed and removed', async () => {
+    const { closeTree, removeTree } = runner.internals;
+    const root = path.join(work, 'close-multibyte');
+    scrub(root);
+    fs.mkdirSync(root);
+    // 85 characters of three bytes each: 255 bytes a name, 85 UTF-16 code units, so
+    // twenty levels are 5,100 bytes (a path holds 4,096) and 1,700 code units.
+    const built = spawnSync('bash', ['-c', 'name=$(printf "\\xe2\\x82\\xac%.0s" $(seq 1 85)); cd "$1" && for _ in $(seq 1 20); do mkdir "$name" && chmod 777 "$name" && cd "$name" || exit 1; done; touch file', 'x', root], { encoding: 'utf8' });
+    assert.equal(built.status, 0, built.stderr);
+    asSplit();
+    try {
+      await closeTree(root);
+      const found = spawnSync('find', [root, '(', '!', '-uid', String(process.getuid()), '-o', '(', '!', '-type', 'l', '-a', '-perm', '/077', ')', ')', '-print', '-quit'], { encoding: 'utf8' });
+      assert.equal(found.stdout, '', 'nothing is left open');
+      await removeTree(root);
+      assert.equal(fs.existsSync(root), false, 'and the whole of it is removed');
+    } finally {
+      noSplit();
+      scrub(root);
+    }
+  });
+
+  await check('closeTree gives the event loop back by elapsed time, and a vanished name is an error outside a tree the runner shares', async () => {
+    const { closeTree, closeTuning } = runner.internals;
+    const root = path.join(work, 'close-yield');
+    scrub(root);
+    fs.mkdirSync(root);
+    for (let n = 0; n < 300; n += 1) fs.writeFileSync(path.join(root, `f${n}`), 'x\n', { mode: 0o666 });
+    asSplit();
+    try {
+      const before = closeTuning.yields;
+      const saved = closeTuning.sliceMs;
+      closeTuning.sliceMs = 0;
+      try {
+        await closeTree(root);
+      } finally {
+        closeTuning.sliceMs = saved;
+      }
+      assert.ok(closeTuning.yields - before >= 300, `an entry that outlasts the slice yields (${closeTuning.yields - before} yields)`);
+      const quiet = closeTuning.yields;
+      await closeTree(root);
+      assert.ok(closeTuning.yields - quiet < 100, 'a pass that fits in a few slices yields a few times, not once an entry');
+      // A name listed and then gone: the tree is closed, so nobody else can have
+      // removed it, and that is an error. A tree the runner shares with another
+      // worker's runner (the memory) can lose one, and says so by `shared`.
+      const realLstat = fs.lstatSync;
+      let dropped = false;
+      fs.lstatSync = function patched(target, ...rest) {
+        if (!dropped && /^\/proc\/self\/fd\/\d+\/f7$/.test(String(target))) {
+          dropped = true;
+          fs.unlinkSync(target);
+        }
+        return realLstat.call(fs, target, ...rest);
+      };
+      try {
+        await assert.rejects(closeTree(root), /could not be closed to other accounts: .*is gone/);
+        assert.equal(dropped, true, 'the premise: the file was dropped between the listing and the look');
+        dropped = false;
+        fs.writeFileSync(path.join(root, 'f7'), 'x\n', { mode: 0o666 });
+        await closeTree(root, { shared: true });
+        assert.equal(dropped, true, 'the file was dropped again, and a shared tree takes that');
+      } finally {
+        fs.lstatSync = realLstat;
+      }
+    } finally {
+      noSplit();
+      scrub(root);
+    }
+  });
+
+  await check('the instance directory carries no access control list, a named entry and a default one set beforehand included', async () => {
+    const { settleInstanceGate } = runner.internals;
+    const parent = path.join(work, 'acl-instances');
+    fs.rmSync(parent, { recursive: true, force: true });
+    fs.mkdirSync(parent, { recursive: true });
+    const probe = spawnSync('setfacl', ['-d', '-m', 'u:65534:rx', parent], { encoding: 'utf8' });
+    if (probe.status !== 0) {
+      console.log(`     (skipped: ACLs cannot be set here: ${(probe.stderr || probe.error?.message || '').trim()})`);
+      return;
+    }
+    const dir = path.join(parent, 'pool-1');
+    fs.mkdirSync(dir);
+    assert.equal(spawnSync('setfacl', ['-m', 'u:65534:rx,g:65533:rx', dir]).status, 0);
+    const named = spawnSync('getfacl', ['-c', '-p', '-n', dir], { encoding: 'utf8' }).stdout;
+    assert.match(named, /^user:65534:r-x$/m, 'the premise: the directory has a named entry');
+    assert.match(spawnSync('getfacl', ['-c', '-p', '-n', parent], { encoding: 'utf8' }).stdout, /^default:user:65534:r-x$/m, 'and its parent a default one');
+    const groups = [...new Set([process.getgid(), ...process.getgroups()])];
+    asSplit({ agent: { uid: process.getuid() + 1, gid: groups[groups.length - 1], home: work } });
+    try {
+      settleInstanceGate(dir);
+      const after = spawnSync('getfacl', ['-c', '-p', '-n', dir], { encoding: 'utf8' }).stdout.trim().split('\n');
+      assert.deepEqual(after.map((line) => line.split(':')[0]), ['user', 'group', 'other'], `no entry is left: ${after.join(' | ')}`);
+      assert.equal(fs.statSync(dir).mode & 0o7777, 0o710);
+      // A directory made later inherits the parent's default entry; settled again, it is clean.
+      const later = path.join(parent, 'pool-2');
+      fs.mkdirSync(later);
+      assert.match(spawnSync('getfacl', ['-c', '-p', '-n', later], { encoding: 'utf8' }).stdout, /^user:65534:r-x$/m, 'the premise: a new directory inherits an entry');
+      settleInstanceGate(later);
+      assert.equal(spawnSync('getfacl', ['-c', '-p', '-n', later], { encoding: 'utf8' }).stdout.trim().split('\n').length, 3);
+      // Without the tools that clear and read an ACL, the check cannot be made, so no checkout is handed over.
+      const savedPath = process.env.PATH;
+      process.env.PATH = path.join(work, 'no-such-bin');
+      try {
+        assert.throws(() => settleInstanceGate(dir), /setfacl|getfacl|access control list/);
+      } finally {
+        process.env.PATH = savedPath;
+      }
+    } finally {
+      noSplit();
     }
   });
 

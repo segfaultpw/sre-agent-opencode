@@ -212,6 +212,27 @@ async function main() {
     assert.equal(asRoot.code, 2);
   });
 
+  await check('an agent account that is in another agent\'s group, or has it as its primary group, is refused as far as the account database says so', () => {
+    const etc = fs.mkdtempSync(path.join(os.tmpdir(), 'supervisor-etc-'));
+    try {
+      const env = accounts(2);
+      const write = (passwd, group) => {
+        fs.writeFileSync(path.join(etc, 'passwd'), passwd);
+        fs.writeFileSync(path.join(etc, 'group'), group);
+      };
+      write('agent:x:20010:20010::/h:/bin/false\nagent-2:x:20020:20020::/h:/bin/false\n', 'agent:x:20010:\nagent-2:x:20020:\n');
+      assert.equal(supervisor.workerAccounts(env, 2, etc).length, 2, 'accounts with a group of their own are accepted');
+      write('agent:x:20010:20010::/h:/bin/false\nagent-2:x:20020:20020::/h:/bin/false\n', 'agent:x:20010:agent-2\nagent-2:x:20020:\n');
+      assert.throws(() => supervisor.workerAccounts(env, 2, etc), /agent-2 is listed as a member of group agent \(20010\)/);
+      write('agent:x:20010:20010::/h:/bin/false\nagent-2:x:20020:20010::/h:/bin/false\n', 'agent:x:20010:\n');
+      assert.throws(() => supervisor.workerAccounts(env, 2, etc), /agent-2 \(uid 20020\) has group 20010 as its primary group/);
+      write('agent:x:20010:20010::/h:/bin/false\nrunner:x:19999:20010::/h:/bin/false\n', 'agent:x:20010:runner\n');
+      assert.equal(supervisor.workerAccounts(accounts(1), 1, etc).length, 1, 'the runner\'s own account in the group does no harm');
+    } finally {
+      fs.rmSync(etc, { recursive: true, force: true });
+    }
+  });
+
   await check('with no agent account at all (the split off) any number of workers starts, with none handed over', async () => {
     const run = launch({ SRE_CONCURRENCY: '4' });
     try {

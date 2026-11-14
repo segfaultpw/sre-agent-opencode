@@ -7,9 +7,12 @@
 // a directory outside it, as fast as it can, while the runner's own removal
 // (removeTree) runs, under every Node this machine has (the one running this
 // test, and Node 22 when it is installed: NODE22 names it, else nvm's), and
-// asserts that nothing outside the tree was touched. Where fs.rmSync is shown to
-// lose files in the same race the test says so, but never asserts it: whether
-// the swap wins is the scheduler's.
+// asserts that nothing outside the tree was touched. The race has to have
+// happened: the swapper counts every exchange it makes in a file, the removal
+// reads that count before and after, and a round in which no exchange was made
+// while the removal ran is a failure, not a pass (a removal that nothing raced
+// proves nothing). Where fs.rmSync is shown to lose files in the same race the
+// test says so, but never asserts it: whether the swap wins is the scheduler's.
 // Run with `node tests/removal_race_test.js`. It needs python3 for the swapper
 // (renameat2 with RENAME_EXCHANGE has no Node binding); without it the test says
 // SKIP and passes, and in CI (CI=true) that is a failure.
@@ -25,14 +28,18 @@ process.on('exit', () => spawnSync('rm', ['-rf', work]));
 
 const ROUNDS = 3;
 const FILES_IN_VICTIM = 200;
+const DIRECTORIES = 100;
 
 const SWAPPER = `
 import os, sys, time, ctypes
 libc = ctypes.CDLL(None, use_errno=True)
 AT_FDCWD = -100
 RENAME_EXCHANGE = 2
-base, victim, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+base, victim, count, counter = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 stop = time.time() + 30
+done = 0
+fd = os.open(counter, os.O_WRONLY | os.O_CREAT, 0o644)
+os.pwrite(fd, b"%016d" % done, 0)
 pairs = []
 for i in range(count):
     link = os.path.join(base, "s%d" % i)
@@ -43,7 +50,9 @@ for i in range(count):
     pairs.append((os.path.join(base, "d%d" % i).encode(), link.encode()))
 while time.time() < stop:
     for a, b in pairs:
-        libc.renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE)
+        if libc.renameat2(AT_FDCWD, a, AT_FDCWD, b, RENAME_EXCHANGE) == 0:
+            done += 1
+    os.pwrite(fd, b"%016d" % done, 0)
     if not os.path.isdir(base):
         break
 `;
@@ -72,11 +81,11 @@ function build(round) {
   fs.mkdirSync(path.join(root, 't', 'x'), { recursive: true });
   fs.mkdirSync(victim, { recursive: true });
   for (let n = 1; n <= FILES_IN_VICTIM; n += 1) fs.writeFileSync(path.join(victim, `v${n}`), 'keep\n');
-  for (let i = 0; i < 50; i += 1) {
+  for (let i = 0; i < DIRECTORIES; i += 1) {
     fs.mkdirSync(path.join(root, 't', 'x', `d${i}`));
     for (let j = 1; j <= 50; j += 1) fs.writeFileSync(path.join(root, 't', 'x', `d${i}`, `w${j}`), '');
   }
-  return { tree: path.join(root, 't'), base: path.join(root, 't', 'x'), victim };
+  return { tree: path.join(root, 't'), base: path.join(root, 't', 'x'), victim, counter: path.join(root, 'exchanges') };
 }
 
 const REMOVER = `
@@ -86,27 +95,35 @@ const runner = require(${JSON.stringify(runnerPath)});
 runner.internals.setIdentity({ mode: 'none', runner: null, agent: null });
 const how = process.argv[1];
 const target = process.argv[2];
+const counter = process.argv[3];
+const exchanges = () => { try { return Number.parseInt(require('node:fs').readFileSync(counter, 'utf8'), 10) || 0; } catch { return 0; } };
+const before = exchanges();
 const run = how === 'rmSync'
   ? () => { try { require('node:fs').rmSync(target, { recursive: true, force: true }); } catch (error) { console.error('rmSync threw ' + error.code); } return Promise.resolve(); }
   : () => runner.internals.removeTree(target);
-run().then(() => process.exit(0), (error) => { console.error(error.message); process.exit(1); });
+run().then(
+  () => { console.log('exchanged ' + (exchanges() - before)); process.exit(0); },
+  (error) => { console.error(error.message); console.log('exchanged ' + (exchanges() - before)); process.exit(1); }
+);
 `;
 
 function race(binary, how, round) {
   const made = build(round);
-  const swapper = spawn('python3', ['-c', SWAPPER, made.base, made.victim, '50'], { stdio: 'ignore' });
+  const swapper = spawn('python3', ['-c', SWAPPER, made.base, made.victim, String(DIRECTORIES), made.counter], { stdio: 'ignore' });
   const started = Date.now();
   while (Date.now() - started < 300) { /* let the swapper get going */ }
   // A removal that meets an entry swapped under it may stop with an error, which
   // is safe; what it must never do is reach what a link names.
+  let raced = 0;
   for (let attempt = 0; attempt < 3 && fs.existsSync(made.tree); attempt += 1) {
-    spawnSync(binary, ['-e', REMOVER, how, made.tree], { encoding: 'utf8', timeout: 120_000 });
+    const ran = spawnSync(binary, ['-e', REMOVER, how, made.tree, made.counter], { encoding: 'utf8', timeout: 120_000 });
+    if (attempt === 0) raced = Number.parseInt((/exchanged (\d+)/.exec(ran.stdout) || [])[1], 10) || 0;
   }
   swapper.kill();
   const left = fs.readdirSync(made.victim).length;
   // Once nothing swaps any more, the same removal finishes the job.
-  const after = spawnSync(binary, ['-e', REMOVER, how, made.tree], { encoding: 'utf8', timeout: 120_000 });
-  return { left, gone: !fs.existsSync(made.tree), done: after };
+  const after = spawnSync(binary, ['-e', REMOVER, how, made.tree, made.counter], { encoding: 'utf8', timeout: 120_000 });
+  return { left, raced, gone: !fs.existsSync(made.tree), done: after };
 }
 
 function main() {
@@ -126,15 +143,18 @@ function main() {
       if (lost > 0) baseline += 1;
     }
     let worst = FILES_IN_VICTIM;
+    let exchanged = 0;
     try {
       for (let round = 0; round < ROUNDS; round += 1) {
         const result = race(binary, 'removeTree', round);
+        assert.ok(result.raced > 0, `no directory was swapped for a link while the removal ran in round ${round} under ${version}, so that round raced nothing`);
+        exchanged += result.raced;
         assert.equal(result.done.status, 0, `removeTree failed under ${version}: ${result.done.stderr}`);
         assert.equal(result.gone, true, 'the tree is gone');
         worst = Math.min(worst, result.left);
       }
       assert.equal(worst, FILES_IN_VICTIM, `files of the directory the links name were removed under ${version}`);
-      console.log(`ok   removeTree under node ${version} (${ROUNDS} rounds against a process swapping directories for links): the directory the links named lost nothing (fs.rmSync lost files in ${baseline} of ${ROUNDS} rounds of the same race)`);
+      console.log(`ok   removeTree under node ${version} (${ROUNDS} rounds against a process swapping directories for links, ${exchanged} swaps made while it ran): the directory the links named lost nothing (fs.rmSync lost files in ${baseline} of ${ROUNDS} rounds of the same race)`);
     } catch (error) {
       failed += 1;
       console.log(`FAIL ${error.message} (fs.rmSync lost files in ${baseline} of ${ROUNDS} rounds)`);

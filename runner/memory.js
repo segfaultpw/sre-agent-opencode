@@ -598,7 +598,50 @@ function clearTestMarkers(workspace) {
   return removed;
 }
 
+// Whether an agent account's primary group is its own, as far as this process can
+// read the account database (/etc/passwd and /etc/group of its own container or
+// machine). The instance directory of a worker is the runner's and carries the
+// group of that worker's agent alone with mode 0710, so what keeps another
+// worker's agent out of it is that nobody else holds that group: no other
+// account has it as its primary group and none is listed as a member of it.
+// `accounts` are the agent accounts to check ({ uid, gid }); `ignoreUids` are the
+// runner's own account, whose group membership is harmless (it owns the
+// directory). Answers a sentence naming the sharing, or null. An account that is
+// in no database this process can read (another container, a directory service)
+// cannot be seen, and the README says so.
+function parseTable(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').split('\n').filter((line) => line !== '' && !line.startsWith('#')).map((line) => line.split(':'));
+  } catch {
+    return [];
+  }
+}
+
+function agentGroupProblem(accounts, { etc = '/etc', ignoreUids = [] } = {}) {
+  const ignored = new Set(ignoreUids);
+  const passwd = parseTable(path.join(etc, 'passwd')).map(([name, , uid, gid]) => ({ name, uid: Number.parseInt(uid, 10), gid: Number.parseInt(gid, 10) }));
+  const groups = parseTable(path.join(etc, 'group')).map(([name, , gid, members]) => ({ name, gid: Number.parseInt(gid, 10), members: (members || '').split(',').filter(Boolean) }));
+  const uidOf = new Map(passwd.map((entry) => [entry.name, entry.uid]));
+  for (const account of accounts) {
+    for (const entry of passwd) {
+      if (entry.gid === account.gid && entry.uid !== account.uid && !ignored.has(entry.uid)) {
+        return `the account ${entry.name} (uid ${entry.uid}) has group ${account.gid} as its primary group, which is the group of the agent account with uid ${account.uid}; an agent account's group must be its own, because the worker's directory is closed to everyone else by that group alone`;
+      }
+    }
+    for (const group of groups) {
+      if (group.gid !== account.gid) continue;
+      for (const member of group.members) {
+        const uid = uidOf.get(member);
+        if (uid === account.uid || (uid !== undefined && ignored.has(uid))) continue;
+        return `${member} is listed as a member of group ${group.name} (${account.gid}), which is the group of the agent account with uid ${account.uid}; an agent account's group must have no other member, because the worker's directory is closed to everyone else by that group alone`;
+      }
+    }
+  }
+  return null;
+}
+
 module.exports = {
+  agentGroupProblem,
   NOTES,
   SCRIPTS,
   ESTATE,

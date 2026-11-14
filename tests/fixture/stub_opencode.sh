@@ -238,6 +238,22 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
   esac
 fi
 
+# Names that are not valid UTF-8, which a run can make as easily as any other: a
+# directory open to every account and, with STUB_PLANT_BYTES=files (a scratch
+# directory, where no repository's index can refuse them), a repository below a
+# directory whose name is one and a file. The runner has to take all of it back
+# and remove it, whatever bytes the names hold.
+if [ -n "${STUB_PLANT_BYTES:-}" ]; then
+  mkdir -p $'dir\xfe/sub'
+  chmod 777 $'dir\xfe' $'dir\xfe/sub'
+  if [ "$STUB_PLANT_BYTES" = files ]; then
+    mkdir -p $'par\xe8/inner/.git'
+    printf 'ref: refs/heads/main\n' > $'par\xe8/inner/.git/HEAD'
+    : > $'bad\xff'
+    chmod 666 $'bad\xff'
+  fi
+fi
+
 if [ -n "${STUB_OPENCODE_BRIEF_OUT:-}" ]; then
   printf '%s' "$brief" > "$STUB_OPENCODE_BRIEF_OUT"
 fi

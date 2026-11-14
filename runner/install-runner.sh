@@ -125,6 +125,13 @@ if ! command -v setpriv >/dev/null 2>&1; then
     "install util-linux from your distribution"
 fi
 
+for tool in setfacl getfacl; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    lack "${tool} is not on PATH, and the runner reads with it that the directory of a worker carries no access control list before it hands a checkout over" \
+      "install the acl package from your distribution"
+  fi
+done
+
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "refusing to install: nothing has been written" >&2
   for line in "${missing[@]}"; do printf '  %-8s %s\n' missing "$line" >&2; done
