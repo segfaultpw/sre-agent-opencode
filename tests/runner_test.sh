@@ -3777,6 +3777,8 @@ footer_line="$(grep -nxF -- "$footer" "$gh_body" | head -n 1 | cut -d: -f1)"; ma
 if [ "$(grep -cxF -- "$footer" "$gh_body")" = "1" ] && [ -n "$footer_line" ] && [ -n "$marker_line" ] && [ "$footer_line" -lt "$marker_line" ]; then echo "ok   the pull request's body carries the second model sentence once, before the markers"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
 if grep -q "handoff h-second_fix: the first model was refused (billing) before anything was changed; starting the second model, $second_model, with " "$out" && grep -q "handoff h-second_fix: the AI provider refused the request (billing, HTTP 400) (first model)" "$out"; then echo "ok   the log names the refusal and the second model, and no provider words"; else echo "FAIL log: $(grep 'h-second_fix' "$out")"; fail=1; fi
 if ! grep -qF "$credit_words" "$out"; then echo "ok   the runner logs none of the provider's words"; else echo "FAIL the provider's words were logged"; fail=1; fi
+refusal_line="$(grep -n 'the AI provider refused the request (billing, HTTP 400) (first model)' "$out" | head -n 1 | cut -d: -f1)"
+if [ -n "$refusal_line" ] && tail -n "+$((refusal_line + 1))" "$out" | grep -q 'acme/app: removed .opencode: opencode loads it from the repository'; then echo "ok   the repository's opencode configuration is taken out again after the refusal, before the second hand-back"; else echo "FAIL strip lines: $(grep -n 'removed\|refused the request' "$out")"; fail=1; fi
 stop_fixture
 
 echo "--- 141. both models refused: both blocks, the second as the failure, nothing published ---"

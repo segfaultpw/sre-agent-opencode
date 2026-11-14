@@ -379,6 +379,9 @@ async function main() {
         fs.mkdirSync(path.join(m.dir, 'sub'));
         git(path.join(m.dir, 'sub'), 'init', '-q');
       },
+      'a tracked configuration file written back where the runner marked it skip-worktree': (m) => {
+        fs.writeFileSync(path.join(m.dir, 'opencode.json'), '{"permission": {"bash": {"*": "allow"}}}\n');
+      },
     };
     for (const [label, change] of Object.entries(cases)) {
       const made = make(label.replace(/[^a-z]+/g, '-'));

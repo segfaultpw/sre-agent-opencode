@@ -4160,6 +4160,17 @@ async function treeIsTheBase(workspace, repo) {
     if (head.code !== 0 || head.stdout.trim() !== workspace.baseSha) return false;
     const staged = await git(['diff-index', '--ignore-submodules=all', '--cached', '--quiet', workspace.baseSha]);
     if (staged.code !== 0) return false;
+    // A path marked skip-worktree is invisible to status whatever the tree holds
+    // there: the runner marks the repository's own opencode configuration that
+    // way when it removes it, so one that is back on disk is the agent's, and
+    // opencode would load it. Only the runner's own entries may exist.
+    const marked = await git(['ls-files', '-t', '-z']);
+    if (marked.code !== 0) return false;
+    for (const entry of marked.stdout.split('\0').filter(Boolean)) {
+      if (!/^[Ss] /.test(entry)) continue;
+      const name = entry.slice(2);
+      if (!runnerOwnEntry(name) && statOrNull(path.join(workspace.dir, name))) return false;
+    }
     // --ignore-submodules=all: nothing is left in a submodule path to read (the
     // scrub emptied them), and git must not start another git in one.
     const status = await git(['-c', 'core.quotePath=false', 'status', '--ignore-submodules=all', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
@@ -5856,6 +5867,12 @@ async function handleJob(config, job, options = {}) {
         }
         if (decision.try) {
           stillHeld(signal);
+          // The repository's own opencode configuration and the agent file of the
+          // first run go before the checkout is handed back, exactly as they went
+          // before the first hand-over: a tracked configuration file the first run
+          // could have written back is marked skip-worktree and invisible to the
+          // proof, so it is taken out again here whatever the proof said.
+          if (repo) await stripRepoConfig(workspace);
           fs.rmSync(path.join(workspace.dir, '.opencode'), { recursive: true, force: true });
           writeAgent(config, workspace.dir);
           secondBundle = repo ? await makeBaseBundle(workspace) : null;
