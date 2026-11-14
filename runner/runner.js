@@ -5208,12 +5208,15 @@ function newResult(config) {
 // the platform queues a job of the ordinary shape with `"test": true`, a null
 // repo_full_name and the repository to clone in test_repo_full_name (null:
 // scratch). Nothing in it is a fix request: no pull request is opened and
-// nothing is pushed. The report carries seven steps, in the order collected,
-// cloned, model, memory, bucket, pull_request, reported, so a person can see that collection,
-// the clone, the model, the memory directory and the bucket all work from this
-// machine. The first step that fails is reported with its sentence and every
-// step after it as not run; `reported` is always ok, because the report
-// arriving is its proof.
+// nothing is pushed. The report carries eight steps, in the order collected,
+// cloned, model, fallback_model, memory, bucket, pull_request, reported, so a
+// person can see that collection, the clone, the model, the second model, the
+// memory directory and the bucket all work from this machine. The first step
+// that fails is reported with its sentence and every step after it as not run,
+// with one exception: fallback_model runs after a failed model step, so one test
+// shows both models, and its own failure fails the test without stopping the
+// steps after it, which do not depend on it. `reported` is always ok, because
+// the report arriving is its proof.
 const TEST_DETAIL_MAX = 300;
 const TEST_MARKER = memory.TEST_MARKER;
 const TEST_NOT_RUN = 'not run';
@@ -5266,11 +5269,11 @@ function writeTestMarker(file) {
   ownByRunner(file);
 }
 
-function modelVerdict(agent, timeoutMs) {
+function modelVerdict(agent, timeoutMs, who = 'the model') {
   if (agent.timedOut) {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
     const stray = agent.abandoned ? '; a process it started did not exit and may still be running' : '';
-    return { ok: false, detail: `the model did not answer within ${seconds} second${seconds === 1 ? '' : 's'}${stray}` };
+    return { ok: false, detail: `${who} did not answer within ${seconds} second${seconds === 1 ? '' : 's'}${stray}` };
   }
   if (agent.code !== 0) {
     const refusal = providerRefusalOf(agent);
@@ -5282,12 +5285,14 @@ function modelVerdict(agent, timeoutMs) {
   }
   const answer = oneLine(String(agent.finalMessage || '').split('\n').find((line) => line.trim()) || '', 200);
   if (!answer) return { ok: false, detail: 'opencode finished without an answer' };
-  return { ok: true, detail: `the model answered: ${answer}` };
+  return { ok: true, detail: `${who} answered: ${answer}` };
 }
 
 // The test job's sentence for the platform's card, and for a platform that does
-// not read the steps: one sentence that names the step that failed.
-function testSummary(config, steps, failed) {
+// not read the steps: one sentence that names the first step that failed, in the
+// order the steps are listed (a step that was not run is not a failure).
+function testSummary(config, steps) {
+  const failed = steps.find((step) => step.ok !== true && step.detail !== TEST_NOT_RUN);
   if (!failed) return `Test job finished: every step passed on runner v${config.version}.`;
   const skipped = steps.filter((step) => step.detail === TEST_NOT_RUN).length;
   const tail = skipped > 0 ? `, so the ${skipped} step${skipped === 1 ? '' : 's'} after it ${skipped === 1 ? 'was' : 'were'} not run` : '';
@@ -5322,11 +5327,17 @@ async function runTestJob(config, job, heartbeat) {
   let repo = null;
   let hookWorkspace = null;
   let hooksBegan = false;
+  // What the model step's hooks answered, which the second model's step uses
+  // too: the hooks run once per test job. null until they have.
+  let preparedEnv = null;
   const memoryRoot = config.layout.memory;
   const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
-  const step = async (name, run) => {
-    if (failed || (signal && signal.aborted)) {
+  // `options.exempt`: a failed model step does not stop it. `options.blocking`
+  // false: its own failure fails the test without stopping the steps after it.
+  const step = async (name, run, options = {}) => {
+    const stopped = failed && !(options.exempt && failed.name === 'model');
+    if (stopped || (signal && signal.aborted)) {
       result.test.push({ name, ok: false, detail: TEST_NOT_RUN });
       return;
     }
@@ -5340,7 +5351,7 @@ async function runTestJob(config, job, heartbeat) {
     const detail = oneLine(redact(outcome.detail || (ok ? 'ok' : 'failed')), TEST_DETAIL_MAX);
     result.test.push({ name, ok, detail });
     log(ok ? 'info' : 'warn', `test job ${job.handoff_id}: ${name}: ${ok ? 'ok' : 'failed'}: ${detail}`);
-    if (!ok) failed = { name, detail };
+    if (!ok && options.blocking !== false) failed = { name, detail };
   };
 
   try {
@@ -5373,6 +5384,7 @@ async function runTestJob(config, job, heartbeat) {
         hookWorkspace = scratch.dir;
         hooksBegan = true;
         const prepared = await prepareRequestEnv(config, job, { workspace: scratch.dir, signal });
+        preparedEnv = prepared;
         await handOver(scratch.dir, home);
         progress.phase('agent');
         agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress });
@@ -5391,6 +5403,49 @@ async function runTestJob(config, job, heartbeat) {
       if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       return verdict;
     });
+
+    // One real call to the second model, or ok when none is configured. It runs
+    // even when the model step failed, so one test shows both models.
+    await step('fallback_model', async () => {
+      if (!config.fallbackModel) return { ok: true, detail: 'no second model is configured' };
+      if (!preparedEnv) return { ok: false, detail: TEST_NOT_RUN };
+      const scratch = prepareScratch(config);
+      writeAgent(config, scratch.dir);
+      const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
+      let agent;
+      let quiet = true;
+      const home = identity.mode !== 'none' ? agentHomeFor(null) : null;
+      try {
+        hookWorkspace = scratch.dir;
+        await handOver(scratch.dir, home);
+        progress.phase('agent');
+        agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, {
+          model: config.fallbackModel,
+          second: true,
+          timeoutMs,
+          home,
+          repo,
+          signal,
+          extraEnv: preparedEnv.extraEnv,
+          awsReplaced: preparedEnv.awsReplaced,
+          progress,
+        });
+      } finally {
+        quiet = await reclaim(scratch.dir, home);
+      }
+      const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      result.actions.push(`asked the second model ${config.fallbackModel} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
+      const earlier = Array.isArray(result.evidence.models) ? result.evidence.models : [];
+      result.evidence.models = [...earlier, ...modelsEvidence([{ model: config.fallbackModel, refusal: null }])];
+      if (!quiet) {
+        if (agent && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+        return { ok: false, detail: 'a process of the agent\'s account started by the second model call could not be ended' };
+      }
+      const verdict = modelVerdict(agent, timeoutMs, 'the second model');
+      if (verdict.refusal) result.evidence.models = [...earlier, ...modelsEvidence([{ model: config.fallbackModel, refusal: verdict.refusal }])];
+      if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
+      return verdict;
+    }, { exempt: true, blocking: false });
 
     await step('memory', async () => {
       const lease = await testRepoLease(config, repo);
@@ -5464,7 +5519,7 @@ async function runTestJob(config, job, heartbeat) {
     if (hooksBegan) await runHook('post-run', job, {}, { workspace: hookWorkspace });
     result.test.push({ name: 'reported', ok: true, detail: 'the report is being sent with these steps' });
     result.actions.push('ran the test job: no fix was run and nothing was pushed');
-    result.summary = testSummary(config, result.test, failed);
+    result.summary = testSummary(config, result.test);
     // Read and switched with no await between, so no beat can end the job
     // after the decision to report it; the beats go on, ignored, until the
     // report has returned.
