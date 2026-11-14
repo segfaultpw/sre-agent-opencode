@@ -603,7 +603,7 @@ async function main() {
     assert.ok(swappedGitlink && swappedWalk, 'both swaps happened');
     assert.equal(fs.existsSync(path.join(victim, 'lib', 'precious.txt')), true, 'a link swapped in above a gitlink path is not followed by the removal');
     assert.equal(fs.existsSync(path.join(victim, 'other', '.git', 'HEAD')), true, 'a link swapped in for a directory the walk was about to enter is not entered');
-    assert.deepEqual(swapped.workspace.plants && swapped.workspace.plants.embedded, ['third/lib/', 'w/d/'], 'both are told, and refuse the request');
+    assert.deepEqual(swapped.workspace.plants && swapped.workspace.plants.escaped, ['third/lib/', 'w/d/'], 'both are told as what they are, and refuse the request');
 
     // A repository put back in a submodule path after the scrub and before the
     // runner stages (the window another account that holds a directory of the
@@ -679,6 +679,275 @@ async function main() {
     assert.equal(await workspaceUnchanged(none, null, null), true, 'a scratch directory with only the runner\'s own entries');
     fs.writeFileSync(path.join(scratch, 'notes.txt'), 'x\n');
     assert.equal(await workspaceUnchanged(none, null, null), false, 'a scratch directory with a file the agent made');
+  });
+
+  // What the runner does to a tree another account has had. The agent account is
+  // never this test's own, so the split is stood in for: identity mode `caps`
+  // with the runner's own ids, which is what closeTree gives a tree to.
+  const asSplit = (extra = {}) => {
+    const me = { uid: process.getuid(), gid: process.getgid() };
+    runner.internals.setIdentity({ mode: 'caps', runner: { ...me, home: work }, agent: { uid: me.uid + 1, gid: me.gid + 1, home: work }, ...extra });
+  };
+  const noSplit = () => runner.internals.setIdentity({ mode: 'none', runner: null, agent: null });
+  const modeOf = (target) => fs.lstatSync(target).mode & 0o7777;
+  // A tree these checks left with directories nobody can enter is still removed.
+  const scrub = (target) => {
+    spawnSync('chmod', ['-R', 'u+rwx', target]);
+    spawnSync('rm', ['-rf', target]);
+  };
+  const walk = (dir, visit) => {
+    visit(dir);
+    if (fs.lstatSync(dir).isDirectory()) for (const name of fs.readdirSync(dir)) walk(path.join(dir, name), visit);
+  };
+
+  await check('closeTree: one pass fixes each directory before it lists it, and leaves no directory open and no link followed', async () => {
+    const { closeTree } = runner.internals;
+    const root = path.join(work, 'close-pass');
+    scrub(root);
+    fs.mkdirSync(path.join(root, 'open', 'inner'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'locked', 'inner'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'sticky'));
+    fs.writeFileSync(path.join(root, 'open', 'inner', 'file'), 'x\n', { mode: 0o666 });
+    fs.writeFileSync(path.join(root, 'open', 'script'), '#!/bin/sh\n', { mode: 0o755 });
+    fs.writeFileSync(path.join(root, 'open', 'setuid'), 'x\n');
+    fs.chmodSync(path.join(root, 'open', 'setuid'), 0o4777);
+    fs.writeFileSync(path.join(root, 'locked', 'inner', 'file'), 'x\n', { mode: 0o000 });
+    spawnSync('mkfifo', [path.join(root, 'open', 'fifo')]);
+    fs.chmodSync(path.join(root, 'open', 'fifo'), 0o666);
+    const outside = path.join(work, 'close-outside');
+    scrub(outside);
+    fs.mkdirSync(outside, { mode: 0o777 });
+    fs.chmodSync(outside, 0o777);
+    fs.writeFileSync(path.join(outside, 'precious'), 'x\n');
+    fs.chmodSync(path.join(outside, 'precious'), 0o666);
+    fs.symlinkSync(outside, path.join(root, 'open', 'link'));
+    fs.chmodSync(path.join(root, 'open', 'inner'), 0o777);
+    fs.chmodSync(path.join(root, 'open'), 0o777);
+    fs.chmodSync(path.join(root, 'sticky'), 0o1777);
+    fs.chmodSync(path.join(root, 'locked', 'inner'), 0o000);
+    fs.chmodSync(path.join(root, 'locked'), 0o000);
+    fs.chmodSync(root, 0o777);
+    asSplit();
+    try {
+    // What a directory looks like at the moment its listing is read: closed already.
+    const realList = fs.readdirSync;
+    const atListing = [];
+    fs.readdirSync = function patched(target, ...rest) {
+      if (String(target).startsWith('/proc/self/fd/')) atListing.push(fs.statSync(target).mode & 0o7777);
+      return realList.call(fs, target, ...rest);
+    };
+    try {
+      await closeTree(root);
+    } finally {
+      fs.readdirSync = realList;
+      noSplit();
+    }
+    assert.ok(atListing.length >= 6, `every directory was listed through its descriptor (${atListing.length})`);
+    assert.deepEqual([...new Set(atListing)], [0o700], 'each directory was mode 0700 and the runner\'s when its listing was read');
+    const seen = [];
+    walk(root, (entry) => seen.push(entry));
+    for (const entry of seen) {
+      const stat = fs.lstatSync(entry);
+      assert.equal(stat.uid, process.getuid(), entry);
+      if (stat.isDirectory()) assert.equal(stat.mode & 0o7777, 0o700, `${entry} is a closed directory`);
+      else if (!stat.isSymbolicLink()) assert.equal(stat.mode & 0o7077, 0, `${entry} has no group or other bit, no setuid`);
+    }
+    assert.equal(modeOf(path.join(root, 'open', 'script')) & 0o100, 0o100, 'an executable file stays executable for its owner');
+    assert.equal(modeOf(path.join(root, 'open', 'inner', 'file')) & 0o600, 0o600, 'and a file the owner could not read can be read');
+    assert.equal(modeOf(outside), 0o777, 'the directory a link names is not changed');
+    assert.equal(modeOf(path.join(outside, 'precious')), 0o666, 'nor is a file in it');
+    } finally {
+      scrub(root);
+      scrub(outside);
+    }
+  });
+
+  await check('closeTree: a tree nested deeper than a path can be named is closed, and removed, without a descriptor for every level', async () => {
+    const { closeTree, removeTree } = runner.internals;
+    const root = path.join(work, 'close-deep');
+    scrub(root);
+    fs.mkdirSync(root);
+    const built = spawnSync('bash', ['-c', 'cd "$1" && for _ in $(seq 1 2300); do mkdir d && chmod 777 d && cd d || exit 1; done; touch file', 'x', root], { encoding: 'utf8' });
+    assert.equal(built.status, 0, built.stderr);
+    asSplit();
+    try {
+      await closeTree(root);
+      const found = spawnSync('find', [root, '(', '!', '-uid', String(process.getuid()), '-o', '(', '!', '-type', 'l', '-a', '-perm', '/077', ')', ')', '-print', '-quit'], { encoding: 'utf8' });
+      assert.equal(found.stdout, '', 'nothing is left open');
+      await removeTree(root);
+      assert.equal(fs.existsSync(root), false, 'and the whole of it is removed');
+    } finally {
+      noSplit();
+      scrub(root);
+    }
+  });
+
+  await check('closeTree fails closed: a tree it cannot own is refused, and nothing is removed from it', async () => {
+    if (process.getuid() === 0) return;
+    const { closeTree, removeTree, removeEntries } = runner.internals;
+    const root = path.join(work, 'close-refused');
+    scrub(root);
+    fs.mkdirSync(path.join(root, 'a'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'a', 'keep'), 'x\n');
+    // A runner account that is not this process's own: fchown to it is refused.
+    asSplit({ runner: { uid: process.getuid() + 1, gid: process.getgid(), home: work } });
+    try {
+      await assert.rejects(closeTree(root), /could not be closed to other accounts/);
+      await assert.rejects(removeTree(root), /could not be closed to other accounts/);
+      await assert.rejects(removeEntries(root, ['a']), /is not closed/);
+    } finally {
+      noSplit();
+    }
+    assert.equal(fs.readFileSync(path.join(root, 'a', 'keep'), 'utf8'), 'x\n', 'nothing was removed');
+    scrub(root);
+  });
+
+  await check('removeEntries refuses a tree that was not closed, and removes from one that was', async () => {
+    const { closeTree, removeEntries } = runner.internals;
+    const root = path.join(work, 'close-guard');
+    scrub(root);
+    fs.mkdirSync(path.join(root, 'x', 'y'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'x', 'y', 'f'), 'x\n');
+    asSplit();
+    try {
+      await assert.rejects(removeEntries(root, ['x']), /is not closed/);
+      assert.equal(fs.existsSync(path.join(root, 'x', 'y', 'f')), true);
+      await closeTree(root);
+      await removeEntries(root, ['x']);
+      assert.equal(fs.existsSync(path.join(root, 'x')), false);
+      await assert.rejects(removeEntries(root, ['../x']), /one name/);
+      await assert.rejects(removeEntries(root, ['a/b']), /one name/);
+    } finally {
+      noSplit();
+      scrub(root);
+    }
+  });
+
+  await check('the instance directory is the runner\'s, mode 0710, with the group of that worker\'s agent alone', async () => {
+    const { settleInstanceGate } = runner.internals;
+    const dir = path.join(work, 'instances', 'pool-1');
+    fs.rmSync(path.join(work, 'instances'), { recursive: true, force: true });
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    fs.chmodSync(dir, 0o755);
+    const groups = [...new Set([process.getgid(), ...process.getgroups()])];
+    const group = groups[groups.length - 1];
+    asSplit({ agent: { uid: process.getuid() + 1, gid: group, home: work } });
+    try {
+      settleInstanceGate(dir);
+      const stat = fs.statSync(dir);
+      assert.equal(stat.mode & 0o7777, 0o710);
+      assert.equal(stat.gid, group);
+      assert.equal(stat.uid, process.getuid());
+      fs.chmodSync(dir, 0o777);
+      settleInstanceGate(dir);
+      assert.equal(fs.statSync(dir).mode & 0o7777, 0o710, 'opened again, closed again at the next check');
+      const target = path.join(work, 'instances', 'gate-target');
+      fs.mkdirSync(target);
+      fs.symlinkSync(target, path.join(work, 'instances', 'gate-link'));
+      assert.throws(() => settleInstanceGate(path.join(work, 'instances', 'gate-link')), /ELOOP|link|directory/, 'a link is never followed');
+      assert.notEqual(fs.statSync(target).mode & 0o7777, 0o710);
+    } finally {
+      noSplit();
+    }
+  });
+
+  await check('a swap that happens while a tree is being removed never reaches what the link names, on the node the image ships and on this one', async () => {
+    const race = path.resolve(__dirname, 'removal_race_test.js');
+    const done = spawnSync(process.execPath, [race], { encoding: 'utf8', timeout: 240_000 });
+    assert.equal(done.status, 0, `${done.stdout}${done.stderr}`);
+    assert.match(done.stdout, /ok .*removeTree/);
+  });
+
+  await check('the paths a report names are redacted, one line each and bounded', async () => {
+    const { shownPaths, redact } = runner.internals;
+    const hold = load({ SRE_GITHUB_TOKEN: `ghp_${'a'.repeat(36)}` }).runner;
+    const secret = `ghp_${'a'.repeat(36)}`;
+    const shown = hold.internals.shownPaths([`vendor/${secret}/`, `a\nb/`, `${'x'.repeat(400)}/`, ...Array.from({ length: 30 }, (_, n) => `d${n}/`)]);
+    assert.equal(shown.some((entry) => entry.includes(secret)), false, 'a held secret in a name is masked');
+    assert.equal(shown.every((entry) => !/[\n\r]/.test(entry)), true, 'one line each');
+    assert.ok(shown[2].length <= 200, 'bounded');
+    assert.equal(shown.length, 21, 'at most twenty, and one entry for the rest');
+    assert.match(shown[20], /and 13 more/);
+    assert.ok(typeof shownPaths === 'function' && typeof redact === 'function');
+  });
+
+  await check('a path found outside the checkout is told as that, not as an embedded repository', async () => {
+    const { escapedReport } = runner.internals;
+    const result = { summary: 'done', actions: [], evidence: {} };
+    escapedReport(result, ['third/lib/', 'w/d/']);
+    assert.deepEqual(result.evidence.escaped_paths, ['third/lib/', 'w/d/']);
+    assert.match(result.summary, /resolved to a place outside the checkout while the runner was cleaning it/);
+    assert.doesNotMatch(result.summary, /embedded|protected paths gate/);
+    assert.ok(result.actions.some((line) => /outside the checkout/.test(line)));
+  });
+
+  await check('a skip-worktree mark that cannot be made or taken off leaves the index as it was, or the checkout marked to be cloned again', async () => {
+    const { stageAndGate, setIdentity } = runner.internals;
+    setIdentity({ mode: 'none', runner: null, agent: null });
+    const git = (cwd, ...args) => {
+      const done = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
+      assert.equal(done.status, 0, `git ${args.join(' ')}: ${done.stderr}`);
+      return done.stdout.trim();
+    };
+    const source = path.join(work, 'mark-source');
+    fs.mkdirSync(source, { recursive: true });
+    git(source, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(source, 'f'), 'a\n');
+    git(source, 'add', 'f');
+    git(source, 'commit', '-q', '-m', 'inner');
+    const commit = git(source, 'rev-parse', 'HEAD');
+    const realGit = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+    const build = (label) => {
+      const root = path.join(work, `mark-${label}`);
+      const dir = path.join(root, 'tree');
+      const gitdir = path.join(root, 'gitdir');
+      fs.mkdirSync(dir, { recursive: true });
+      git(dir, 'init', '-q', '-b', 'main', `--separate-git-dir=${gitdir}`);
+      fs.rmSync(path.join(dir, '.git'), { force: true });
+      fs.writeFileSync(path.join(dir, 'README.md'), 'the repository\n');
+      const named = (...args) => git(dir, `--git-dir=${gitdir}`, `--work-tree=${dir}`, ...args);
+      named('add', '-A');
+      for (let n = 0; n < 205; n += 1) named('update-index', '--add', '--cacheinfo', `160000,${commit},sub${n}`);
+      named('commit', '-q', '-m', 'base');
+      const baseSha = named('rev-parse', 'HEAD');
+      for (let n = 0; n < 205; n += 1) fs.mkdirSync(path.join(dir, `sub${n}`));
+      fs.appendFileSync(path.join(dir, 'README.md'), 'a real change\n');
+      return { workspace: { dir, gitdir, cleanUrl: 'https://github.com/acme/app.git', baseSha, repo: { owner: 'acme', name: 'app', fullName: 'acme/app' } }, named };
+    };
+    // git wrapper that fails the n-th `update-index` call
+    const failing = (label, which) => {
+      const wrapper = path.join(work, `mark-wrapper-${label}`);
+      fs.mkdirSync(wrapper, { recursive: true });
+      const counter = path.join(wrapper, 'count');
+      fs.writeFileSync(counter, '0');
+      fs.writeFileSync(
+        path.join(wrapper, 'git'),
+        `#!/usr/bin/env bash\nfor a in "$@"; do if [ "$a" = update-index ]; then n=$(( $(cat "${counter}") + 1 )); echo $n > "${counter}"; if ${which}; then echo "update-index refused" >&2; exit 1; fi; fi; done\nexec "${realGit}" "$@"\n`,
+        { mode: 0o755 }
+      );
+      return wrapper;
+    };
+    const withPath = async (wrapper, body) => {
+      const saved = process.env.PATH;
+      process.env.PATH = `${wrapper}:${saved}`;
+      try {
+        return await body();
+      } finally {
+        process.env.PATH = saved;
+      }
+    };
+    const marked = (made) => made.named('ls-files', '-t').split('\n').filter((line) => /^S /.test(line)).length;
+    // The second chunk of marks fails: the first chunk's marks may not stay in the index.
+    const second = build('second');
+    const wrapperSecond = failing('second', '[ "$n" = 2 ]');
+    await assert.rejects(withPath(wrapperSecond, () => stageAndGate(second.workspace, new Set())), /update-index refused/);
+    assert.equal(marked(second), 0, 'no gitlink is left skip-worktree after a mark that failed half way');
+    // The mark can be made but not taken off: the original index comes back.
+    const undo = build('undo');
+    const wrapperUndo = failing('undo', '[ "$n" -gt 2 ]');
+    await assert.rejects(withPath(wrapperUndo, () => stageAndGate(undo.workspace, new Set())), /update-index refused/);
+    assert.equal(marked(undo), 0, 'no gitlink is left skip-worktree after an undo that failed');
+    assert.equal(fs.existsSync(path.join(undo.workspace.gitdir, 'index.sre-agent-before-mark')), false, 'and the copy of the index is not left behind');
   });
 
   if (failed > 0) {

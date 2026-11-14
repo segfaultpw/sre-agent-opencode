@@ -18,7 +18,7 @@ const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
 const https = require('node:https');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { conventionalTitle, validHeader, TYPES, MIN_SUBJECT, TITLE_MAX } = require('./conventional_title.js');
 const { ciPaths } = require('./ci_config.js');
 const memory = require('./memory.js');
@@ -1785,6 +1785,275 @@ async function chownTree(dir, who) {
   if (result.code !== 0) throw new Error(`${dir} could not be given to uid ${target.uid}: ${redact(result.stderr).trim()}`);
 }
 
+// With several workers on one volume (SRE_WORKSPACE_PER_INSTANCE=1 and a split
+// of accounts) the directories above a worker's trees were walkable by every
+// account, so another worker's agent could reach into a checkout whose agent had
+// opened it, and an entry it made there outlives the runner taking the tree back.
+// The structural fix is here: the worker's instance directory is the runner's, in
+// the group of that worker's agent alone, mode 0710, so no account but the
+// runner's and that agent's can search it, whatever any directory below it
+// allows. `instanceGate` is the directory, set once the layout is known (null in
+// the flat layout, where one agent account exists and there is nobody to keep
+// out, and with no split).
+let instanceGate = null;
+
+// Makes the gate what it must be, through one descriptor opened without
+// following a link, and says so with a throw when it cannot: run at the start
+// and again before every hand-over, so a directory something replaced or
+// reopened is never one the agent is handed a tree below.
+function settleInstanceGate(dir = instanceGate) {
+  if (identity.mode === 'none' || !dir) return;
+  const descriptor = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  try {
+    const before = fs.fstatSync(descriptor);
+    if (before.uid !== identity.runner.uid || before.gid !== identity.agent.gid) fs.fchownSync(descriptor, identity.runner.uid, identity.agent.gid);
+    if ((before.mode & 0o7777) !== 0o710) fs.fchmodSync(descriptor, 0o710);
+    const after = fs.fstatSync(descriptor);
+    if (after.uid !== identity.runner.uid || after.gid !== identity.agent.gid || (after.mode & 0o7777) !== 0o710) {
+      throw new Error(`${dir} is not the runner's directory for this worker's agent alone (uid ${after.uid}, gid ${after.gid}, mode ${(after.mode & 0o7777).toString(8)}), so no checkout is handed over`);
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+// Trees the runner has taken back and closed (closeTree), by resolved path: the
+// ones nothing may be removed from, or read, until the agent is handed one again.
+const closedTrees = new Set();
+
+function forgetClosed(dir) {
+  closedTrees.delete(path.resolve(dir));
+}
+
+// A directory the runner has just made itself and filled itself (a fresh clone, an
+// empty scratch directory): nothing of an agent's is in it, so it is as closed as
+// a tree that went through closeTree.
+function rememberClosed(dir) {
+  closedTrees.add(path.resolve(dir));
+}
+
+function isClosedUnder(target) {
+  if (identity.mode === 'none') return true;
+  const resolved = path.resolve(target);
+  for (const root of closedTrees) {
+    if (resolved === root || resolved.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) return true;
+  }
+  return false;
+}
+
+// The descriptors one close pass holds: a directory is found again through
+// /proc/self/fd/<parent>/<name>, so a path never has to be named whole, and a
+// tree nested deeper than a path can be (PATH_MAX) is still reached: a
+// descriptor is kept as an anchor once the path below it grows past this many
+// bytes, so the number of descriptors held is the depth in bytes over this, not
+// the depth.
+const CLOSE_ANCHOR_BYTES = 2000;
+const CLOSE_YIELD_EVERY = 2000;
+
+// Opens a directory without following a link at its last component. An owner
+// that cannot open its own unreadable directory (no capability: a start where
+// the runner is the only account) gives it its access back through chmod first,
+// after lstat has said it is a directory and not a link.
+function openClosing(target) {
+  const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+  try {
+    return fs.openSync(target, flags);
+  } catch (error) {
+    if (error.code !== 'EACCES') throw error;
+    const stat = fs.lstatSync(target);
+    if (!stat.isDirectory()) throw error;
+    fs.chmodSync(target, 0o700);
+    return fs.openSync(target, flags);
+  }
+}
+
+// Takes a tree the agent has had, in ONE pass, for the runner alone: every
+// directory is opened without following a link, given to the runner and closed
+// (0700) BEFORE its entries are listed, and only then are its entries read, so
+// an entry another account made in it before that is in the listing and is taken
+// over in its turn, and nothing can be made in it afterwards (creating, renaming
+// and removing in a directory check the directory's owner and mode at the call,
+// whatever descriptor or working directory the caller holds). A parent is closed
+// before any child is listed, so a child cannot be moved out of a closed
+// directory either. Every other entry is given to the runner and loses its group,
+// other and setuid bits (a link is given away and never followed). It does not
+// wait on a quiet account: the agent's processes are ended before this, and what
+// another worker's agent could do is the instance directory's business
+// (settleInstanceGate). It asserts the result with find, and throws, having
+// removed nothing, when anything foreign-owned or open is left. Done by the
+// runner itself (root, or the capabilities of the caps mode) and not by a chown
+// and a chmod run one after the other, which left a window between the two.
+async function closeTree(dir) {
+  if (identity.mode === 'none') return;
+  const owner = identity.runner;
+  const root = path.resolve(dir);
+  forgetClosed(root);
+  // A second pass when the check finds something: a tree the runner shares with
+  // another worker of its own account (the memory) can gain an entry in the
+  // moment between the pass and the check. A tree an agent had cannot, since
+  // nobody else can make an entry in a closed directory, so a second finding there
+  // would be a real one and is raised.
+  for (let attempt = 1; ; attempt += 1) {
+    await closePass(dir, root, owner);
+    const check = await runProcess(
+      'find',
+      [root, '(', '!', '-uid', String(owner.uid), '-o', '(', '!', '-type', 'l', '-a', '-perm', '/077', ')', ')', '-print', '-quit'],
+      {}
+    );
+    if (check.code !== 0) throw new Error(`${dir} could not be closed to other accounts: it could not be checked (${oneLine(redact(check.stderr || ''), 160)})`);
+    const left = check.stdout.split('\n')[0];
+    if (!left) break;
+    if (attempt >= 2) throw new Error(`${dir} could not be closed to other accounts: ${oneLine(redact(left), 200)} is still owned by another account or open to one`);
+  }
+  closedTrees.add(root);
+}
+
+async function closePass(dir, root, owner) {
+  const held = new Set();
+  const close = (anchor) => {
+    if (held.delete(anchor)) fs.closeSync(anchor.fd);
+  };
+  const release = (anchor) => {
+    anchor.pending -= 1;
+    if (anchor.pending === 0) close(anchor);
+  };
+  let entries = 0;
+  try {
+    const first = { fd: openClosing(root), pending: 1 };
+    held.add(first);
+    const stack = [{ anchor: first, rel: '' }];
+    while (stack.length > 0) {
+      const frame = stack.pop();
+      let own = null;
+      let descriptor = frame.anchor.fd;
+      if (frame.rel !== '') {
+        try {
+          descriptor = openClosing(`/proc/self/fd/${frame.anchor.fd}/${frame.rel}`);
+        } catch (error) {
+          // Gone since it was listed (only a tree the runner shares with another
+          // worker of its own account can lose an entry meanwhile).
+          if (error.code !== 'ENOENT') throw error;
+          release(frame.anchor);
+          continue;
+        }
+        own = { fd: descriptor, pending: 0 };
+        held.add(own);
+      }
+      const me = fs.fstatSync(descriptor);
+      if (me.uid !== owner.uid || me.gid !== owner.gid) fs.fchownSync(descriptor, owner.uid, owner.gid);
+      if ((me.mode & 0o7777) !== 0o700) fs.fchmodSync(descriptor, 0o700);
+      const base = `/proc/self/fd/${descriptor}`;
+      for (const name of fs.readdirSync(base)) {
+        const entry = `${base}/${name}`;
+        let stat;
+        try {
+          stat = fs.lstatSync(entry);
+        } catch (error) {
+          if (error.code === 'ENOENT') continue;
+          throw error;
+        }
+        entries += 1;
+        if (entries % CLOSE_YIELD_EVERY === 0) await new Promise((resolve) => setImmediate(resolve));
+        if (stat.isDirectory()) {
+          let anchor = frame.anchor;
+          let rel = frame.rel === '' ? name : `${frame.rel}/${name}`;
+          if (own && rel.length > CLOSE_ANCHOR_BYTES) {
+            anchor = own;
+            rel = name;
+          }
+          anchor.pending += 1;
+          stack.push({ anchor, rel });
+          continue;
+        }
+        try {
+          if (stat.uid !== owner.uid || stat.gid !== owner.gid) fs.lchownSync(entry, owner.uid, owner.gid);
+          if (stat.isSymbolicLink()) continue;
+          const wanted = stat.isFile() ? (stat.mode & 0o700) | 0o600 : stat.mode & 0o700;
+          if ((stat.mode & 0o7777) !== wanted) fs.chmodSync(entry, wanted);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+      if (own && own.pending === 0) close(own);
+      release(frame.anchor);
+    }
+  } catch (error) {
+    throw new Error(`${dir} could not be closed to other accounts: ${oneLine(redact(error.message), 240)}`);
+  } finally {
+    for (const anchor of held) fs.closeSync(anchor.fd);
+  }
+}
+
+// What `rm` takes: GNU rm names every directory it enters by a descriptor and
+// opens each child without following a link, so a path component swapped for a
+// link while it works is unlinked as a link and never walked into, which neither
+// Node 22's fs.rmSync (it resolves each child by its whole path) nor a walk of
+// our own can promise. --one-file-system keeps it from entering a mount that was
+// put in the tree. A system whose rm lacks it (not Linux) gets the plain flags.
+let removalFlags = null;
+function removalArguments(names) {
+  if (removalFlags === null) {
+    const version = spawnSync('rm', ['--version'], { encoding: 'utf8' });
+    removalFlags = /GNU/.test(`${version.stdout || ''}`) ? ['-rf', '--one-file-system'] : ['-rf'];
+  }
+  for (const name of names) {
+    if (typeof name !== 'string' || name === '' || name === '.' || name === '..' || name.includes('/') || name.includes('\0')) {
+      throw new Error('a removal takes one name at a time, never a path');
+    }
+  }
+  return [...removalFlags, '--', ...names];
+}
+
+// Removes `names` (single names, never paths) from `holder` with rm, run from
+// holder as the runner's own account: after a close, every entry of a tree the
+// agent had is the runner's, so nothing here needs a privileged account, and a
+// tree that was not closed is refused rather than removed from.
+async function removeNames(holder, names) {
+  if (names.length === 0 || !statOrNull(holder)) return;
+  for (let at = 0; at < names.length; at += 100) {
+    const chunk = names.slice(at, at + 100);
+    const done = await runProcess('rm', removalArguments(chunk), { cwd: holder });
+    if (done.code !== 0) throw new Error(`${oneLine(chunk.join(' '), 120)} could not be removed from ${holder}: ${oneLine(redact(done.stderr || ''), 200)}`);
+  }
+}
+
+// The same for the few small things removed where nothing can wait: the
+// memory copy at the end of a run, whose size the memory bounds already limit,
+// and what the runner removes from the agent's own home and database directory
+// (`as` 'root': those are the agent's, not the runner's, and a swap while rm works
+// is still unlinked as a link and never followed).
+function removeNamesSync(holder, names, as = 'runner') {
+  if (names.length === 0 || !statOrNull(holder)) return;
+  const launched = launch('rm', removalArguments(names), minimalEnv(), as);
+  const done = spawnSync(launched.command, launched.args, { cwd: holder, env: launched.env, encoding: 'utf8', timeout: 60_000, ...launched.ids });
+  if (done.status !== 0) throw new Error(`${oneLine(names.join(' '), 120)} could not be removed from ${holder}: ${oneLine(redact(done.stderr || done.error?.message || ''), 200)}`);
+}
+
+// Removes entries of a directory inside a tree the runner has taken back and
+// closed. The refusal is the point: no recursive removal of what an agent made
+// runs over a tree that is not closed, whoever asks.
+async function removeEntries(holder, names) {
+  if (!isClosedUnder(holder)) throw new Error(`${holder} is not closed to other accounts, so nothing is removed from it`);
+  await removeNames(holder, names);
+}
+
+function removeEntriesSync(holder, names) {
+  if (!isClosedUnder(holder)) throw new Error(`${holder} is not closed to other accounts, so nothing is removed from it`);
+  removeNamesSync(holder, names);
+}
+
+// A whole tree an agent touched (a checkout, a scratch directory, a memory
+// copy): closed first and removed with rm, from the directory above it by its
+// own name, so no path above it is ever resolved by the removal. A tree that
+// cannot be closed is not removed, and the request fails.
+async function removeTree(target) {
+  const stat = statOrNull(target);
+  if (!stat) return;
+  if (stat.isDirectory()) await closeTree(target);
+  await removeNames(path.dirname(target), [path.basename(target)]);
+  forgetClosed(target);
+}
+
 // The agent is a reduced but capable user, much as a CI job would be. It has a
 // home for each repository, on the volume (agent-home/<owner>/<repo>, and
 // agent-home/_estate for requests that name none), so what it installs there
@@ -1906,7 +2175,7 @@ function sweepAgentDbs(root, now) {
     const target = path.join(root, name);
     try {
       const stat = fs.lstatSync(target);
-      if (stat.isDirectory() && now - stat.mtimeMs > AGENT_DB_STALE_MS) fs.rmSync(target, { recursive: true, force: true });
+      if (stat.isDirectory() && now - stat.mtimeMs > AGENT_DB_STALE_MS) removeNamesSync(root, [name], 'root');
     } catch {
       // Gone already, or not ours to remove: either way nothing is owed.
     }
@@ -1931,7 +2200,7 @@ function prepareAgentDb(env = process.env, now = Date.now()) {
 }
 
 function removeAgentDb(db) {
-  if (db) fs.rmSync(db.dir, { recursive: true, force: true });
+  if (db) removeNamesSync(path.dirname(db.dir), [path.basename(db.dir)], 'root');
 }
 
 function agentHomeFor(repo) {
@@ -1973,11 +2242,11 @@ function removeBelow(root, relative) {
       throw error;
     }
     if (!stat.isDirectory()) {
-      fs.rmSync(current, { recursive: true, force: true });
+      removeNamesSync(path.dirname(current), [path.basename(current)], 'root');
       return;
     }
   }
-  fs.rmSync(path.join(current, parts[parts.length - 1]), { recursive: true, force: true });
+  removeNamesSync(current, [parts[parts.length - 1]], 'root');
 }
 
 // A regular file of at most `max` bytes, read through a descriptor that was
@@ -2359,6 +2628,8 @@ function agentToolEnv(env, home) {
 // clone it could not write; a clone is a few seconds of chown, once before and
 // once after.
 async function handOver(dir, home) {
+  forgetClosed(dir);
+  settleInstanceGate();
   settleAgentHome(home);
   await chownTree(dir, 'agent');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
@@ -2547,21 +2818,28 @@ function makeTreeWritable(realRoot, target) {
   }
 }
 
-// rm -rf that never follows a link, and that takes a directory the agent made
-// unreadable or unwritable (the runner owns it by now, so a chmod is its own).
-// Answers false, removing nothing, when the directory that holds `target` is no
-// longer inside the checkout.
-function forceRemove(realRoot, target) {
-  if (!holderInside(realRoot, target)) return false;
+// rm -rf of entries of one directory that never follows a link (see removeNames)
+// and that takes a directory the agent made unreadable or unwritable (with an
+// account split the tree is closed by now and every directory is the runner's
+// own 0700; with none, a chmod of what it owns is enough). Answers false,
+// removing nothing, when the directory that holds them is no longer inside the
+// checkout. The tree must have been closed (removeEntries refuses otherwise).
+async function forceRemoveNames(realRoot, holder, names) {
+  if (!directoryInside(realRoot, holder)) return false;
   try {
-    fs.rmSync(target, { recursive: true, force: true });
+    await removeEntries(holder, names);
     return true;
   } catch (error) {
-    if (error.code !== 'EACCES' && error.code !== 'EPERM' && error.code !== 'ENOTEMPTY') throw error;
+    if (/is not closed to other accounts/.test(error.message)) throw error;
   }
-  makeTreeWritable(realRoot, target);
-  fs.rmSync(target, { recursive: true, force: true });
+  for (const name of names) makeTreeWritable(realRoot, path.join(holder, name));
+  if (!directoryInside(realRoot, holder)) return false;
+  await removeEntries(holder, names);
   return true;
+}
+
+function forceRemove(realRoot, target) {
+  return forceRemoveNames(realRoot, path.dirname(target), [path.basename(target)]);
 }
 
 // The gitlink paths of the runner's own index. Only the index is read: no file
@@ -2634,20 +2912,27 @@ async function ignoredDirectories(workspace, directories) {
 // from the listing of its parent and does not enter a link; before a directory
 // is listed, and before anything in it is removed, `realpath` of the directory
 // is read again and must be inside the checkout's own real path, otherwise it is
-// left alone and told as `embedded`; a removal takes a link as a link. What this
-// does not do is close the gap between that check and the removal against a
-// writer that is still running: that writer is shut out beforehand (the account's
-// processes are ended, and reclaim takes every other account's access to the
-// whole tree away before it calls this).
+// left alone and told as `escaped` (its own sentence, not an embedded repository's);
+// a removal takes a link as a link, by rm, which names every directory by a
+// descriptor and never follows one. What this does not do is close the gap between
+// the realpath check and the removal against a writer that is still running: that
+// writer is shut out beforehand (the account's processes are ended, closeTree has
+// given the whole tree to the runner in one pass, and the instance directory
+// keeps every other worker's agent away from it), and a tree that is not closed
+// is closed here first or the scrub does not run.
 //
-// The answer is {submodule, ignored, embedded}, each a sorted list of paths with
-// a trailing slash, the way git lists an embedded repository.
+// The answer is {submodule, ignored, embedded, escaped}, each a sorted list of paths
+// with a trailing slash, the way git lists an embedded repository.
 async function scrubPlantedRepositories(workspace) {
   const root = workspace.dir;
+  // Nothing is listed, followed or removed in a tree another account may still
+  // write in: a tree not taken back and closed is closed first, and when that
+  // fails the scrub does not run.
+  if (!isClosedUnder(root)) await closeTree(root);
   const realRoot = fs.realpathSync(root);
-  const plants = { submodule: new Set(), ignored: new Set(), embedded: new Set() };
+  const plants = { submodule: new Set(), ignored: new Set(), embedded: new Set(), escaped: new Set() };
   const escaped = (relative) => {
-    plants.embedded.add(`${relative}/`);
+    plants.escaped.add(`${relative}/`);
     log('error', `${workspace.repo ? workspace.repo.fullName : root}: ${relative}/ resolved to a place outside the checkout while it was being cleaned, so nothing there was touched and the request is refused`);
   };
   if (workspace.gitdir) {
@@ -2662,15 +2947,11 @@ async function scrubPlantedRepositories(workspace) {
         }
         const entries = await listDirectory(target);
         if (entries.length === 0) continue;
-        let complete = true;
-        for (const entry of entries) {
-          if (!forceRemove(realRoot, path.join(target, entry.name))) complete = false;
-        }
-        if (!complete) {
+        if (!(await forceRemoveNames(realRoot, target, entries.map((entry) => entry.name)))) {
           escaped(relative);
           continue;
         }
-      } else if (!forceRemove(realRoot, target)) {
+      } else if (!(await forceRemove(realRoot, target))) {
         escaped(relative);
         continue;
       }
@@ -2697,19 +2978,19 @@ async function scrubPlantedRepositories(workspace) {
   const held = [...new Set(nested.filter((entry) => entry.relative !== '').map((entry) => entry.relative))];
   const ignored = workspace.gitdir ? await ignoredDirectories(workspace, held) : new Set(held);
   for (const { target, relative } of nested) {
-    if (!forceRemove(realRoot, target)) {
+    if (!(await forceRemove(realRoot, target))) {
       escaped(relative === '' ? '.git' : `${relative}/.git`);
       continue;
     }
     if (relative === '') continue;
     plants[ignored.has(relative) ? 'ignored' : 'embedded'].add(`${relative}/`);
   }
-  return { submodule: [...plants.submodule].sort(), ignored: [...plants.ignored].sort(), embedded: [...plants.embedded].sort() };
+  return { submodule: [...plants.submodule].sort(), ignored: [...plants.ignored].sort(), embedded: [...plants.embedded].sort(), escaped: [...plants.escaped].sort() };
 }
 
 // Every path a scrub told, in one list.
 function plantedPaths(found) {
-  return [...new Set([...found.submodule, ...found.ignored, ...found.embedded])].sort();
+  return [...new Set([...found.submodule, ...found.ignored, ...found.embedded, ...(found.escaped || [])])].sort();
 }
 
 // What the scrubs of one request found, kept on its workspace: for the proof
@@ -2718,22 +2999,10 @@ function plantedPaths(found) {
 function rememberPlants(workspace, found) {
   const all = plantedPaths(found);
   if (all.length === 0) return;
-  const kept = workspace.plants || { submodule: [], ignored: [], embedded: [] };
-  for (const kind of ['submodule', 'ignored', 'embedded']) kept[kind] = [...new Set([...kept[kind], ...found[kind]])].sort();
+  const kept = workspace.plants || { submodule: [], ignored: [], embedded: [], escaped: [] };
+  for (const kind of ['submodule', 'ignored', 'embedded', 'escaped']) kept[kind] = [...new Set([...(kept[kind] || []), ...(found[kind] || [])])].sort();
   workspace.plants = kept;
   workspace.planted = plantedPaths(kept);
-}
-
-// Takes every other account's access to a tree the runner has just taken back
-// (the agent keeps whatever mode it gave a subdirectory, and a process of
-// another account that holds a directory inside it keeps its handle), so that
-// nothing can write in it while the runner reads, cleans or stages it. chmod -R
-// does not enter a link, and its group and other bits being gone sets an ACL
-// mask to none, so an entry for another account cannot keep access open either.
-async function closeTree(dir) {
-  if (identity.mode === 'none') return;
-  const closed = await runProcess('chmod', ['-R', 'go-rwx', dir]);
-  if (closed.code !== 0) throw new Error(`${dir} could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
 }
 
 // The seam the tests use to make the agent's account not quiet; null in production.
@@ -2750,12 +3019,14 @@ let agentKiller = null;
 async function reclaim(dir, home, workspace = null) {
   const quiet = await (agentKiller || killAgentProcesses)();
   closeAgentHome(home);
-  await chownTree(dir, 'runner');
-  if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
+  // One pass, which owns and closes each directory before it lists it. When it
+  // throws, nothing is removed anywhere (every removal below asks for a closed
+  // tree), the root .git included, which no runner git call ever reads (each
+  // names its own git directory), and the request fails.
   await closeTree(dir);
   // The repository in the tree is the agent's. The runner never reads it; it
   // goes so it cannot be mistaken for the runner's.
-  fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+  await removeEntries(dir, ['.git']);
   const found = await scrubPlantedRepositories(workspace || { dir, gitdir: null });
   if (workspace) rememberPlants(workspace, found);
   return quiet;
@@ -2808,7 +3079,12 @@ async function settleWorkspace(config) {
     // walks through to reach its checkout: the two directories above it are
     // 0711 like the ones above a checkout in the flat layout, never listed.
     settleDir(path.dirname(lay.instanceDir), 0o711);
-    settleDir(lay.instanceDir, 0o711);
+    // The worker's own directory is the one the agent of ANOTHER worker must not
+    // be able to search at all (see settleInstanceGate): 0710 with the group of
+    // this worker's agent, checked again before every hand-over.
+    settleDir(lay.instanceDir, 0o710);
+    instanceGate = lay.instanceDir;
+    settleInstanceGate();
   }
   settleDir(lay.repos, 0o711);
   for (const owner of fs.readdirSync(lay.repos)) {
@@ -2856,9 +3132,7 @@ async function settleWorkspace(config) {
   }
   settleDir(lay.memory, 0o700);
   settleDir(lay.scratch, 0o700);
-  await chownTree(lay.memory, 'runner');
-  const closed = await runProcess('chmod', ['-R', 'go-rwx', lay.memory]);
-  if (closed.code !== 0) throw new Error(`the memory directory could not be closed to other accounts: ${redact(closed.stderr).trim()}`);
+  await closeTree(lay.memory);
 }
 
 async function refExists(workspace, ref) {
@@ -2931,9 +3205,23 @@ async function prepareCheckout(config, job, repo, options = {}) {
     // with its git directory, and cloned again.
     log('warn', `${repo.fullName}: the checkout from an earlier request could not be cleaned (${oneLine(redact(error.cause ? error.cause.message : error.message), 200)}); removing it and cloning again`);
     const lay = config.layout;
-    await wipeTree(path.join(lay.repos, repo.owner, repo.name));
-    await wipeTree(path.join(lay.gitdirs, repo.owner, repo.name));
+    await removeTree(path.join(lay.repos, repo.owner, repo.name));
+    await removeTree(path.join(lay.gitdirs, repo.owner, repo.name));
     return prepareCheckoutOnce(config, job, repo, options, true);
+  }
+}
+
+// A file in a runner's git directory that says the checkout cannot be trusted
+// (its index could not be put back after a failed mark): the next request removes
+// the checkout and its git directory and clones again.
+const UNUSABLE_MARK = 'sre-agent-unusable';
+
+function markCheckoutUnusable(gitdir) {
+  try {
+    fs.writeFileSync(path.join(gitdir, UNUSABLE_MARK), 'the index could not be restored\n');
+    ownByRunner(path.join(gitdir, UNUSABLE_MARK));
+  } catch (error) {
+    log('error', `${gitdir}: the checkout could not be marked unusable (${oneLine(redact(error.message), 160)})`);
   }
 }
 
@@ -2943,17 +3231,6 @@ class UnusableCheckout extends Error {
   constructor(cause) {
     super(cause.message);
     this.cause = cause;
-  }
-}
-
-// rm -rf for a directory that can be deeper than the system lets a path be, which
-// the runtime's own removal handles and its fallback, rm, does too.
-async function wipeTree(target) {
-  try {
-    fs.rmSync(target, { recursive: true, force: true });
-  } catch {
-    const removed = await runProcess('rm', ['-rf', '--', target]);
-    if (removed.code !== 0) throw new Error(`${target} could not be removed: ${redact(removed.stderr).trim()}`);
   }
 }
 
@@ -3009,14 +3286,14 @@ async function prepareCheckoutOnce(config, job, repo, options, fresh) {
   // something planted, and nothing in it is trusted: both are removed and the
   // clone is made again. So is a git directory that is not one.
   const gitStat = lstatOrNull(gitdir);
-  const goodGitdir = Boolean(gitStat && gitStat.isDirectory() && lstatOrNull(path.join(gitdir, 'HEAD')));
+  const goodGitdir = Boolean(gitStat && gitStat.isDirectory() && lstatOrNull(path.join(gitdir, 'HEAD')) && !lstatOrNull(path.join(gitdir, UNUSABLE_MARK)));
   if (lstatOrNull(path.join(dir, '.git'))) {
     log('warn', `${repo.fullName}: the checkout holds a git directory inside the checkout; cloning it again into the runner's own`);
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.rmSync(gitdir, { recursive: true, force: true });
+    await removeTree(dir);
+    await removeTree(gitdir);
   } else if (!goodGitdir) {
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.rmSync(gitdir, { recursive: true, force: true });
+    await removeTree(dir);
+    await removeTree(gitdir);
   }
 
   settleDir(lay.repos, 0o711);
@@ -3028,16 +3305,16 @@ async function prepareCheckoutOnce(config, job, repo, options, fresh) {
     await git(['clone', `--separate-git-dir=${gitdir}`, cleanUrl, dir], { token });
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
+    rememberClosed(dir);
   } else {
     // Whatever the last run's end left behind is the runner's again before the
     // runner's git touches it, and closed to every other account before anything
     // reads it.
     reused = true;
     settleDir(dir, 0o700);
-    await chownTree(dir, 'runner');
     await unusableWhenItFails(fresh, async () => {
       await closeTree(dir);
-      fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+      await removeEntries(dir, ['.git']);
       resetGitDir(gitdir, cleanUrl);
       await removeEarlierPlants(workspace, repo);
     });
@@ -3258,13 +3535,14 @@ function openContextTree(dir) {
   }
 }
 
-function prepareScratch(config) {
+async function prepareScratch(config) {
   // One fixed directory rather than one per handoff: an untargeted answer has
   // nothing to publish, so the only reason to keep it is for the operator to
   // read the last one, and a directory per request would grow without bound.
   const dir = config.layout.scratch;
-  fs.rmSync(dir, { recursive: true, force: true });
+  await removeTree(dir);
   settleDir(dir, 0o700);
+  rememberClosed(dir);
   return { dir, gitdir: null, repo: null, branch: null, defaultBranch: null, cleanUrl: null };
 }
 
@@ -3297,6 +3575,29 @@ const MEMORY_COPY_MIN_BYTES = 64;
 function oneLine(text, max) {
   const flat = String(text).replace(/\p{Cc}+/gu, ' ').replace(/\s+/g, ' ').trim();
   return Array.from(flat).slice(0, max).join('');
+}
+
+// Paths the agent named (a directory it made, a file it changed) on their way
+// into a report, a card or a log: redacted like any text of its own, one line
+// each, at most this long, and at most this many with the rest counted, since a
+// name is the agent's to choose and a secret it holds can be put in one.
+const SHOWN_PATHS_MAX = 20;
+const SHOWN_PATH_CHARS = 200;
+
+function shownPaths(paths) {
+  const shown = paths.slice(0, SHOWN_PATHS_MAX).map((entry) => oneLine(redact(entry), SHOWN_PATH_CHARS));
+  if (paths.length > SHOWN_PATHS_MAX) shown.push(`and ${paths.length - SHOWN_PATHS_MAX} more`);
+  return shown;
+}
+
+// A path that resolved outside the checkout while it was being cleaned: nothing
+// there was touched and the request is refused, in these words and not those of
+// an embedded repository or of the protected paths gate, which it is neither.
+function escapedReport(result, escaped) {
+  const shown = shownPaths(escaped);
+  result.evidence.escaped_paths = shown;
+  result.actions.push(`${shown.join(', ')} resolved to a place outside the checkout while the runner was cleaning it, so nothing there was touched and nothing was published`);
+  result.summary = `${result.summary}\n\nNothing was published: ${shown.join(', ')} resolved to a place outside the checkout while the runner was cleaning it (something in the tree was swapped for a link), so nothing there was touched and the request was refused.`;
 }
 
 // The first comment line of a script, so the agent can choose which saved
@@ -3352,7 +3653,13 @@ function memoryBlock(mem) {
 function openMemory(config, workspace, repo) {
   const source = memory.memoryDirIn(config.layout.memory, repo ? { owner: repo.owner, name: repo.name } : null);
   const copy = path.join(workspace.dir, MEMORY_COPY);
-  fs.rmSync(copy, { recursive: true, force: true });
+  // A copy an earlier run left is removed by the caller, from a closed tree, with
+  // rm (see handleJob): with an account split nothing here removes what an agent
+  // had, and a copy still there is one this run is not given memory for.
+  if (statOrNull(copy)) {
+    if (identity.mode !== 'none') throw new Error(`${MEMORY_COPY}/ of an earlier run is still in the checkout`);
+    fs.rmSync(copy, { recursive: true, force: true });
+  }
 
   // The directory is the runner's, but an operator or a restore may have left
   // something that breaks a bound; the agent is handed only what passes.
@@ -3479,7 +3786,14 @@ function closeMemory(mem, result) {
     result.memoryChanges = [];
     result.memoryMirror = [];
   } finally {
-    fs.rmSync(mem.copy, { recursive: true, force: true });
+    // The checkout is closed by now (the caller reclaimed it), so what is removed
+    // is the runner's own, by rm from the checkout's directory.
+    try {
+      if (identity.mode === 'none') fs.rmSync(mem.copy, { recursive: true, force: true });
+      else removeEntriesSync(path.dirname(mem.copy), [path.basename(mem.copy)]);
+    } catch (error) {
+      log('warn', `memory for ${mem.label}: its copy could not be removed (${oneLine(redact(error.message), 200)})`);
+    }
   }
 }
 
@@ -4450,6 +4764,62 @@ async function markGitlinks(workspace, paths, on) {
   }
 }
 
+// Runs `body` with the paths marked skip-worktree and takes the marks off again,
+// whatever happened. A mark that could not be made on a later chunk or taken off
+// leaves bits in the runner's own index, and the index is then put back as it was
+// before the first mark (a copy of it is kept for the length of this call), or,
+// when that cannot be done either, the checkout is marked unusable so that the
+// next request removes it and clones again. The request fails whenever a mark or
+// an unmark did; the original error, when there is one, is the one that is raised.
+async function withSkipWorktree(workspace, paths, body) {
+  if (paths.length === 0) return body();
+  const index = path.join(workspace.gitdir, 'index');
+  const backup = `${index}.sre-agent-before-mark`;
+  let kept = false;
+  try {
+    fs.copyFileSync(index, backup);
+    fs.chmodSync(backup, 0o600);
+    ownByRunner(backup);
+    kept = true;
+  } catch (error) {
+    log('warn', `${workspace.dir}: the index could not be copied before the marks (${oneLine(redact(error.message), 160)}), so a failed mark makes the checkout unusable instead of restoring it`);
+  }
+  let primary = null;
+  let markFailed = false;
+  try {
+    try {
+      await markGitlinks(workspace, paths, true);
+    } catch (error) {
+      markFailed = true;
+      throw error;
+    }
+    await body();
+  } catch (error) {
+    primary = error;
+  }
+  let undone = null;
+  try {
+    await markGitlinks(workspace, paths, false);
+  } catch (error) {
+    undone = error;
+  }
+  if (markFailed || undone) {
+    let restored = false;
+    if (kept) {
+      try {
+        fs.copyFileSync(backup, `${index}.sre-agent-restoring`);
+        fs.renameSync(`${index}.sre-agent-restoring`, index);
+        restored = true;
+      } catch (error) {
+        log('error', `${workspace.dir}: the index could not be put back (${oneLine(redact(error.message), 160)})`);
+      }
+    }
+    if (!restored) markCheckoutUnusable(workspace.gitdir);
+  }
+  if (kept) fs.rmSync(backup, { force: true });
+  if (primary || undone) throw primary || undone;
+}
+
 // Step 5. The gate. The fences are opencode's own tool gates and the agent
 // also runs a shell, which can write a file without any tool, so what actually
 // changed is judged here, by this package's own protected paths script, before
@@ -4467,7 +4837,8 @@ async function stageAndGate(workspace, memoryBlobs) {
   // stages with is rebuilt anyway: the config, the hooks and the ignore entries
   // that keep the runner's own files out of the commit, and a .git in the tree
   // is not a repository the runner reads.
-  fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+  if (identity.mode !== 'none' && !isClosedUnder(dir)) await closeTree(dir);
+  await removeEntries(dir, ['.git']);
   resetGitDir(gitdir, cleanUrl);
   excludeFromGit(gitdir, '.opencode/');
   excludeFromGit(gitdir, `${MEMORY_COPY}/`);
@@ -4477,9 +4848,13 @@ async function stageAndGate(workspace, memoryBlobs) {
   // the tree holds no `.git` and no gitlink content, so nothing below has a
   // nested repository to descend into.
   rememberPlants(workspace, await scrubPlantedRepositories(workspace));
-  const plants = workspace.plants || { submodule: [], ignored: [], embedded: [] };
+  const plants = workspace.plants || { submodule: [], ignored: [], embedded: [], escaped: [] };
   const removed = [...new Set([...plants.submodule, ...plants.ignored])].sort();
-  if (plants.embedded.length > 0) return { changed: plants.embedded, flagged: plants.embedded, memoryCopies: [], embedded: plants.embedded, removed };
+  const escaped = plants.escaped || [];
+  // A path that resolved outside the checkout while it was being cleaned is told
+  // as that and refuses the request, before anything is staged.
+  if (escaped.length > 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [], escaped, removed };
+  if (plants.embedded.length > 0) return { changed: plants.embedded, flagged: plants.embedded, memoryCopies: [], embedded: plants.embedded, escaped: [], removed };
   // An embedded repository (the agent ran git init in a subdirectory) would be
   // added as a gitlink: a pointer at history that is in no pull request. git
   // lists such a directory, untracked, with a trailing slash; nothing is staged.
@@ -4488,16 +4863,17 @@ async function stageAndGate(workspace, memoryBlobs) {
   // mark is taken off again afterwards (the next request, the proof and the
   // commit see the index as the base made it).
   const baseGitlinks = await gitlinkPaths(workspace);
-  await markGitlinks(workspace, baseGitlinks, true);
-  try {
+  let early = null;
+  await withSkipWorktree(workspace, baseGitlinks, async () => {
     const untracked = (await gitIn(workspace, ['ls-files', '--others', '--exclude-standard', '-z'])).split('\0').filter(Boolean);
     const embedded = untracked.filter((entry) => entry.endsWith('/'));
-    if (embedded.length > 0) return { changed: embedded, flagged: embedded, memoryCopies: [], embedded, removed };
-
+    if (embedded.length > 0) {
+      early = { changed: embedded, flagged: embedded, memoryCopies: [], embedded, escaped: [], removed };
+      return;
+    }
     await gitIn(workspace, ['add', '-A']);
-  } finally {
-    await markGitlinks(workspace, baseGitlinks, false);
-  }
+  });
+  if (early) return early;
   // NUL separated and unquoted: git's default quoting wraps a name that holds a
   // non-ASCII or special character in double quotes with octal escapes, and a
   // quoted name matches neither the protected paths gate nor the CI paths rule.
@@ -4506,7 +4882,7 @@ async function stageAndGate(workspace, memoryBlobs) {
     .split('\0')
     .filter(Boolean);
 
-  if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [], removed };
+  if (staged.length === 0) return { changed: [], flagged: [], memoryCopies: [], embedded: [], escaped: [], removed };
 
   const gate = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'protected_paths.sh')], {
     input: `${staged.join('\n')}\n`,
@@ -4540,6 +4916,7 @@ async function stageAndGate(workspace, memoryBlobs) {
     flagged: [...new Set([...flagged, ...memoryCopies, ...gitlinks])],
     memoryCopies,
     embedded: gitlinks,
+    escaped: [],
     removed,
   };
 }
@@ -5803,7 +6180,7 @@ async function runTestJob(config, job, heartbeat) {
     });
 
     await step('model', async () => {
-      const scratch = prepareScratch(config);
+      const scratch = await prepareScratch(config);
       writeAgent(config, scratch.dir);
       const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
       let agent;
@@ -5847,7 +6224,7 @@ async function runTestJob(config, job, heartbeat) {
         log('warn', `test job ${job.handoff_id}: fallback_model: not run: a process of the agent's account from the model step could not be ended`);
         return { ok: false, detail: TEST_NOT_RUN };
       }
-      const scratch = prepareScratch(config);
+      const scratch = await prepareScratch(config);
       writeAgent(config, scratch.dir);
       const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
       let agent;
@@ -6039,7 +6416,7 @@ async function handleJob(config, job, options = {}) {
       return result;
     }
     if (repo) progress.phase('cloning');
-    const workspace = repo ? await prepareCheckout(config, job, repo, change ? checkoutOptions(change) : {}) : prepareScratch(config);
+    const workspace = repo ? await prepareCheckout(config, job, repo, change ? checkoutOptions(change) : {}) : await prepareScratch(config);
     if (change) {
       result.evidence.repository = repo.fullName;
       result.evidence.branch = workspace.remoteBranch || workspace.branch;
@@ -6081,9 +6458,10 @@ async function handleJob(config, job, options = {}) {
     writeAgent(config, workspace.dir);
     let mem = null;
     try {
+      await removeEntries(workspace.dir, [MEMORY_COPY]);
       mem = openMemory(config, workspace, repo);
     } catch (error) {
-      fs.rmSync(path.join(workspace.dir, MEMORY_COPY), { recursive: true, force: true });
+      await removeEntries(workspace.dir, [MEMORY_COPY]).catch(() => {});
       log('warn', `memory could not be prepared (${redact(error.message)}); the run goes ahead without it`);
     }
     let agent;
@@ -6143,7 +6521,7 @@ async function handleJob(config, job, options = {}) {
           // could have written back is marked skip-worktree and invisible to the
           // proof, so it is taken out again here whatever the proof said.
           if (repo) await stripRepoConfig(workspace);
-          fs.rmSync(path.join(workspace.dir, '.opencode'), { recursive: true, force: true });
+          await removeEntries(workspace.dir, ['.opencode']);
           writeAgent(config, workspace.dir);
           secondBundle = repo ? await makeBaseBundle(workspace) : null;
           await handOver(workspace.dir, home);
@@ -6181,7 +6559,15 @@ async function handleJob(config, job, options = {}) {
         reclaimed = true;
       } finally {
         if (mem && reclaimed) closeMemory(mem, result);
-        else if (mem) fs.rmSync(mem.copy, { recursive: true, force: true });
+        else if (mem) {
+          // A checkout that could not be taken back: its copy is closed and removed
+          // by itself, and when that cannot be done it stays and the request fails.
+          try {
+            await removeTree(mem.copy);
+          } catch (error) {
+            log('warn', `memory for ${mem.label}: its copy could not be removed (${oneLine(redact(error.message), 200)})`);
+          }
+        }
         // The repository's lease ends with the save and the home: this is the
         // brief's span, held until the memory is closed and the agent's home
         // is the runner's again, and never into the staging and the push.
@@ -6313,14 +6699,21 @@ async function handleJob(config, job, options = {}) {
     }
 
     progress.phase('checks');
-    const { changed, flagged, memoryCopies, embedded, removed } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
+    const { changed, flagged, memoryCopies, embedded, escaped, removed } = await stageAndGate(workspace, mem ? mem.blobs : new Set());
     if (removed.length > 0) {
       // Not a reason to refuse: a repository in a path the base keeps for a
       // submodule, or under an ignored directory, is in no pull request. Said, so
-      // that whoever reads the report knows it was there and is gone.
-      result.evidence.removed_repositories = removed;
-      result.actions.push(`removed ${removed.join(', ')}, where the agent left a git repository (a submodule it initialised, or one a tool made under an ignored path); the runner never reads one, and no pull request holds it`);
-      result.summary = `${result.summary}\n\nThe git repository the agent left in ${removed.join(', ')} was removed from the checkout and is not part of the change.`;
+      // that whoever reads the report knows it was there and is gone. The names
+      // are the agent's: redacted, one line each and bounded like any text of
+      // its own that reaches the report.
+      const shown = shownPaths(removed);
+      result.evidence.removed_repositories = shown;
+      result.actions.push(`removed ${shown.join(', ')}, where the agent left a git repository (a submodule it initialised, or one a tool made under an ignored path); the runner never reads one, and no pull request holds it`);
+      result.summary = `${result.summary}\n\nThe git repository the agent left in ${shown.join(', ')} was removed from the checkout and is not part of the change.`;
+    }
+    if (escaped.length > 0) {
+      escapedReport(result, escaped);
+      return result;
     }
     if (changed.length === 0) {
       result.actions.push('the agent left the working tree unchanged, so nothing was published');
@@ -6330,18 +6723,21 @@ async function handleJob(config, job, options = {}) {
     result.evidence.changed_files = changed;
 
     if (flagged.length > 0) {
-      result.evidence.flagged_paths = flagged;
-      result.summary = `${result.summary}\n\nNothing was published: the change touched ${flagged.join(', ')}, which the protected paths gate refuses.`;
+      const shownFlagged = shownPaths(flagged);
+      result.evidence.flagged_paths = shownFlagged;
+      result.summary = `${result.summary}\n\nNothing was published: the change touched ${shownFlagged.join(', ')}, which the protected paths gate refuses.`;
       if (embedded.length > 0) {
-        result.summary = `${result.summary} ${embedded.join(', ')} is an embedded git repository (or a pointer to one), which git records as a pointer at history that is in no pull request; nothing was published.`;
-        result.evidence.embedded_repositories = embedded;
+        const shownEmbedded = shownPaths(embedded);
+        result.summary = `${result.summary} ${shownEmbedded.join(', ')} is an embedded git repository (or a pointer to one), which git records as a pointer at history that is in no pull request; nothing was published.`;
+        result.evidence.embedded_repositories = shownEmbedded;
       }
       if (memoryCopies.length > 0) {
-        result.summary = `${result.summary} ${memoryCopies.join(', ')} holds a copy of what the agent keeps in its memory, and memory never goes into a pull request.`;
-        result.evidence.memory_copy_paths = memoryCopies;
+        const shownCopies = shownPaths(memoryCopies);
+        result.summary = `${result.summary} ${shownCopies.join(', ')} holds a copy of what the agent keeps in its memory, and memory never goes into a pull request.`;
+        result.evidence.memory_copy_paths = shownCopies;
       }
-      result.actions.push(`the protected paths gate refused ${flagged.join(', ')}`);
-      log('error', `the protected paths gate refused ${flagged.join(', ')}; nothing was pushed`);
+      result.actions.push(`the protected paths gate refused ${shownFlagged.join(', ')}`);
+      log('error', `the protected paths gate refused ${shownFlagged.join(', ')}; nothing was pushed`);
       return result;
     }
 
@@ -6755,6 +7151,12 @@ module.exports = {
     workspaceUnchanged,
     reclaim,
     stageAndGate,
+    closeTree,
+    removeTree,
+    removeEntries,
+    settleInstanceGate,
+    shownPaths,
+    escapedReport,
     poll,
     openMemory,
     closeMemory,

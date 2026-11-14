@@ -330,6 +330,15 @@ case "${STUB_OPENCODE_MEMORY:-}" in
     # tool that checks a dependency out leaves.
     plant_repository vendor/pkg
     ;;
+  plantsecret)
+    # Repositories under an ignored directory whose names are the agent's choice:
+    # one named after a secret the runner holds, one far longer than a report line
+    # may be, one with a line break in it, and many more than a report names.
+    plant_repository "vendor/0-${STUB_SECRET_NAME:?}"
+    plant_repository "vendor/$(printf 'a%.0s' $(seq 1 230))"
+    plant_repository "vendor/line"$'\n'"break"
+    for n in $(seq 1 24); do plant_repository "vendor/many$n"; done
+    ;;
   plant)
     # What an agent that owns its tree can leave for the runner's git: a .git
     # of its own with a filter and an fsmonitor in it, and attributes that name
@@ -663,6 +672,16 @@ d.yml"
     printf 'start %s %s %s\n' "$(id -u)" "$PWD" "$(date +%s%N)" >> "${STUB_OPENCODE_TIMING:?}"
     case "$PWD" in
       */acme/app)
+        # A hostile agent opens its own checkout to every account, and leaves
+        # directories open to every account inside it, which another account that
+        # can walk in would write in once the run is over. The test starts a
+        # process of the other worker's account that holds one of them, and the
+        # other worker's agent keeps trying to reach the tree from outside.
+        chmod 0777 .
+        mkdir -p open777/inner sticky
+        chmod 0777 open777 open777/inner
+        chmod 1777 sticky
+        printf 'premise_tree_mode: %s\n' "$(stat -c %a .)" >> "${STUB_WORKERS_PROBE:?}"
         sleep "${STUB_QUICK:-4}"
         ;;
       *)
@@ -700,7 +719,31 @@ d.yml"
           printf 'other_checkout_write: %s\n' "$(allowed bash -c ": >> '$ws/instances/$other_instance/repos/acme/app/README.md'")"
           printf 'other_home_list: %s\n' "$(allowed ls "$ws/instances/$other_instance/agent-home/acme/app")"
           printf 'other_instance_list: %s\n' "$(allowed ls "$ws/instances/$other_instance")"
+          printf 'own_checkout_list: %s\n' "$(allowed ls "$PWD")"
         } >> "${STUB_WORKERS_PROBE:?}"
+        # From here to the end of its run, this agent tries everything it can think
+        # of to get into the other worker's tree, while the other worker's run ends
+        # and its checkout is taken back: it must get into none of it, at any time.
+        theirs="$ws/instances/$other_instance"
+        attempts=0
+        reached=""
+        until_ns=$(( $(date +%s%N) + ${STUB_SLOW_NS:-4000000000} ))
+        while [ "$(date +%s%N)" -lt "$until_ns" ]; do
+          attempts=$((attempts + 1))
+          for target in "$theirs/repos/acme/app" "$theirs/repos/acme/app/open777" "$theirs/repos/acme/app/open777/inner" "$theirs/repos/acme/app/sticky" "$theirs/scratch" "$theirs/gitdirs/acme/app" "$theirs/agent-home/acme/app" "$theirs/agent-home" "$theirs"; do
+            if ls "$target" >/dev/null 2>&1; then reached="$reached ls:$target"; fi
+            # A name can always be looked up in a directory one may search, so the
+            # instance directory itself is not stat'ed: what is below it is.
+            if [ "$target" != "$theirs" ] && stat -c %a "$target" >/dev/null 2>&1; then reached="$reached stat:$target"; fi
+            if ( cd "$target" ) 2>/dev/null; then reached="$reached cd:$target"; fi
+            if ( : > "$target/probe-$attempts" ) 2>/dev/null; then reached="$reached create:$target"; fi
+            if mkdir "$target/probe-dir-$attempts" 2>/dev/null; then reached="$reached mkdir:$target"; fi
+            if ln -s /nowhere "$target/probe-link-$attempts" 2>/dev/null; then reached="$reached symlink:$target"; fi
+          done
+          sleep 0.05
+        done
+        printf 'race_attempts: %s\n' "$attempts" >> "${STUB_WORKERS_PROBE:?}"
+        printf 'race_reached: [%s]\n' "$reached" >> "${STUB_WORKERS_PROBE:?}"
         sleep "${STUB_SLOW:-7}"
         ;;
     esac

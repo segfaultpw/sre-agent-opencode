@@ -136,7 +136,10 @@ function main(env = process.env) {
   for (const instance of instances) {
     const dir = path.join(workspace, 'instances', instance);
     try {
-      fs.mkdirSync(dir, { recursive: true });
+      // 0700 for a directory made here: until the worker settles it (the runner's,
+      // in the group of that worker's agent alone, 0710) no account but this one can
+      // search it.
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.accessSync(dir, fs.constants.W_OK);
     } catch {
       process.stderr.write(

@@ -4045,6 +4045,10 @@ gl_run gl_ignored plantignored
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && jq -e '.evidence.removed_repositories == ["vendor/pkg/"] and (.evidence | has("flagged_paths") | not)' <<<"$report" >/dev/null && gl_clean && [ ! -e "$gl_tree/vendor/pkg/.git" ]; then echo "ok   a repository under an ignored directory is removed and told, runs nothing, and the request still ends in its pull request"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
 stop_fixture
 
+STUB_SECRET_NAME="$github_token" gl_run gl_secretname plantsecret
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && ! grep -qF "$github_token" <<<"$report" && jq -e '(.evidence.removed_repositories | length) == 21 and (.evidence.removed_repositories | all(test("[\\n\\r]") | not)) and (.evidence.removed_repositories | all(length <= 200)) and (.evidence.removed_repositories[20] == "and 7 more") and (.evidence.removed_repositories[0] | startswith("vendor/0-")) and (.summary | contains("line\nbreak") | not)' <<<"$report" >/dev/null; then echo "ok   the paths of removed repositories go through the redaction, one line each and bounded, and a secret named by the agent is not in the report"; else echo "FAIL rc=$rc report: $(jq -c '[.evidence.removed_repositories, .summary]' <<<"$report" | cut -c1-900)"; fail=1; fi
+stop_fixture
+
 gl_run gl_nested plantnested
 if [ "$rc" -eq 0 ] && jq -e '.evidence.flagged_paths | index("deep/inner/")' <<<"$report" >/dev/null && gl_clean && [ ! -e "$gl_tree/deep/inner/.git" ]; then echo "ok   a repository outside any submodule path is refused, never read, and its .git is removed"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
 stop_fixture
@@ -4065,6 +4069,16 @@ stop_fixture
 gl_run gl_first plantsub
 gl_run gl_second ""
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean && [ ! -e "$gl_tree/sub/.git" ]; then echo "ok   the request after one that left a repository publishes, and nothing planted ever ran"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+stop_fixture
+
+# A checkout whose git directory carries the mark the runner writes when it could
+# not put the index back after a skip-worktree mark failed: the next request removes
+# the checkout and its git directory and clones again, whatever else is wrong with
+# neither, and ends in its pull request.
+printf 'stray\n' > "$gl_tree/stray-file-of-an-earlier-request"
+printf 'the index could not be restored\n' > "$workspace/gitdirs/acme/gl/sre-agent-unusable"
+gl_run gl_unusable ""
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ ! -e "$gl_tree/stray-file-of-an-earlier-request" ] && [ ! -e "$workspace/gitdirs/acme/gl/sre-agent-unusable" ]; then echo "ok   a checkout marked unusable is removed with its git directory and cloned again"; else echo "FAIL rc=$rc report: $report stray: $(ls "$gl_tree" | head -5) mark: $(ls "$workspace/gitdirs/acme/gl")"; fail=1; fi
 stop_fixture
 
 # A checkout the runner cannot clean at all: a path longer than the system lets

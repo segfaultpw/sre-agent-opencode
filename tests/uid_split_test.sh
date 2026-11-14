@@ -502,6 +502,46 @@ prove_workers() {
        token: $token})' > "$work/queue-wk.json"
   FIXTURE_QUEUE_LEASE=1 FIXTURE_QUEUE_FILE="$work/queue-wk.json" start_fixture
   sed -i "s#BASE#${server_url}#g" "$work/queue-wk.json"
+  # A process of the OTHER worker's account that already holds a directory the
+  # first worker's agent opened to every account (here the test, which can enter
+  # anywhere, puts it there before the account switch: the cwd it keeps is what a
+  # process that got in earlier would hold), and creates entries of its own in a
+  # loop, links to a directory outside the tree among them. Whatever it manages
+  # before the run ends has to be taken over by the runner's close; after the
+  # checkout is taken back it must manage nothing.
+  local victim="$work/$label.wk-victim" attacker_log="$work/$label.wk-attacker" attacker_stop="$work/$label.wk-attacker.stop" attacker_pid=""
+  rm -rf "$victim" "$attacker_stop"
+  mkdir -p "$victim/lib"
+  for n in $(seq 1 20); do printf 'keep\n' > "$victim/lib/v$n"; done
+  chown -R "$owner:$owner" "$victim"
+  : > "$attacker_log"; chmod 666 "$attacker_log"
+  (
+    held=""
+    for _ in $(seq 1 600); do
+      held="$(compgen -G "$ws/instances/*/repos/acme/app/open777/inner" | head -n 1 || true)"
+      if [ -n "$held" ]; then break; fi
+      sleep 0.02
+    done
+    if [ -z "$held" ]; then echo "premise none $(date +%s%N)" >> "$attacker_log"; exit 0; fi
+    attacker="$agent_uid"
+    case "$held" in */instances/pool-1/*) attacker="$agent2_uid" ;; esac
+    cd "$held"
+    exec setpriv --reuid="$attacker" --regid="$attacker" --clear-groups env VICTIM="$victim" STOP="$attacker_stop" LOG="$attacker_log" bash -c '
+      i=0
+      while [ ! -e "$STOP" ]; do
+        i=$((i + 1))
+        if mkdir "n$i" 2>/dev/null; then
+          ln -s "$VICTIM" "n$i/lib" 2>/dev/null || true
+          : > "n$i/file" 2>/dev/null || true
+          echo "ok $(date +%s%N) $i" >> "$LOG"
+        else
+          echo "denied $(date +%s%N) $i" >> "$LOG"
+        fi
+        sleep 0.02
+      done'
+  ) &
+  attacker_pid=$!
+  survivors+=("$attacker_pid")
   local rc=0
   timeout 120 "${prefix[@]}" env SRE_ONCE=1 SRE_CONCURRENCY=2 SRE_RUNNER_INSTANCE=pool \
     SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
@@ -515,6 +555,8 @@ prove_workers() {
     STUB_AGENT_UIDS="$agent_uid $agent2_uid" STUB_INSTANCES="pool-1 pool-2" \
     node "$work/pkg/runner/supervisor.js" > "$out" 2>&1 || rc=$?
   stop_fixture
+  : > "$attacker_stop"
+  wait "$attacker_pid" 2>/dev/null || true
   local reports
   # The fixture log is shared by every case, so count only this case's two handoffs.
   reports="$(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body | select(.pr_url == "https://github.com/acme/app/pull/7")' "$work/requests.jsonl" | wc -l)"
@@ -533,6 +575,28 @@ prove_workers() {
   if grep -qE '^other_cmdline_readable: [1-9]' "$probe"; then echo "ok   $label: the other agent's command lines ARE readable, as the README says (a credential on a command line is visible to another worker's agent)"; else echo "FAIL $label: the documented residual is gone or the probe is blind: $(grep cmdline "$probe")"; fail=1; fi
   if grep -qx 'other_checkout_list: denied' "$probe" && grep -qx 'other_checkout_read: denied' "$probe" && grep -qx 'other_checkout_write: denied' "$probe"; then echo "ok   $label: the other worker's checkout can be neither listed, read nor written"; else echo "FAIL $label: $(grep checkout "$probe")"; fail=1; fi
   if grep -qx 'other_home_list: denied' "$probe" && grep -qx 'other_instance_list: denied' "$probe"; then echo "ok   $label: the other worker's agent home and instance directory cannot be listed"; else echo "FAIL $label: $(grep -E 'home|instance' "$probe")"; fail=1; fi
+  if grep -qx 'own_checkout_list: allowed' "$probe"; then echo "ok   $label: the probe is not blind, the worker's own checkout is reachable to its own agent"; else echo "FAIL $label: $(grep own_ "$probe")"; fail=1; fi
+  # Every account but the worker's own agent is shut out of the whole tree of the
+  # worker, at all times: not only once the checkout is closed. Its agent opened its
+  # checkout and two directories in it to every account, and the other worker's
+  # agent tried to list, stat, enter and write them, and the folder above, for the
+  # whole of the first run's end and reclaim.
+  if grep -qx 'premise_tree_mode: 777' "$probe" && grep -qE '^race_attempts: ([5-9]|[1-9][0-9])' "$probe" && grep -qx 'race_reached: \[\]' "$probe"; then echo "ok   $label: the other worker's agent, which tried $(sed -n 's/^race_attempts: //p' "$probe") rounds of list, stat, enter, create, mkdir and symlink on the tree of a worker whose agent had opened it to every account, got into none of it"; else echo "FAIL $label: $(grep -E 'premise|race_' "$probe")"; fail=1; fi
+  local gate1 gate2
+  gate1="$(stat -c '%u:%g %a' "$ws/instances/pool-1" 2>&1)"
+  gate2="$(stat -c '%u:%g %a' "$ws/instances/pool-2" 2>&1)"
+  if [ "$gate1" = "$owner:$agent_uid 710" ] && [ "$gate2" = "$owner:$agent2_uid 710" ]; then echo "ok   $label: each worker's instance directory is the runner's with the group of that worker's agent alone, mode 0710 (walked into by that agent only)"; else echo "FAIL $label: pool-1 $gate1, pool-2 $gate2"; fail=1; fi
+  # The entries a process of the other account made inside the open directory
+  # while it still could are the runner's now, nothing of it can write there once
+  # the run is over, and nothing outside the tree was touched.
+  local app_instance foreign
+  app_instance="$(awk '$1 == "end" && $3 ~ /acme\/app$/ { print $3 }' "$timing")"
+  foreign="$(find "${app_instance:-$ws/none}" ! -uid "$owner" -print -quit 2>/dev/null || true)"
+  local end_ns late_ok late_denied
+  end_ns="$(awk '$1 == "end" && $3 ~ /acme\/app$/ { print $4 }' "$timing")"
+  late_ok="$(awk -v t="$end_ns" '$1 == "ok" && $2 > t + 3000000000 { n++ } END { print n + 0 }' "$attacker_log")"
+  late_denied="$(awk -v t="$end_ns" '$1 == "denied" && $2 > t + 3000000000 { n++ } END { print n + 0 }' "$attacker_log")"
+  if [ -n "$end_ns" ] && [ -z "$foreign" ] && [ "$late_ok" -eq 0 ] && [ "$late_denied" -ge 5 ] && [ "$(ls "$victim/lib" | wc -l)" -eq 20 ]; then echo "ok   $label: a process of the other account that held an open directory of the tree could not write in it once the run was over ($late_denied refused attempts, none allowed), left nothing of its own in the checkout, and the directory its links named was never touched"; else echo "FAIL $label: foreign=[$foreign] late_ok=$late_ok late_denied=$late_denied victim=$(ls "$victim/lib" | wc -l) first=$(head -n 3 "$attacker_log" | tr '\n' ';')"; fail=1; fi
   if ! jq -e --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure.kind // empty' "$work/requests.jsonl" >/dev/null; then echo "ok   $label: neither request reports an agent that was stopped or survived"; else echo "FAIL $label: $(jq -c --arg label "$label" 'select((.path | test("/h-wk-" + $label + "-[ab]/report$"))) | .body.failure' "$work/requests.jsonl" | tr '\n' ' ')"; fail=1; fi
 }
 prove_workers root "$runner_uid" setpriv --groups=20001,20002 --
