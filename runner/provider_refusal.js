@@ -140,13 +140,21 @@ const MODEL_MISSING_CODE = /(?<![a-z0-9_])(?:not_found_error|model_not_found|unk
 // own request for a model (Unsupported parameter for this model: 'x' does not
 // exist), so the id must follow the word `model` after whitespace only (the
 // platform's PCRE reads \s as these six ASCII characters, so they are spelled
-// out), and `this model` is never a name.
-const MODEL_MISSING_SENTENCE = /(?<!this )\bmodel[ \t\n\v\f\r]+[`'"]?[\w.:/@-]+[`'"]?[ \t\n\v\f\r]+does not exist\b/;
+// out), and the word must start a sentence: the start of the text, or one of
+// a line feed, a colon, a quote, a backquote, a parenthesis, a bracket, or a
+// full stop, semicolon, exclamation or question mark followed by blanks, then
+// at most two of `the`, `requested` and `specified`. A word of another phrase
+// right before `model` (for, parameter, field, this) is no start. `^` without
+// the m flag is the start of the text, the platform's \A.
+const MODEL_MISSING_SENTENCE = /(?:^|[\n:"'`(\[.;!?][ \t\n\v\f\r]*)(?:(?:the|requested|specified)[ \t\n\v\f\r]+){0,2}model[ \t\n\v\f\r]+[`'"]?[\w.:/@-]+[`'"]?[ \t\n\v\f\r]+does not exist\b/;
 // A 403 is an authentication refusal only when its words say so: a content
 // policy or safety block is a 403 too, and sending a person to their key for it
 // is the wrong place.
-const FORBIDDEN_AUTH_WORDS = ['unauthorized', 'unauthenticated', 'authentication', 'permission', 'api key', 'api_key', 'x-api-key', 'apikey', 'not authorized', 'accessdenied', 'access denied', 'invalid token', 'credentials'];
+const FORBIDDEN_AUTH_WORDS = ['unauthorized', 'unauthenticated', 'authentication', 'permission', 'api key', 'api_key', 'x-api-key', 'apikey', 'not authorized', 'accessdenied', 'access denied', 'invalid token', 'credential', 'security token', 'request signature', 'token is invalid', 'expired token'];
 const FORBIDDEN_POLICY_WORDS = ['content policy', 'content_policy', 'content filter', 'content_filter', 'usage policy', 'policy violation', 'safety', 'moderation'];
+// Amazon Bedrock answers a 403 with this sentence when the account has not been
+// given the model: the key was accepted, so it is a missing model, not a key.
+const MODEL_ACCESS_SENTENCE = /\b(?:don't|don\u2019t|do not|dont) have access to the model\b/;
 const FORBIDDEN_FOR_KEY = /\bforbidden\b[^.]{0,60}\b(?:key|account|token|credentials?)\b/;
 // The platform counts the 60 in bytes, so the phrase is read as bytes too.
 function forbiddenForKey(text) {
@@ -161,8 +169,10 @@ function holdsAny(text, words) {
   return words.some((word) => text.includes(word));
 }
 
-// The words a status is read from: the message and the body code, at most 4,096
-// bytes, cut on a character.
+// The words a status is read from: the body code, a line feed and the message,
+// at most 4,096 bytes, cut on a character. The code goes first so a long message
+// cannot push it out of the bound; the line feed is a sentence start for the
+// missing model sentence.
 function boundedText(text) {
   const buffer = Buffer.from(text, 'utf8');
   return buffer.length <= TEXT_BYTES ? text : completeCharacters(buffer.subarray(0, TEXT_BYTES)).toString('utf8');
@@ -171,12 +181,12 @@ function boundedText(text) {
 function classOf(event) {
   if (event.name === 'ProviderAuthError') return 'auth';
   if (event.name !== 'APIError') return null;
-  const text = boundedText(wellFormed(`${event.message} ${event.bodyCode || ''}`)).toLowerCase();
+  const text = boundedText(wellFormed(`${event.bodyCode || ''}\n${event.message}`)).toLowerCase();
   switch (event.statusCode) {
     case 401:
       return 'auth';
     case 403:
-      return forbiddenIsAuth(text) ? 'auth' : null;
+      return forbiddenIsAuth(text) ? 'auth' : MODEL_ACCESS_SENTENCE.test(text) && !holdsAny(text, FORBIDDEN_POLICY_WORDS) ? 'model_not_found' : null;
     case 402:
       return 'billing';
     case 404:
@@ -214,9 +224,9 @@ function classify(events, run, options = {}) {
 // The scrubber. One reading of the text, in this order:
 //   1. at most the first 65,536 bytes, a token the cut ended inside of dropped;
 //   2. escape sequences removed, and invisible characters (every format
-//      character, the combining grapheme joiner, the variation selectors, and
-//      U+FFFD, which is what an invalid byte decodes to) replaced by one marker
-//      byte per run;
+//      character, every unassigned code point, the four Hangul fillers, the
+//      combining grapheme joiner, the variation selectors, and U+FFFD, which is
+//      what an invalid byte decodes to) replaced by one marker byte per run;
 //   3. every run of whitespace and control characters one space, or one gap
 //      byte when the run holds anything but plain spaces (a control character,
 //      a line break, a no-break space, another Unicode space), and then every
@@ -309,14 +319,22 @@ function cutRaw(raw) {
 // or the end of the line), the string controls DCS, SOS, PM and APC (until ST),
 // and any other two or three byte escape.
 const ESCAPES = /\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B\n]*(?:\x07|\x1B\\)?|\x1B[PX^_][^\x07\x1B\n]*(?:\x1B\\)?|\x1B[ -/]*[0-~]/g;
-// Every format character, the combining grapheme joiner and the variation
-// selectors. A run of them leaves one marker byte: the rules read it as a gap
-// and the output drops it, so one of them in the middle of a key cannot hide
-// it from a mask and one between a word and a key cannot glue the key to the
-// word.
+// Every format character, every code point the Unicode tables leave unassigned
+// (default ignorables such as U+2065 and U+E0080 split a key as well, and the
+// noncharacters are never drawn), the combining grapheme joiner, the variation
+// selectors and the four Hangul fillers (U+115F, U+1160, U+3164, U+FFA0:
+// letters that draw nothing, so no mask class sees them). A run of them leaves
+// one marker byte: the rules read it as a gap and the output drops it, so one
+// of them in the middle of a key cannot hide it from a mask and one between a
+// word and a key cannot glue the key to the word.
+// The platform's tables are Unicode 16 and Node's are newer, so a code point
+// assigned later is unassigned there and a letter, symbol or mark here. Nothing
+// is lost by that: a key is ASCII, a mark after an ASCII character, a space or
+// a gap is removed by the mark rule below with the same output, and what stays
+// after a letter of another script cannot hide an ASCII key.
 // U+FFFD, what Node decodes a byte that is not valid UTF-8 to, is one of them:
 // dropping it without a marker would glue a key to the word before it.
-const INVISIBLE = /[\p{Cf}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\uFFFD]+/gu;
+const INVISIBLE = /[\p{Cf}\p{Cn}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\uFFFD\u115F\u1160\u3164\uFFA0]+/gu;
 // A run of combining marks that does not follow a character above U+007F: after
 // an ASCII character, a space, a gap, a marker or the start of the text it
 // cannot be told from one that splits a key, so it is removed and leaves a
@@ -358,10 +376,15 @@ function alt(names) {
 }
 
 // The names of a secret field, which a URL may spell with a percent-encoded
-// underscore or hyphen (`api%5Fkey`).
+// underscore or hyphen (`api%5Fkey`), or with that encoded once more
+// (`api%255Fkey`: the percent sign itself escaped, never a third level).
 function nameLiteral(name) {
   return graphemes(name)
-    .map((character) => (character === '_' ? `(?:_|%${GAP_STAR}5${GAP_STAR}[Ff])` : character === '-' ? `(?:-|%${GAP_STAR}2${GAP_STAR}[Dd])` : escapeRegex(character)))
+    .map((character) => {
+      if (character === '_') return `(?:_|%${GAP_STAR}(?:2${GAP_STAR}5${GAP_STAR})?5${GAP_STAR}[Ff])`;
+      if (character === '-') return `(?:-|%${GAP_STAR}(?:2${GAP_STAR}5${GAP_STAR})?2${GAP_STAR}[Dd])`;
+      return escapeRegex(character);
+    })
     .join(GAP_STAR);
 }
 

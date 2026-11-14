@@ -19,7 +19,7 @@ const root = path.resolve(__dirname, '..');
 const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, wellFormed } = require(path.join(root, 'runner', 'provider_refusal.js'));
 
 const FIXTURE_PATH = path.join(__dirname, 'fixture', 'provider_messages.json');
-const FIXTURE_SHA256 = '4f245e3a446a3fb3f2f0434418c192c55f04efa5c8543e2aad788fe7c205ed76';
+const FIXTURE_SHA256 = '8557e505122766636e27bf47482523148e44e450a10bf0329aa3df504dc15b8e';
 
 let failed = 0;
 function check(name, fn) {
@@ -66,6 +66,25 @@ check('every case holds with the removal by value alone, with no redact function
   assert.deepEqual(wrong, []);
 });
 
+// Node knows a newer Unicode than the platform's PCRE: a code point assigned
+// in the newer version only is unassigned there and a letter or mark here. A
+// fixture case may hold an unassigned code point only when both sides give the
+// same result: U+2065, U+E0080 and U+FFFF are unassigned in both, and U+1ACF is
+// a mark in the newer tables that is removed after the ASCII letter it follows,
+// which is what removing it as unassigned does.
+check('the fixture\'s unassigned code points are the ones whose result does not depend on the Unicode version', () => {
+  const agreed = new Set([0x1acf, 0x2065, 0xe0080, 0xffff]);
+  const stray = [];
+  for (const entry of fixture.cases) {
+    for (const text of [entry.input, ...entry.secrets]) {
+      for (const character of expand(text)) {
+        if (/\p{Cn}/u.test(character) && !agreed.has(character.codePointAt(0))) stray.push(`${entry.name}: U+${character.codePointAt(0).toString(16).toUpperCase()}`);
+      }
+    }
+  }
+  assert.deepEqual(stray, []);
+});
+
 check('every case has a distinct name and no key-shaped literal is committed', () => {
   const names = fixture.cases.map((entry) => entry.name);
   assert.equal(new Set(names).size, names.length);
@@ -108,6 +127,9 @@ const TEMPLATES = [
   ['a long run', 'gw ', 'x'.repeat(60), ' end', []],
   ['a query name with a percent escaped underscore', 'GET https://api.example.com/v1/models?api%5Fkey=', 't'.repeat(20), '&x=1 failed', []],
   ['a query name with a percent escaped hyphen', 'GET https://api.example.com/v1/models?x%2Dapi%2Dkey=', 'u'.repeat(20), '&y=2 failed', []],
+  ['a query name with a doubly percent escaped underscore', 'GET https://api.example.com/v1/models?api%255Fkey=', 't'.repeat(20), '&x=1 failed', []],
+  ['a query name with a doubly percent escaped hyphen', 'GET https://api.example.com/v1/models?x%252Dapi%252Dkey=', 'u'.repeat(20), '&y=2 failed', []],
+  ['a field name with a doubly percent escaped underscore', 'x api%255Fkey=', 'hunter2xyz', ' done', []],
   ['an account id after four hex characters and a dash', 'req abcd-', '123456789012', ' failed', []],
   ['an account id after a short uuid look-alike', 'id 123e4567-e89b-12d3-', '123456789012', ' failed', []],
   ['a known key', 'key ', 'KEY12345678', ' rejected', ['KEY12345678']],
@@ -115,7 +137,7 @@ const TEMPLATES = [
 
 // A line break, a tab, a NUL, and every kind of invisible or exotic space: each
 // is a gap or a marker to the rules, never something that hides a key.
-const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000', '\uFFFD', '\u0301', '\u0301\u0302', '\uD800', '\uDC00'];
+const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000', '\uFFFD', '\u0301', '\u0301\u0302', '\uD800', '\uDC00', '\u2065', '\u{E0080}', '\uFFFF', '\u1ACF', '\u115F', '\u1160', '\u3164', '\uFFA0'];
 
 function windows(secret, size) {
   const chars = Array.from(secret);
@@ -305,6 +327,14 @@ const HOSTILE = [
   ['a percent escape start', '?api%'],
   ['a percent escape and a line break', '?api%\n5'],
   ['a percent escape and a mark', '?token%\u0301'],
+  ['a doubly encoded escape start', '?api%25'],
+  ['a doubly encoded escape and a line break', '?api%25\n5'],
+  ['a doubly encoded hyphen start', '?x%252'],
+  ['a doubly encoded escape and a filler', '?api%\u3164\u3164 25'],
+  ['an unassigned default ignorable', 'ab\u2065'],
+  ['an unassigned noncharacter and a word', 'a\uFFFF b'],
+  ['a hangul filler and a word', 'ab\u3164'],
+  ['hangul fillers and an access key prefix', 'AKIA\u115F\u1160'],
   ['a replacement character', '\uFFFD'],
   ['a replacement character and a word', 'ab\uFFFD'],
   ['a combining mark after an ascii letter', 'a\u0301'],
@@ -494,6 +524,86 @@ for (const [name, words, klass, body] of FORBIDDEN_ROWS) {
     assert.equal(got && got.class, klass, words);
   });
 }
+
+const AUTH_WORDS_403 = [
+  'The security token included in the request is invalid.',
+  'The security token included in the request is expired',
+  'The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key and signing method.',
+  'Token is invalid or has been revoked',
+  'The request contained an expired token.',
+  'No valid credential was supplied',
+];
+const POLICY_VETO_403 = [
+  'The security token passed but the request was blocked by the content policy',
+  'Request signature accepted, blocked for safety reasons',
+  'credential accepted; the content filter stopped the prompt',
+];
+check('a 403 whose words name a token, a signature or a credential is auth, and a content policy word still vetoes it', () => {
+  for (const words of AUTH_WORDS_403) assert.equal(verdict([apiError(403, words)]).class, 'auth', words);
+  for (const words of POLICY_VETO_403) assert.equal(verdict([apiError(403, words)]), null, words);
+});
+
+check('a 403 that says the model is not open to the account is a missing model, never a key problem', () => {
+  for (const words of [
+    "You don't have access to the model with the specified model ID.",
+    'You do not have access to the model with the specified model ID.',
+    'You don\u2019t have access to the model with the specified model ID.',
+    'You dont have access to the model with the specified model ID.',
+  ]) {
+    const got = verdict([apiError(403, words)]);
+    assert.equal(got && got.class, 'model_not_found', words);
+    assert.equal(got.status, 403);
+  }
+  for (const words of ["You don't have access to this feature", "You don't have access to the model, blocked by the content policy", 'model access']) {
+    assert.equal(verdict([apiError(403, words)]), null, words);
+  }
+});
+
+const MISSING_MODEL_POSITIVE = [
+  'The model `gpt-9` does not exist or you do not have access to it.',
+  "Model 'x' does not exist",
+  'error: model x does not exist',
+  'Error. Model x does not exist',
+  '"The model `x` does not exist"',
+  "The requested model 'acme/llama-3.1:70b' does not exist.",
+];
+const MISSING_MODEL_NEGATIVE = [
+  "Unsupported parameter for model 'temperature' does not exist",
+  "the parameter model 'temperature' does not exist",
+  "the field model 'tool_choice' does not exist",
+  "Unsupported parameter for the model 'temperature' does not exist",
+  "Unsupported parameter for this model: 'temperature' does not exist in the request schema",
+  'for this model `x` does not exist',
+  "the field model of the tool 'x' does not exist",
+  'the model does not exist',
+];
+check('the missing model sentence needs the start of a sentence in front of it, with and without a body code before it', () => {
+  const body = JSON.stringify({ error: { type: 'invalid_request_error' } });
+  for (const words of MISSING_MODEL_POSITIVE) {
+    assert.equal(verdict([apiError(400, words)]).class, 'model_not_found', words);
+    assert.equal(verdict([apiError(400, words, { responseBody: body })]).class, 'model_not_found', words);
+  }
+  for (const words of MISSING_MODEL_NEGATIVE) {
+    assert.equal(verdict([apiError(400, words)]), null, words);
+    assert.equal(verdict([apiError(400, words, { responseBody: body })]), null, words);
+  }
+});
+
+check('a code or a type is read before the message, so a long message cannot push it out of the 4,096 bytes', () => {
+  // An event keeps at most 2,000 code points of a message, which is up to 8,000
+  // bytes, so only multibyte text can fill the bound.
+  const long = '\u20AC'.repeat(1700);
+  assert.ok(Buffer.byteLength(eventFrom(apiError(400, long)).message) > 4096);
+  const code = (error) => ({ responseBody: JSON.stringify({ error }) });
+  assert.equal(verdict([apiError(400, long, code({ code: 'model_not_found' }))]).class, 'model_not_found');
+  assert.equal(verdict([apiError(400, long, code({ type: 'not_found_error' }))]).class, 'model_not_found');
+  assert.equal(verdict([apiError(400, long, { responseBody: JSON.stringify({ code: 'model_not_found' }) })]).class, 'model_not_found');
+  assert.equal(verdict([apiError(400, long, code({ code: 'API_KEY_INVALID' }))]).class, 'auth');
+  assert.equal(verdict([apiError(429, long, code({ code: 'insufficient_quota' }))]).class, 'quota');
+  assert.equal(verdict([apiError(403, long, code({ type: 'authentication_error' }))]).class, 'auth');
+  assert.equal(verdict([apiError(400, 'Your credit balance is too low', code({ code: 'x' }))]).class, 'billing');
+  assert.equal(verdict([apiError(400, 'Your credit balance is too low', code({ code: 'model_not_found' }))]), null);
+});
 
 check('a 401 is auth with no words at all', () => {
   assert.equal(verdict([apiError(401, '')]).class, 'auth');

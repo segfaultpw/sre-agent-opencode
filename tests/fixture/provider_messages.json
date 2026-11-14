@@ -830,6 +830,108 @@
       "input": "request 8F14E45F-CEEA-467F-A8F6-123456789012 ok",
       "secrets": [],
       "output": "request 8F14E45F-CEEA-467F-A8F6-123456789012 ok"
+    },
+    {
+      "name": "an unassigned mark inside an access key",
+      "input": "key AKIA{{repeat:B:8}}\u1acf{{repeat:B:8}} failed",
+      "secrets": [],
+      "output": "key [redacted] failed"
+    },
+    {
+      "name": "an unassigned default ignorable inside an anthropic key",
+      "input": "key sk-ant-api03-{{repeat:A:10}}\u2065{{repeat:A:10}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "an unassigned tag area character inside an access key",
+      "input": "key AKIA{{repeat:B:8}}\udb40\udc80{{repeat:B:8}} failed",
+      "secrets": [],
+      "output": "key [redacted] failed"
+    },
+    {
+      "name": "a noncharacter inside an anthropic key",
+      "input": "key sk-ant-api03-{{repeat:A:10}}\uffff{{repeat:A:10}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a hangul choseong filler inside an access key",
+      "input": "key AKIA{{repeat:B:8}}\u115f{{repeat:B:8}} failed",
+      "secrets": [],
+      "output": "key [redacted] failed"
+    },
+    {
+      "name": "a hangul jungseong filler inside a jwt",
+      "input": "token eyJ{{repeat:a:10}}\u1160.{{repeat:b:10}}.{{repeat:c:10}} expired",
+      "secrets": [],
+      "output": "token [redacted] expired"
+    },
+    {
+      "name": "a hangul filler between a word and an openai key",
+      "input": "word\u3164sk-proj-{{repeat:a:30}} rejected",
+      "secrets": [],
+      "output": "word[redacted] rejected"
+    },
+    {
+      "name": "a halfwidth hangul filler inside a google key",
+      "input": "API key AIza{{repeat:D:17}}\uffa0{{repeat:D:18}} not valid",
+      "secrets": [],
+      "output": "API key [redacted] not valid"
+    },
+    {
+      "name": "an unassigned character between two letters and an access key",
+      "input": "ab\u2065AKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "ab[redacted] failed"
+    },
+    {
+      "name": "hangul fillers alone leave nothing",
+      "input": "bad\u3164\u115f\u1160\uffa0 bytes",
+      "secrets": [],
+      "output": "bad bytes"
+    },
+    {
+      "name": "unassigned characters alone leave nothing",
+      "input": "bad\u2065\uffff bytes",
+      "secrets": [],
+      "output": "bad bytes"
+    },
+    {
+      "name": "a hangul filler inside a query name",
+      "input": "GET /v1/models?api\u3164_key=Zq7Rt2Lm9Xw4Pk8Nv3Bc&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api_key=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a doubly percent encoded underscore in a query name",
+      "input": "GET /v1/models?api%255Fkey=qwertyuiop12&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api%255Fkey=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a doubly percent encoded hyphen in a query name",
+      "input": "GET /v1/models?x%252Dapi%252Dkey=value123&y=2 failed",
+      "secrets": [],
+      "output": "GET /v1/models?x%252Dapi%252Dkey=[redacted]&y=2 failed"
+    },
+    {
+      "name": "a line break inside a doubly percent encoded escape",
+      "input": "GET /v1/models?api%25\n5Fkey=qwertyuiop12&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api%25 5Fkey=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a doubly percent encoded name of a field",
+      "input": "x api%255Fkey=hunter2value done",
+      "secrets": [],
+      "output": "x api%255Fkey=[redacted] done"
+    },
+    {
+      "name": "a doubly percent encoded name in a url fragment",
+      "input": "redirect https://app.example.com/cb#access%255Ftoken=Zq7Rt2Lm9Xw4Pk8Nv3Bc&state=1 end",
+      "secrets": [],
+      "output": "redirect https://app.example.com/cb#access%255Ftoken=[redacted]&state=1 end"
     }
   ]
 }
