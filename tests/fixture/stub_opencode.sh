@@ -481,6 +481,15 @@ d.yml"
     jq -cn --arg b '{"type":"error","error":{"type":"not_found_error","message":"model: nope"}}' '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: "model: nope", statusCode: 404, isRetryable: false, responseBody: $b}}}'
     exit 1
     ;;
+  provider_echo)
+    # A failed run whose provider event and whose stderr both quote what the
+    # test names: STUB_PROVIDER_MESSAGE is the event's message and
+    # STUB_STDERR_ECHO what the process printed. No status, so it is never a
+    # refusal: the evidence is what is under test.
+    jq -cn --arg m "${STUB_PROVIDER_MESSAGE:-boom}" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "UnknownError", data: {message: $m}}}'
+    printf '%s' "${STUB_STDERR_ECHO:-}" >&2
+    exit 1
+    ;;
   provider_then_other)
     # A refusal the run got past: the last error is a server error, which is
     # not a refusal.

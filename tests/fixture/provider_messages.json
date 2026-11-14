@@ -722,6 +722,114 @@
       "input": "from\u2060eyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} done",
       "secrets": [],
       "output": "from[redacted] done"
+    },
+    {
+      "name": "a line break inside a percent escape of a query name",
+      "input": "GET /v1/models?api%\n5Fkey={{repeat:t:20}}&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api% 5Fkey=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a line break between the digits of a percent escape of a query name",
+      "input": "GET /v1/models?api%5\nFkey={{repeat:t:20}}&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api%5 Fkey=[redacted]&x=1 failed"
+    },
+    {
+      "name": "a line break inside a percent escaped hyphen of a query name",
+      "input": "GET /v1/models?x%2\nDapi%2Dkey=value123&y=2 failed",
+      "secrets": [],
+      "output": "GET /v1/models?x%2 Dapi%2Dkey=[redacted]&y=2 failed"
+    },
+    {
+      "name": "U+FFFD between a word and an openai key",
+      "input": "word\ufffdsk-proj-{{repeat:a:30}} rejected",
+      "secrets": [],
+      "output": "word[redacted] rejected"
+    },
+    {
+      "name": "U+FFFD between two letters and an access key",
+      "input": "ab\ufffdAKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "ab[redacted] failed"
+    },
+    {
+      "name": "U+FFFD inside a key",
+      "input": "sk-ant-api03-{{repeat:A:10}}\ufffd{{repeat:A:10}} end",
+      "secrets": [],
+      "output": "[redacted] end"
+    },
+    {
+      "name": "U+FFFD alone leaves nothing",
+      "input": "bad\ufffd\ufffd bytes",
+      "secrets": [],
+      "output": "bad bytes"
+    },
+    {
+      "name": "a combining acute accent inside an anthropic key",
+      "input": "key sk-ant-api03-{{repeat:A:10}}\u0301{{repeat:A:10}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a combining mark and a variation selector inside a key",
+      "input": "key sk-ant-api03-{{repeat:A:6}}\u0301\ufe0f{{repeat:A:6}}\u0302{{repeat:A:10}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a combining mark after the dot of a jwt",
+      "input": "token eyJ{{repeat:a:10}}.\u0301{{repeat:b:10}}.{{repeat:c:10}} expired",
+      "secrets": [],
+      "output": "token [redacted] expired"
+    },
+    {
+      "name": "a combining mark right before a basic scheme word",
+      "input": "Authorization: \u0301Basic dXNlcjpwYXNzd29yZA== x",
+      "secrets": [],
+      "output": "Authorization: Basic [redacted] x"
+    },
+    {
+      "name": "a combining mark between two ascii letters is removed",
+      "input": "cre\u0301dito agotado",
+      "secrets": [],
+      "output": "credito agotado"
+    },
+    {
+      "name": "a combining mark after a letter that is not ascii is kept",
+      "input": "\u0438\u0306 ok",
+      "secrets": [],
+      "output": "\u0438\u0306 ok"
+    },
+    {
+      "name": "an account id after four hex characters and a dash",
+      "input": "req abcd-123456789012 failed",
+      "secrets": [],
+      "output": "req abcd-[redacted] failed"
+    },
+    {
+      "name": "an account id after four digits and a dash",
+      "input": "id 1234-123456789012 failed",
+      "secrets": [],
+      "output": "id 1234-[redacted] failed"
+    },
+    {
+      "name": "an account id after a short uuid look-alike",
+      "input": "id 123e4567-e89b-12d3-123456789012 failed",
+      "secrets": [],
+      "output": "id 123e4567-e89b-12d3-[redacted] failed"
+    },
+    {
+      "name": "a uuid whose last group is twelve digits is kept",
+      "input": "request 8f14e45f-ceea-467f-a8f6-123456789012 ok",
+      "secrets": [],
+      "output": "request 8f14e45f-ceea-467f-a8f6-123456789012 ok"
+    },
+    {
+      "name": "an upper case uuid whose last group is twelve digits is kept",
+      "input": "request 8F14E45F-CEEA-467F-A8F6-123456789012 ok",
+      "secrets": [],
+      "output": "request 8F14E45F-CEEA-467F-A8F6-123456789012 ok"
     }
   ]
 }

@@ -19,7 +19,7 @@ const root = path.resolve(__dirname, '..');
 const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub } = require(path.join(root, 'runner', 'provider_refusal.js'));
 
 const FIXTURE_PATH = path.join(__dirname, 'fixture', 'provider_messages.json');
-const FIXTURE_SHA256 = '830a01b9085b29fbe06f74abe7459ed4474c04dfa037f3de433353485a6ba693';
+const FIXTURE_SHA256 = '4f245e3a446a3fb3f2f0434418c192c55f04efa5c8543e2aad788fe7c205ed76';
 
 let failed = 0;
 function check(name, fn) {
@@ -106,12 +106,16 @@ const TEMPLATES = [
   ['an arn', 'role ', 'arn:aws:iam::123456789012:role/sre-agent-task', ' denied', []],
   ['an account id', 'account ', '123456789012', ' is not subscribed', []],
   ['a long run', 'gw ', 'x'.repeat(60), ' end', []],
+  ['a query name with a percent escaped underscore', 'GET https://api.example.com/v1/models?api%5Fkey=', 't'.repeat(20), '&x=1 failed', []],
+  ['a query name with a percent escaped hyphen', 'GET https://api.example.com/v1/models?x%2Dapi%2Dkey=', 'u'.repeat(20), '&y=2 failed', []],
+  ['an account id after four hex characters and a dash', 'req abcd-', '123456789012', ' failed', []],
+  ['an account id after a short uuid look-alike', 'id 123e4567-e89b-12d3-', '123456789012', ' failed', []],
   ['a known key', 'key ', 'KEY12345678', ' rejected', ['KEY12345678']],
 ];
 
 // A line break, a tab, a NUL, and every kind of invisible or exotic space: each
 // is a gap or a marker to the rules, never something that hides a key.
-const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000'];
+const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000', '\uFFFD', '\u0301', '\u0301\u0302'];
 
 function windows(secret, size) {
   const chars = Array.from(secret);
@@ -298,6 +302,18 @@ const HOSTILE = [
   ['line breaks between key characters', 'abcdef\n'],
   ['spaces', ' '],
   ['an escape start', '\x1b['],
+  ['a percent escape start', '?api%'],
+  ['a percent escape and a line break', '?api%\n5'],
+  ['a percent escape and a mark', '?token%\u0301'],
+  ['a replacement character', '\uFFFD'],
+  ['a replacement character and a word', 'ab\uFFFD'],
+  ['a combining mark after an ascii letter', 'a\u0301'],
+  ['combining marks after a letter of another script', '\u0438\u0306\u0301'],
+  ['a mark and a line break', 'a\u0301\n'],
+  ['hex and a dash before digits', 'abcd-1234'],
+  ['a uuid prefix and digits', '123e4567-e89b-12d3-a456-4266'],
+  ['a long run of hex groups', '1234abcd-'],
+  ['digits and a dash', '123456789012-'],
 ];
 
 function bestMilliseconds(work) {
@@ -405,15 +421,87 @@ check('a 400 that carries one signal is that class, and two or three signals are
   }
 });
 
-check('the sentence that says a model does not exist reads at most 120 bytes and no full stop between the two words', () => {
-  assert.equal(verdict([apiError(400, `The model ${'x'.repeat(100)} does not exist`)]).class, 'model_not_found');
-  assert.equal(verdict([apiError(400, `The model ${'x'.repeat(130)} does not exist`)]), null);
-  assert.equal(verdict([apiError(400, 'The model is fine. The field does not exist')]), null);
-  assert.equal(verdict([apiError(400, 'The model \u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9\u00E9 does not exist')]), null);
+// A 400 is a missing model only when the body code is a whole token or the
+// sentence names the model id right before "does not exist". Each row is the
+// platform's (provider_refusal_test.exs), the same words in the same classes.
+const MODEL_400_ROWS = [
+  ['the sentence with a backquoted id', 'The model `gpt-9` does not exist or you do not have access to it.', 'model_not_found'],
+  ['the sentence with a quoted id holding a slash, a colon and a dot', "Model 'acme/llama-3.1:70b' does not exist.", 'model_not_found'],
+  ['the sentence with a bare id', 'The model gpt-9 does not exist', 'model_not_found'],
+  ['a model line with the code after it', 'model: claude-x-1 not_found_error', 'model_not_found'],
+  ['the code as a whole token after a colon', 'error: model_not_found.', 'model_not_found'],
+  ['the unknown model phrase', 'Unknown model: claude-x-1', 'model_not_found'],
+  ['a parameter that does not exist for this model', "Unsupported parameter for this model: 'temperature' does not exist in the request schema", null],
+  ['a field that does not exist (the word model is quoted)', "the field 'model' passed in tool_choice does not exist", null],
+  ['a tool field that does not exist', "The field model of the tool 'x' does not exist", null],
+  ['this model followed by an id', 'for this model `x` does not exist', null],
+  ['no id at all', 'the model does not exist', null],
+  ['a long run of words between the two', `The model is fine. ${'x'.repeat(30)} does not exist`, null],
+  ['a code with a suffix is not a token', 'model_not_found_in_tools', null],
+  ['another code with a suffix', 'not_found_error_in_tools', null],
+  ['a code with a prefix is not a token', 'x_model_not_found', null],
+  ['a tool schema property that does not exist', "tools.0.custom.input_schema: property 'x' does not exist", null],
+];
+for (const [name, words, klass] of MODEL_400_ROWS) {
+  check(`a 400 missing-model reading: ${name}`, () => {
+    const got = verdict([apiError(400, words)]);
+    assert.equal(got && got.class, klass, words);
+  });
+}
+
+check('a 400 body code is read as a whole token, in the body and not as a substring', () => {
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { code: 'model_not_found_in_tools' } }) })]), null);
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { code: 'not_found_error_in_tools' } }) })]), null);
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { code: 'model_not_found' } }) })]).class, 'model_not_found');
+  assert.equal(verdict([apiError(400, 'bad', { responseBody: JSON.stringify({ error: { type: 'not_found_error' } }) })]).class, 'model_not_found');
 });
 
-check('only 401 and 403 are auth, 402 billing, 404 model_not_found, and a 429 is quota only on a quota word', () => {
-  const table = [[401, 'auth'], [403, 'auth'], [402, 'billing'], [404, 'model_not_found'], [429, 'rate_limit'], [400, null], [408, null], [409, null], [422, null], [500, null], [503, null], [529, null]];
+check('the missing-model sentence is linear on a hostile run and reads ASCII whitespace only', () => {
+  const started = Date.now();
+  assert.equal(verdict([apiError(400, `model ${'model '.repeat(700)}x`)]), null);
+  assert.equal(verdict([apiError(400, `model ${'a'.repeat(3000)}`)]), null);
+  assert.ok(Date.now() - started < 1000);
+  assert.equal(verdict([apiError(400, 'The model gpt-9 does not exist')]), null);
+  assert.equal(verdict([apiError(400, 'The model\tgpt-9\ndoes not exist')]).class, 'model_not_found');
+});
+
+// A 403 is auth only with an authentication word and never with a policy or
+// safety word. 401 needs no word.
+const FORBIDDEN_ROWS = [
+  ['an invalid key', 'Invalid API key', 'auth'],
+  ['a missing key', 'Missing API key', 'auth'],
+  ['the permission word in the type', 'bad', 'auth', JSON.stringify({ error: { type: 'permission_error' } })],
+  ['the key lacks permission', 'Your API key does not have permission to use this model', 'auth'],
+  ['permission denied in the status', 'The caller is denied', 'auth', JSON.stringify({ error: { status: 'PERMISSION_DENIED' } })],
+  ['an authentication error type', 'bad', 'auth', JSON.stringify({ error: { type: 'authentication_error' } })],
+  ['unauthorized', 'Unauthorized', 'auth'],
+  ['forbidden for this key', 'Forbidden for this key', 'auth'],
+  ['forbidden, the account is not allowed', 'Forbidden: the account is not allowed to call this endpoint', 'auth'],
+  ['access denied', 'Access denied', 'auth'],
+  ['an invalid token', 'invalid token supplied', 'auth'],
+  ['a bare forbidden', 'forbidden', null],
+  ['an empty body', '', null],
+  ['a forbidden with the account word after a full stop', 'Forbidden. The account is fine', null],
+  ['a content policy block', 'Request blocked by the content policy of this model', null],
+  ['a safety block', 'The prompt was blocked for safety reasons', null],
+  ['a content filter code with a permission word', 'no permission to bypass the filter', null, JSON.stringify({ error: { code: 'content_filter' } })],
+  ['a usage policy violation naming credentials', 'usage policy violation: credentials were shared', null],
+  ['a region that is not supported', 'Country, region, or territory not supported', null],
+];
+for (const [name, words, klass, body] of FORBIDDEN_ROWS) {
+  check(`a 403 reading: ${name}`, () => {
+    const got = verdict([apiError(403, words, body === undefined ? {} : { responseBody: body })]);
+    assert.equal(got && got.class, klass, words);
+  });
+}
+
+check('a 401 is auth with no words at all', () => {
+  assert.equal(verdict([apiError(401, '')]).class, 'auth');
+  assert.equal(verdict([apiError(401, 'no words at all')]).class, 'auth');
+});
+
+check('only 401 (and a 403 with an authentication word) is auth, 402 billing, 404 model_not_found, and a 429 is quota only on a quota word', () => {
+  const table = [[401, 'auth'], [403, null], [402, 'billing'], [404, 'model_not_found'], [429, 'rate_limit'], [400, null], [408, null], [409, null], [422, null], [500, null], [503, null], [529, null]];
   for (const [status, klass] of table) {
     const got = verdict([apiError(status, 'nothing that names a class')]);
     assert.equal(got && got.class, klass, String(status));
@@ -541,6 +629,60 @@ check('every variable the runner can be given a provider key in is on its secret
     Object.assign(process.env, saved);
     fs.rmSync(work, { recursive: true, force: true });
   }
+});
+
+check('the runner\'s redact() ignores a held value of fewer than eight bytes, and removes one of eight', () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-refusal-short-'));
+  const saved = { ...process.env };
+  try {
+    for (const name of Object.keys(process.env)) delete process.env[name];
+    Object.assign(process.env, { PATH: saved.PATH, HOME: work, SRE_SERVER_URL: 'http://127.0.0.1:9', SRE_API_KEY: `sre-agent-poll-${'2'.repeat(48)}`, SRE_MODEL: 'openrouter/deepseek/deepseek-v4-pro', SRE_WORKSPACE: path.join(work, 'ws'), SRE_ONCE: '1', OPENROUTER_API_KEY: 'none' });
+    fs.mkdirSync(process.env.SRE_WORKSPACE, { recursive: true });
+    const runner = require(path.join(root, 'runner', 'runner.js'));
+    runner.loadConfig();
+    const { redact, heldSecrets } = runner.internals;
+    assert.ok(heldSecrets().includes(`sre-agent-poll-${'2'.repeat(48)}`));
+    assert.equal(heldSecrets().includes('none'), false);
+    assert.equal(redact('none of the models answered'), 'none of the models answered');
+    assert.equal(redact(`key sre-agent-poll-${'2'.repeat(48)} rejected`), 'key [redacted] rejected');
+    runner.internals.addRotatingSecret('abcdefg');
+    runner.internals.addRotatingSecret('abcdefgh');
+    assert.equal(redact('abcdefg and abcdefgh'), 'abcdefg and [redacted]');
+    assert.equal(redact('ééé and éééé'), 'ééé and éééé');
+    runner.internals.addRotatingSecret('éééé');
+    assert.equal(redact('ééé and éééé'), 'ééé and [redacted]');
+  } finally {
+    for (const name of Object.keys(process.env)) delete process.env[name];
+    Object.assign(process.env, saved);
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+});
+
+check('the end of a text is cut by bytes on a character', () => {
+  const { cutBytesFromEnd } = require(path.join(root, 'runner', 'provider_refusal.js'));
+  assert.equal(cutBytesFromEnd('short', 1000), 'short');
+  assert.equal(cutBytesFromEnd('abcdef', 3), 'def');
+  assert.equal(cutBytesFromEnd('aéé', 3), 'é');
+  assert.equal(cutBytesFromEnd('€€', 4), '€');
+  assert.equal(cutBytesFromEnd('x'.repeat(2000), 1000).length, 1000);
+  assert.equal(cutBytesFromEnd('', 10), '');
+});
+
+check('the follow-up scrubber rules, one by one', () => {
+  const key = `sk-ant-api03-${'A'.repeat(40)}`;
+  assert.equal(scrub('GET /v1?api%\n5Fkey=secretvalue1 failed', null, []), 'GET /v1?api% 5Fkey=[redacted] failed');
+  assert.equal(scrub('GET /v1?api%5\nFkey=secretvalue1 failed', null, []), 'GET /v1?api%5 Fkey=[redacted] failed');
+  assert.equal(scrub('GET /v1?x%2\nDapi%2Dkey=secretvalue1 failed', null, []), 'GET /v1?x%2 Dapi%2Dkey=[redacted] failed');
+  assert.equal(scrub(`word�${key} rejected`, null, []), 'word[redacted] rejected');
+  assert.equal(scrub(`key ${key.slice(0, 20)}�${key.slice(20)} rejected`, null, []), 'key [redacted] rejected');
+  assert.equal(scrub('�', null, []), '');
+  assert.equal(scrub(`key ${key.slice(0, 20)}́${key.slice(20)} rejected`, null, []), 'key [redacted] rejected');
+  assert.equal(scrub('crédito agotado', null, []), 'credito agotado');
+  assert.equal(scrub('й kept', null, []), 'й kept');
+  assert.equal(scrub('id abcd-123456789012 failed', null, []), 'id abcd-[redacted] failed');
+  assert.equal(scrub('id 1234-123456789012 failed', null, []), 'id 1234-[redacted] failed');
+  assert.equal(scrub('id 123e4567-e89b-12d3-a456-123456789012 stays', null, []), 'id 123e4567-e89b-12d3-a456-123456789012 stays');
+  assert.equal(scrub('id 123E4567-E89B-12D3-A456-123456789012 stays', null, []), 'id 123E4567-E89B-12D3-A456-123456789012 stays');
 });
 
 if (failed > 0) {

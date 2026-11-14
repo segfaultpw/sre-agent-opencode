@@ -314,14 +314,24 @@ function addRotatingSecret(value) {
 // redacted from every line like the secrets above for as long as the request lasts.
 let requestSecrets = [];
 
+// A held value shorter than this is not removed, by redact() or by the
+// scrubber: a placeholder key (`none`, `x`) would blank those letters out of
+// every line and every sentence the runner writes, and no credential is that
+// short.
+const MIN_SECRET_BYTES = 8;
+
+function removable(secret) {
+  return typeof secret === 'string' && Buffer.byteLength(secret) >= MIN_SECRET_BYTES;
+}
+
 function redact(text) {
   let out = String(text);
   for (const secret of constantSecrets) {
-    if (secret) out = out.split(secret).join('[redacted]');
+    if (removable(secret)) out = out.split(secret).join('[redacted]');
   }
-  for (const secret of rotatingSecrets) out = out.split(secret).join('[redacted]');
-  if (jobSecret) out = out.split(jobSecret).join('[redacted]');
-  for (const secret of requestSecrets) out = out.split(secret).join('[redacted]');
+  for (const secret of rotatingSecrets) if (removable(secret)) out = out.split(secret).join('[redacted]');
+  if (removable(jobSecret)) out = out.split(jobSecret).join('[redacted]');
+  for (const secret of requestSecrets) if (removable(secret)) out = out.split(secret).join('[redacted]');
   return out;
 }
 
@@ -329,7 +339,7 @@ function redact(text) {
 // line break (the provider refusal scrubber), which needs the values and not
 // the function.
 function heldSecrets() {
-  return [...constantSecrets, ...rotatingSecrets, jobSecret, ...requestSecrets].filter((secret) => typeof secret === 'string' && secret !== '');
+  return [...constantSecrets, ...rotatingSecrets, jobSecret, ...requestSecrets].filter(removable);
 }
 
 let logLevel = LEVELS.info;
@@ -3686,14 +3696,35 @@ const STDERR_TAIL_CHARS = 300;
 // the start) never takes the end that is wanted.
 const STDERR_WORDS_MAX_BYTES = STDERR_READ_CHARS * 4;
 
-function exitWords(agent, limit = STDERR_TAIL_CHARS) {
-  if (agent.errors.length > 0) return providerRefusal.scrub(agent.errors.join('; '), redact, heldSecrets());
-  const printed = redact(String(agent.stderr || '')).trim();
+// What the process printed, scrubbed whole from the first whole word of its
+// last STDERR_READ_CHARS characters: '' when it printed nothing.
+function printedWords(stderr) {
+  const printed = redact(String(stderr || '')).trim();
   if (printed === '') return '';
   // The end of a long stream, from the first whole word: a cut that starts
   // inside a key leaves a piece no mask can know.
   const tail = printed.length > STDERR_READ_CHARS ? printed.slice(-STDERR_READ_CHARS).replace(/^\S*(?:\s+|$)/u, '') : printed;
-  const words = providerRefusal.scrub(tail, redact, heldSecrets(), STDERR_WORDS_MAX_BYTES);
+  return providerRefusal.scrub(tail, redact, heldSecrets(), STDERR_WORDS_MAX_BYTES);
+}
+
+// The evidence's tail of what the process printed: scrubbed first, then the
+// last `maxBytes` bytes of the result, cut on a character.
+const EVIDENCE_STDERR_BYTES = 1000;
+function stderrEvidence(stderr) {
+  return providerRefusal.cutBytesFromEnd(printedWords(stderr), EVIDENCE_STDERR_BYTES);
+}
+
+// Each error event's own words, scrubbed like the failure's detail, so a key a
+// provider echoed across a line break, percent-encoded or JSON-escaped, and an
+// account identifier, are masked in the evidence as they are in the detail.
+function errorsEvidence(errors) {
+  return errors.map((error) => providerRefusal.scrub(error, redact, heldSecrets(), EVIDENCE_STDERR_BYTES));
+}
+
+function exitWords(agent, limit = STDERR_TAIL_CHARS) {
+  if (agent.errors.length > 0) return providerRefusal.scrub(agent.errors.join('; '), redact, heldSecrets());
+  const words = printedWords(agent.stderr);
+  if (words === '') return '';
   const kept = Array.from(words);
   return (kept.length > limit ? kept.slice(-limit) : kept).join('').trim();
 }
@@ -5279,7 +5310,7 @@ async function handleJob(config, job, options = {}) {
     stillHeld(signal);
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
     result.evidence.agent_exit_code = agent.code;
-    if (agent.errors.length > 0) result.evidence.agent_errors = agent.errors.map(redact);
+    if (agent.errors.length > 0) result.evidence.agent_errors = errorsEvidence(agent.errors);
     result.evidence.models = modelsEvidence(config, null);
 
     if (!agentProcessesEnded) {
@@ -5331,7 +5362,8 @@ async function handleJob(config, job, options = {}) {
       result.summary = `The agent exited ${agent.code} and nothing was published. ${result.summary}`;
       // The tail rather than the whole stream: a failed run's last words are
       // what names the cause, and the platform caps an entry at a kilobyte.
-      if (agent.stderr.trim()) result.evidence.agent_stderr = redact(agent.stderr).trim().slice(-1000);
+      const printedTail = stderrEvidence(agent.stderr);
+      if (printedTail !== '') result.evidence.agent_stderr = printedTail;
       // opencode's own log is where its error sentence points: the count of
       // forwarded lines tells the operator how much of it the log group holds.
       if (agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;

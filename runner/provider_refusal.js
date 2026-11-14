@@ -34,6 +34,7 @@ const RAW_MAX_CODE_POINTS = 2000;
 const MESSAGE_MAX_BYTES = 500;
 
 const READ_BYTES = 65536;
+const TEXT_BYTES = 4096;
 const MIN_SECRET_BYTES = 8;
 const MIN_ENCODED_CHARS = 8;
 const WRAPPED_LINES = 8;
@@ -118,12 +119,29 @@ function bodyCodeOf(body) {
 // as in a refusal. Gemini answers a key it does not know with a 400 and the
 // auth words, not a 401.
 const BILLING_400 = ['credit balance', 'billing_hard_limit', 'billing hard limit', 'billing account', 'insufficient funds', 'purchase credits', 'payment required', 'account is not active'];
-const MODEL_400 = ['not_found_error', 'model_not_found', 'unknown model', 'model not found'];
 const AUTH_400 = ['api key not valid', 'api_key_invalid'];
-const MODEL_MISSING_SENTENCE = /\bmodel\b[^.]{0,120}\bdoes not exist\b/;
-// The platform counts the 120 in bytes, so the sentence is read as bytes too.
-function missingModelSentence(text) {
-  return MODEL_MISSING_SENTENCE.test(Buffer.from(text, 'utf8').toString('latin1'));
+// The body codes and phrases of a missing model, each as a whole token:
+// `model_not_found_in_tools` is not one.
+const MODEL_MISSING_CODE = /(?<![a-z0-9_])(?:not_found_error|model_not_found|unknown model|model not found)(?![a-z0-9_])/;
+// A provider's sentence names the model id right before the phrase (the model
+// `gpt-9` does not exist). A looser reading takes a field or a parameter of our
+// own request for a model (Unsupported parameter for this model: 'x' does not
+// exist), so the id must follow the word `model` after whitespace only (the
+// platform's PCRE reads \s as these six ASCII characters, so they are spelled
+// out), and `this model` is never a name.
+const MODEL_MISSING_SENTENCE = /(?<!this )\bmodel[ \t\n\v\f\r]+[`'"]?[\w.:/@-]+[`'"]?[ \t\n\v\f\r]+does not exist\b/;
+// A 403 is an authentication refusal only when its words say so: a content
+// policy or safety block is a 403 too, and sending a person to their key for it
+// is the wrong place.
+const FORBIDDEN_AUTH_WORDS = ['unauthorized', 'unauthenticated', 'authentication', 'permission', 'api key', 'api_key', 'x-api-key', 'apikey', 'not authorized', 'accessdenied', 'access denied', 'invalid token', 'credentials'];
+const FORBIDDEN_POLICY_WORDS = ['content policy', 'content_policy', 'content filter', 'content_filter', 'usage policy', 'policy violation', 'safety', 'moderation'];
+const FORBIDDEN_FOR_KEY = /\bforbidden\b[^.]{0,60}\b(?:key|account|token|credentials?)\b/;
+// The platform counts the 60 in bytes, so the phrase is read as bytes too.
+function forbiddenForKey(text) {
+  return FORBIDDEN_FOR_KEY.test(Buffer.from(text, 'utf8').toString('latin1'));
+}
+function forbiddenIsAuth(text) {
+  return (holdsAny(text, FORBIDDEN_AUTH_WORDS) || forbiddenForKey(text)) && !holdsAny(text, FORBIDDEN_POLICY_WORDS);
 }
 const QUOTA_429 = ['insufficient_quota', 'exceeded your current quota', 'quota exceeded', 'free tier'];
 
@@ -131,14 +149,22 @@ function holdsAny(text, words) {
   return words.some((word) => text.includes(word));
 }
 
+// The words a status is read from: the message and the body code, at most 4,096
+// bytes, cut on a character.
+function boundedText(text) {
+  const buffer = Buffer.from(text, 'utf8');
+  return buffer.length <= TEXT_BYTES ? text : completeCharacters(buffer.subarray(0, TEXT_BYTES)).toString('utf8');
+}
+
 function classOf(event) {
   if (event.name === 'ProviderAuthError') return 'auth';
   if (event.name !== 'APIError') return null;
-  const text = `${event.message} ${event.bodyCode || ''}`.toLowerCase();
+  const text = boundedText(`${event.message} ${event.bodyCode || ''}`).toLowerCase();
   switch (event.statusCode) {
     case 401:
-    case 403:
       return 'auth';
+    case 403:
+      return forbiddenIsAuth(text) ? 'auth' : null;
     case 402:
       return 'billing';
     case 404:
@@ -146,7 +172,7 @@ function classOf(event) {
     case 400: {
       const found = [];
       if (holdsAny(text, BILLING_400)) found.push('billing');
-      if (holdsAny(text, MODEL_400) || missingModelSentence(text)) found.push('model_not_found');
+      if (MODEL_MISSING_CODE.test(text) || MODEL_MISSING_SENTENCE.test(text)) found.push('model_not_found');
       if (holdsAny(text, AUTH_400)) found.push('auth');
       return found.length === 1 ? found[0] : null;
     }
@@ -176,12 +202,15 @@ function classify(events, run, options = {}) {
 // The scrubber. One reading of the text, in this order:
 //   1. at most the first 65,536 bytes, a token the cut ended inside of dropped;
 //   2. escape sequences removed, and invisible characters (every format
-//      character, the combining grapheme joiner, the variation selectors)
-//      replaced by one marker byte per run;
+//      character, the combining grapheme joiner, the variation selectors, and
+//      U+FFFD, which is what an invalid byte decodes to) replaced by one marker
+//      byte per run;
 //   3. every run of whitespace and control characters one space, or one gap
 //      byte when the run holds anything but plain spaces (a control character,
-//      a line break, a no-break space, another Unicode space); the rules below
-//      see through both the gap and the marker;
+//      a line break, a no-break space, another Unicode space), and then every
+//      run of combining marks that does not follow a character above U+007F
+//      one marker byte; the rules below see through both the gap and the
+//      marker;
 //   4. the secrets the runner holds, by value (as stored, percent-encoded,
 //      JSON-escaped, and as base64), a gap allowed between any two characters
 //      (the secrets of 8 bytes or more: a placeholder key would wipe its own
@@ -270,23 +299,27 @@ const ESCAPES = /\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B\n]*(?:\x07|\x1B\\)?|
 // and the output drops it, so one of them in the middle of a key cannot hide
 // it from a mask and one between a word and a key cannot glue the key to the
 // word.
-const INVISIBLE = /[\p{Cf}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}]+/gu;
-// The stand-in Node decodes a byte that is not valid UTF-8 to: the platform
-// drops such a byte without a trace, and so does this.
-const BAD_BYTE = /\uFFFD/g;
+// U+FFFD, what Node decodes a byte that is not valid UTF-8 to, is one of them:
+// dropping it without a marker would glue a key to the word before it.
+const INVISIBLE = /[\p{Cf}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\uFFFD]+/gu;
+// A run of combining marks that does not follow a character above U+007F: after
+// an ASCII character, a space, a gap, a marker or the start of the text it
+// cannot be told from one that splits a key, so it is removed and leaves a
+// marker; after a letter of another script it stays.
+const COMBINING_MARKS = /(?<![^\x00-\x7F])\p{Mn}+/gu;
 // Every run of whitespace and control characters except the marker byte.
 const SPACE_RUN = /[\x00\x01\x03-\x20\x7F-\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+/gu;
 const NOT_A_PLAIN_SPACE = /[^ ]/u;
 
 function strip(text) {
-  return text.replace(ESCAPES, '').replace(INVISIBLE, REMOVED).replace(BAD_BYTE, '');
+  return text.replace(ESCAPES, '').replace(INVISIBLE, REMOVED);
 }
 
 // A run that holds anything but plain spaces (a control character, a line
 // break, a no-break space, another Unicode space) is a gap: a terminal wrapped
 // the text, or something was inserted.
 function gaps(text) {
-  return text.replace(SPACE_RUN, (run) => (NOT_A_PLAIN_SPACE.test(run) ? GAP : ' '));
+  return text.replace(SPACE_RUN, (run) => (NOT_A_PLAIN_SPACE.test(run) ? GAP : ' ')).replace(COMBINING_MARKS, REMOVED);
 }
 
 // The characters of a literal with a gap or a marker allowed between each two
@@ -313,7 +346,7 @@ function alt(names) {
 // underscore or hyphen (`api%5Fkey`).
 function nameLiteral(name) {
   return graphemes(name)
-    .map((character) => (character === '_' ? '(?:_|%5[Ff])' : character === '-' ? '(?:-|%2[Dd])' : escapeRegex(character)))
+    .map((character) => (character === '_' ? `(?:_|%${GAP_STAR}5${GAP_STAR}[Ff])` : character === '-' ? `(?:-|%${GAP_STAR}2${GAP_STAR}[Dd])` : escapeRegex(character)))
     .join(GAP_STAR);
 }
 
@@ -411,7 +444,7 @@ const SHAPES = [
   maskJwts,
   count(run('[A-Za-z0-9+/=_-]'), 48),
   replace(`${NOT_IN_WORD}${literal('arn:aws')}${GAP_STAR}(?:-[a-z]+)*${GAP_STAR}:${GAP_STAR}(?=(${ARN_CLASS}+(?:[\\x01\\x02]+${ARN_CLASS}+)*))\\1`, '', () => MASK),
-  replace(`(?<![0-9])(?<![0-9A-Fa-f]{4}-)(?:[0-9][\\x01\\x02]*){11}[0-9](?![0-9])`, '', () => MASK),
+  replace(`(?<![0-9])(?<![0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-)(?:[0-9][\\x01\\x02]*){11}[0-9](?![0-9])`, '', () => MASK),
 ];
 
 function maskShapes(text) {
@@ -505,6 +538,15 @@ function cutBytes(text, max) {
   return out;
 }
 
+// The last maxBytes bytes of a text, starting on a character.
+function cutBytesFromEnd(text, maxBytes) {
+  const buffer = Buffer.from(text, 'utf8');
+  if (buffer.length <= maxBytes) return text;
+  let start = buffer.length - maxBytes;
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start += 1;
+  return buffer.subarray(start).toString('utf8');
+}
+
 function finish(text, maxBytes) {
   const oneLine = text.split(GAP).join(' ').split(REMOVED).join('').split(' ').filter(Boolean).join(' ');
   return cutBytes(oneLine, maxBytes).trim();
@@ -527,4 +569,4 @@ function scrub(message, redact, secrets, maxBytes = MESSAGE_MAX_BYTES) {
   }
 }
 
-module.exports = { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes, cutRaw };
+module.exports = { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes, cutBytesFromEnd, cutRaw };

@@ -3606,6 +3606,50 @@ export STUB_OPENCODE_MODE=fix
 if jq -e '.failure.kind == "agent_exit" and (.failure.detail | test("^opencode exited 3: .*the cause was this ending$")) and ((.failure.detail | length) <= 500)' <<<"$report" >/dev/null; then echo "ok   a long stderr is read from its end: the detail ends with the last words the process printed, within the bound"; else echo "FAIL detail: $(jq -c '.failure' <<<"$report")"; fail=1; fi
 stop_fixture
 
+echo "--- 137. the evidence's error events and stderr tail are scrubbed like the failure detail ---"
+# A held key wrapped by a line break, percent-encoded and JSON-escaped, an
+# Amazon resource name and a bare account id: none of them is in any field of
+# the report, the two evidence fields included.
+echo_key="$(printf 'zqx"kv\\ww/7319+84=yy')"
+echo_wrapped="$(printf 'zqx"kv\\ww/\n7319+84=yy')"
+echo_percent='zqx%22kv%5Cww%2F7319%2B84%3Dyy'
+echo_json='zqx\"kv\\ww/7319+84=yy'
+echo_arn='arn:aws:iam::123456789012:role/sre-agent-task'
+echo_words="bad key $echo_wrapped or $echo_percent or $echo_json for $echo_arn and account 123456789012"
+export OPENROUTER_API_KEY="$echo_key" STUB_PROVIDER_MESSAGE="$echo_words" STUB_STDERR_ECHO="the gateway quoted: $echo_words"
+export STUB_OPENCODE_MODE=provider_echo
+start_fixture evidence_echo
+queue_one h-evidence-echo acme/app
+run_once evidence_echo
+export STUB_OPENCODE_MODE=fix
+unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE STUB_STDERR_ECHO
+echo_leaks=""
+for fragment in 7319 84=yy 84%3D 2B84 123456789012 'arn:aws' zqx; do
+  if jq -c '.' <<<"$report" | grep -qF -e "$fragment"; then echo_leaks="${echo_leaks}${fragment} "; fi
+done
+if [ -z "$echo_leaks" ]; then echo "ok   no part of the key, the resource name or the account id is anywhere in the report"; else echo "FAIL the report holds: ${echo_leaks}"; fail=1; fi
+if jq -e '(.evidence.agent_errors | length) == 1 and (.evidence.agent_errors[0] | contains("[redacted]") and startswith("bad key "))' <<<"$report" >/dev/null; then echo "ok   the error event is in the evidence, scrubbed"; else echo "FAIL agent_errors: $(jq -c '.evidence.agent_errors' <<<"$report")"; fail=1; fi
+if jq -e '(.evidence.agent_stderr | endswith("the gateway quoted: bad key [redacted] or [redacted] or [redacted] for [redacted] and account [redacted]"))' <<<"$report" >/dev/null; then echo "ok   the stderr tail is in the evidence, scrubbed"; else echo "FAIL agent_stderr: $(jq -c '.evidence.agent_stderr' <<<"$report")"; fail=1; fi
+stop_fixture
+export STUB_OPENCODE_MODE=provider_echo
+export STUB_PROVIDER_MESSAGE="first $(for n in $(seq 1 300); do printf 'word%s ' "$n"; done)" STUB_STDERR_ECHO="$(for n in $(seq 1 400); do printf 'filler line %s of the stream\n' "$n"; done)the cause was this ending"
+start_fixture evidence_long
+queue_one h-evidence-long acme/app
+run_once evidence_long
+export STUB_OPENCODE_MODE=fix
+unset STUB_PROVIDER_MESSAGE STUB_STDERR_ECHO
+if jq -e '(.evidence.agent_errors[0] | (length <= 1000) and (length > 900)) and (.evidence.agent_stderr | (length <= 1000) and endswith("the cause was this ending") and (contains("\n") | not))' <<<"$report" >/dev/null; then echo "ok   a long error is cut to 1,000 bytes and a long stderr keeps its end, one line"; else echo "FAIL evidence: $(jq -c '[(.evidence.agent_errors[0] | length), (.evidence.agent_stderr | length)]' <<<"$report")"; fail=1; fi
+stop_fixture
+export OPENROUTER_API_KEY=none STUB_PROVIDER_MESSAGE="none of the models answered" STUB_STDERR_ECHO="none of them"
+export STUB_OPENCODE_MODE=provider_echo
+start_fixture evidence_short_key
+queue_one h-evidence-short-key acme/app
+run_once evidence_short_key
+export STUB_OPENCODE_MODE=fix
+unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE STUB_STDERR_ECHO
+if jq -e '.evidence.agent_errors == ["none of the models answered"] and (.evidence.agent_stderr | endswith("\" none of them")) and (.failure.detail | test("none of the models answered"))' <<<"$report" >/dev/null; then echo "ok   a held value of fewer than eight bytes (a placeholder key) blanks no word of the report"; else echo "FAIL evidence: $(jq -c '[.evidence.agent_errors, .evidence.agent_stderr, .failure.detail]' <<<"$report")"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"
