@@ -142,6 +142,14 @@ done
 if [ "\$net" = 1 ]; then
   if [ -n "\${RUNNER_GIT_PASSWORD+x}" ]; then printf '%s\n' "\$sub" >> "$work/git_authed.log"; else printf '%s\n' "\$sub" >> "$work/git_plain.log"; fi
 fi
+# A bundle that takes long: the control file holds the seconds the SECOND bundle of
+# a request waits (the first is made before the run's clock starts), so a case can
+# make the second model's hand-over slow.
+if [ "\$sub" = bundle ] && [ -s "$work/ctl/slow_bundle" ]; then
+  bundles=\$(( \$(cat "$work/ctl/bundle_count" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "\$bundles" > "$work/ctl/bundle_count"
+  if [ "\$bundles" = 2 ]; then sleep "\$(cat "$work/ctl/slow_bundle")"; fi
+fi
 # A push that takes long enough for a heartbeat to land (the control file names
 # the flag file the fixture waits for), and a push GitHub refuses with the
 # lines a protected branch gives (the control file holds the refspec pattern).
@@ -3965,6 +3973,22 @@ unset STUB_OPENCODE_SECOND_MODE
 if jq -e '(.test.steps[] | select(.name == "model") | .ok) == false and (.test.steps[] | select(.name == "fallback_model") | (.ok == false and (.detail | startswith("refused (quota): ")))) and (.summary | startswith("Test job finished: the model step failed"))' <<<"$report" >/dev/null; then echo "ok   both refused: both steps say so, and the summary names the first failure"; else echo "FAIL: $(jq -c '[.test.steps, .summary]' <<<"$report")"; fail=1; fi
 stop_fixture
 
+
+echo "--- 150. the second model's start is judged after the hand-back, and not tried when too little time is left ---"
+start_fixture second_slow
+queue_one h-second-slow acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=fix STUB_RECORD_ENV="ANTHROPIC_API_KEY OPENAI_API_KEY"
+printf '15' > "$work/ctl/slow_bundle"
+printf '0' > "$work/ctl/bundle_count"
+run_timeout=130
+with_second_model run_once second_slow
+run_timeout=60
+rm -f "$work/ctl/slow_bundle" "$work/ctl/bundle_count"
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE STUB_RECORD_ENV
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.kind == "provider_refused" and .evidence.fallback_not_tried == "time" and (.evidence | has("fallback_used") | not) and (.summary | endswith("The second model was not tried, because less than two minutes of SRE_RUN_TIMEOUT_SECONDS was left."))' <<<"$report" >/dev/null; then echo "ok   a hand-back that used the time up is read after it: one run, and the report says time was the reason"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence, .summary]' <<<"$report")"; fail=1; fi
+if grep -q 'handoff h-second-slow: the second model was not tried (time)' "$out" && ! grep -q 'starting the second model' "$out"; then echo "ok   the log says it, and never says the second model started"; else echo "FAIL log: $(grep 'h-second-slow' "$out")"; fail=1; fi
+stop_fixture
 
 echo "--- 151. a repository the agent leaves in a submodule path or below the checkout is never read by the runner's git, and never published ---"
 # The base has a submodule at sub/. The runner never fills it, so whatever stands

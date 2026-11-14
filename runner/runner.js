@@ -5856,9 +5856,6 @@ async function handleJob(config, job, options = {}) {
         }
         if (decision.try) {
           stillHeld(signal);
-          const remainingMs = Math.max(1000, config.runTimeoutMs - (Date.now() - startedAt));
-          const mode = identity.mode === 'none' ? '; with no agent account the proof its processes are gone is that opencode exited by itself after tools that start none' : '';
-          log('info', `handoff ${job.handoff_id}: the first model was refused (${refused.class}) before anything was changed; starting the second model, ${config.fallbackModel}, with ${Math.floor(remainingMs / 1000)} seconds left${mode}`);
           fs.rmSync(path.join(workspace.dir, '.opencode'), { recursive: true, force: true });
           writeAgent(config, workspace.dir);
           secondBundle = repo ? await makeBaseBundle(workspace) : null;
@@ -5866,9 +5863,20 @@ async function handleJob(config, job, options = {}) {
           if (repo) await initAgentRepository(workspace, secondBundle, home);
           if (secondBundle) fs.rmSync(secondBundle.dir, { recursive: true, force: true });
           secondBundle = null;
-          const first = agent;
-          agent = await runAgent(config, workspace.dir, prompt, { model: config.fallbackModel, second: true, timeoutMs: remainingMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress, hookNotes });
-          firstRun = { agent: first, refusal: refused };
+          // What is left is read now, after the bundle, the hand-over and the
+          // agent's repository, which can take minutes: the second run gets exactly
+          // the time that remains and never starts with less than the floor.
+          const remainingMs = config.runTimeoutMs - (Date.now() - startedAt);
+          if (remainingMs < FALLBACK_MIN_RUN_MS) {
+            notTried = 'time';
+            log('info', `handoff ${job.handoff_id}: the second model was not tried (${notTried})`);
+          } else {
+            const mode = identity.mode === 'none' ? '; with no agent account the proof its processes are gone is that opencode exited by itself after tools that start none' : '';
+            log('info', `handoff ${job.handoff_id}: the first model was refused (${refused.class}) before anything was changed; starting the second model, ${config.fallbackModel}, with ${Math.floor(remainingMs / 1000)} seconds left${mode}`);
+            const first = agent;
+            agent = await runAgent(config, workspace.dir, prompt, { model: config.fallbackModel, second: true, timeoutMs: remainingMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress, hookNotes });
+            firstRun = { agent: first, refusal: refused };
+          }
         } else if (decision.notTried) {
           notTried = decision.notTried;
           log('info', `handoff ${job.handoff_id}: the second model was not tried (${notTried})`);
