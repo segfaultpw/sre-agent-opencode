@@ -598,6 +598,7 @@ A tracked path is marked `skip-worktree` before it is removed, so no pull reques
 What holds regardless of anything the agent does in that shell:
 
 - The protected paths gate. The runner runs it over the staged file list before anything is published. A change that touched `.github/`, an env file, a path containing `secrets` or a `.pem` key publishes nothing, and the report names the paths.
+- Repositories inside the checkout. The agent owns every byte of its checkout, and git runs the filter drivers a repository's own configuration names as whoever runs git. So before the runner's git reads the tree it removes whatever the agent left that git would read as a repository: the contents of every submodule path of the base (the runner never fills them), and every `.git` below the root. A request that left one publishes nothing and the report names the path as an embedded git repository; the root's `.git` is the agent's own repository, which the runner never reads.
 - The draft pull request, SRE Agent's review, and your own CI on the pull request. Nothing merges without a person.
 
 The provider key and the repository token exist in the runner's environment while the agent runs. The log masks them, which is not the same as keeping them out of a shell's reach. For a runner that shares a machine with production credentials, read [What it can reach, and what actually bounds it](#what-it-can-reach-and-what-actually-bounds-it) and give the machine a role of its own.

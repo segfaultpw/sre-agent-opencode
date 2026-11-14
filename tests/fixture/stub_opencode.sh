@@ -236,6 +236,22 @@ if [ -n "${STUB_OPENCODE_BRIEF_OUT:-}" ]; then
   printf '%s' "$brief" > "$STUB_OPENCODE_BRIEF_OUT"
 fi
 
+# A repository of the agent's own at $1, with a tracked file that differs from its
+# index and a clean filter and an fsmonitor in its configuration that write the
+# marker STUB_PLANT_MARKER (and .fsmonitor): git run inside it as another account
+# would run them, so a marker file is the proof that something did.
+plant_repository() {
+  local at="$1" git="${STUB_PROBE_GIT:?}"
+  mkdir -p "$at"
+  "$git" init -q "$at"
+  printf 'a\n' > "$at/f"
+  "$git" -C "$at" add f
+  "$git" -C "$at" -c user.name=a -c user.email=a@example.invalid -c commit.gpgsign=false commit -q -m inner
+  printf 'b\n' > "$at/f"
+  printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n' "${STUB_PLANT_MARKER:?}" "${STUB_PLANT_MARKER}.fsmonitor" >> "$at/.git/config"
+  printf '* filter=evil\n' > "$at/.gitattributes"
+}
+
 # What a run can do to the notes the runner copied in. The edits include the
 # ones the runner must refuse (a symlink, a name outside the allowed set, a file
 # outside NOTES.md and scripts/, an oversized NOTES.md), because the bounds are
@@ -292,6 +308,16 @@ case "${STUB_OPENCODE_MEMORY:-}" in
     printf 'inside\n' > sub/file.txt
     "$git" -C sub add file.txt
     "$git" -C sub -c user.name=a -c user.email=a@example.invalid -c commit.gpgsign=false commit -q -m inner
+    ;;
+  plantsub)
+    # A repository with a filter driver where the base keeps a submodule, and a
+    # real change beside it, so the request would end in a pull request if the
+    # runner staged what is there.
+    plant_repository sub
+    ;;
+  plantnested)
+    # The same, in a directory that is no submodule of the base.
+    plant_repository deep/inner
     ;;
   plant)
     # What an agent that owns its tree can leave for the runner's git: a .git
@@ -539,6 +565,14 @@ d.yml"
     # A process of the agent's account left behind, with every descriptor closed so the run ends.
     tool_event read
     setsid sleep 60 </dev/null >/dev/null 2>&1 &
+    billing_refusal
+    ;;
+  provider_billing_plantsub)
+    # Only a read in the stream, while the tree holds a repository with a filter
+    # driver inside the path a submodule of the base keeps: what a proof that
+    # asks git about the tree must never run.
+    tool_event read
+    plant_repository sub
     billing_refusal
     ;;
   provider_billing)

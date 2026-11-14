@@ -2458,11 +2458,129 @@ async function killAgentProcesses() {
   return false;
 }
 
+function readDirectory(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== 'EACCES' && error.code !== 'EPERM') throw error;
+    fs.chmodSync(dir, 0o700);
+    return fs.readdirSync(dir, { withFileTypes: true });
+  }
+}
+
+function makeTreeWritable(target) {
+  const stack = [target];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory()) continue;
+    fs.chmodSync(current, 0o700);
+    for (const entry of readDirectory(current)) stack.push(path.join(current, entry.name));
+  }
+}
+
+// rm -rf that never follows a link, and that takes a directory the agent made
+// unreadable or unwritable (the runner owns it by now, so a chmod is its own).
+function forceRemove(target) {
+  try {
+    fs.rmSync(target, { recursive: true, force: true });
+    return;
+  } catch (error) {
+    if (error.code !== 'EACCES' && error.code !== 'EPERM' && error.code !== 'ENOTEMPTY') throw error;
+  }
+  makeTreeWritable(target);
+  fs.rmSync(target, { recursive: true, force: true });
+}
+
+// The gitlink paths of the runner's own index. Only the index is read: no file
+// of the tree is, so nothing here can start a driver.
+async function gitlinkPaths(workspace) {
+  const listing = await gitIn(workspace, ['ls-files', '-s', '-z']);
+  const found = [];
+  for (const entry of listing.split('\0').filter(Boolean)) {
+    const meta = /^(\d+) [0-9a-f]+ \d\t([^]*)$/.exec(entry);
+    if (meta && meta[1] === '160000') found.push(meta[2]);
+  }
+  return found;
+}
+
+// The directory a tree-relative path names, only when every component above it
+// is a real directory (a link in the way means the path is not inside the tree).
+function pathInside(root, relative) {
+  const parts = relative.split('/').filter(Boolean);
+  if (parts.length === 0 || parts.includes('..') || parts.includes('.')) return null;
+  let current = root;
+  for (const part of parts.slice(0, -1)) {
+    current = path.join(current, part);
+    const stat = statOrNull(current);
+    if (!stat || !stat.isDirectory()) return null;
+  }
+  return path.join(current, parts[parts.length - 1]);
+}
+
+// What the agent's account can leave in a checkout that git would read as a
+// repository of its own. Its configuration, attributes, filters and hooks are the
+// agent's: a filter driver runs as whoever runs git, and git starts one when it
+// compares or stages a file inside such a repository. Two places reach one from
+// the runner's own calls. A gitlink (a submodule, mode 160000 in the runner's
+// index) is a directory the runner never fills, and a git that looks at it
+// descends into whatever repository stands there (status and add both do). A
+// `.git` anywhere else below the root is a repository git adds as an embedded
+// one. Neither may survive into any git call the runner makes, so both are taken
+// out here, once the agent's processes are gone and before the next call:
+//
+//   - every gitlink path of the runner's index is emptied (a file or a link
+//     there is removed too), and a directory that held anything is reported;
+//   - every `.git` (file, directory or link) below the root is removed, and its
+//     parent is reported; the root's own `.git` is the agent's repository, which
+//     the runner never reads, and is removed without being a finding.
+//
+// The walk uses lstat only and never enters a link, so a link the agent made
+// cannot point the removal outside the checkout. The answer is the list of
+// reported paths with a trailing slash, the way git lists an embedded
+// repository; the caller treats any of them as a change to the checkout and as a
+// reason to stage nothing.
+async function scrubPlantedRepositories(workspace) {
+  const root = workspace.dir;
+  const found = new Set();
+  if (workspace.gitdir) {
+    for (const relative of await gitlinkPaths(workspace)) {
+      const target = pathInside(root, relative);
+      const stat = target ? statOrNull(target) : null;
+      if (!stat) continue;
+      if (stat.isDirectory()) {
+        const entries = readDirectory(target);
+        if (entries.length === 0) continue;
+        for (const entry of entries) forceRemove(path.join(target, entry.name));
+      } else {
+        forceRemove(target);
+      }
+      found.add(`${relative}/`);
+    }
+  }
+  const stack = [{ dir: root, relative: '' }];
+  while (stack.length > 0) {
+    const { dir, relative } = stack.pop();
+    for (const entry of readDirectory(dir)) {
+      const target = path.join(dir, entry.name);
+      if (entry.name === '.git') {
+        forceRemove(target);
+        if (relative !== '') found.add(`${relative}/`);
+      } else if (entry.isDirectory()) {
+        stack.push({ dir: target, relative: relative === '' ? entry.name : `${relative}/${entry.name}` });
+      }
+    }
+  }
+  return [...found];
+}
+
 // Takes the agent's processes, its home and the checkout back, in that order, and
 // answers whether the account is quiet. The home goes back first, so that even a
 // checkout that cannot be taken back leaves the agent unable to enter a home no
-// run is using.
-async function reclaim(dir, home) {
+// run is using. `workspace` is the request's checkout: what the agent left in it
+// that git would read as a repository is removed (scrubPlantedRepositories) and
+// recorded on it as `planted`, for the proof and the gate that come after.
+async function reclaim(dir, home, workspace = null) {
   const quiet = await killAgentProcesses();
   closeAgentHome(home);
   await chownTree(dir, 'runner');
@@ -2470,6 +2588,8 @@ async function reclaim(dir, home) {
   // The repository in the tree is the agent's. The runner never reads it; it
   // goes so it cannot be mistaken for the runner's.
   fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
+  const planted = await scrubPlantedRepositories(workspace || { dir, gitdir: null });
+  if (workspace && planted.length > 0) workspace.planted = [...new Set([...(workspace.planted || []), ...planted])];
   return quiet;
 }
 
@@ -2592,6 +2712,31 @@ async function fetchPullHead(workspace, token, number) {
   return fetched.code === 0 ? target : null;
 }
 
+// What an earlier request's agent left in a reused checkout that git would read
+// as a repository (see scrubPlantedRepositories): removed, and said, never
+// carried into this request's `planted`, which is about this request's own run.
+async function removeEarlierPlants(workspace, repo) {
+  const earlier = await scrubPlantedRepositories(workspace);
+  if (earlier.length > 0) {
+    log('warn', `${repo.fullName}: ${earlier.join(', ')} held a git repository left in the checkout by an earlier request; it was removed`);
+  }
+}
+
+// opencode reads configuration, plugins and agent definitions out of the
+// repository it runs in (see scripts/strip_repo_config.sh); the checkout is
+// emptied of them before every run of the agent in it, the second model's too.
+async function stripRepoConfig(workspace) {
+  const stripped = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'strip_repo_config.sh'), workspace.dir], {
+    env: { ...gitEnv(), GIT_DIR: workspace.gitdir, GIT_WORK_TREE: workspace.dir },
+  });
+  if (stripped.code !== 0) {
+    throw new Error(`the checkout could not be stripped of its own opencode configuration: ${redact(stripped.stderr).trim()}`);
+  }
+  for (const line of stripped.stdout.split('\n')) {
+    if (line.trim().startsWith('removed ')) log('warn', `${workspace.repo.fullName}: ${line.trim()}`);
+  }
+}
+
 // Step 3. Prepare the workspace. The credential reaches the calls that need it
 // through their environment (gitAuthEnv) and every URL is the clean one, so a
 // token is on no command line and never written into .git/config where a later
@@ -2671,6 +2816,7 @@ async function prepareCheckout(config, job, repo, options = {}) {
     await chownTree(dir, 'runner');
     fs.rmSync(path.join(dir, '.git'), { recursive: true, force: true });
     resetGitDir(gitdir, cleanUrl);
+    await removeEarlierPlants(workspace, repo);
     await gitIn(workspace, ['fetch', '--prune', cleanUrl, '+refs/heads/*:refs/remotes/origin/*'], token);
   }
   resetGitDir(gitdir, cleanUrl);
@@ -2718,6 +2864,10 @@ async function prepareCheckout(config, job, repo, options = {}) {
   // -f discards whatever a previous run left behind, so one abandoned run
   // cannot put its changes into the next request's pull request.
   await gitIn(workspace, ['checkout', '-f', '-B', branch, startRef]);
+  // The index now names this base's submodule paths, which may not be the
+  // earlier request's: what stands in them is taken out before the clean below
+  // or any other call reads the tree.
+  await removeEarlierPlants(workspace, repo);
   // -x as well, twice: ignored files (a build directory, a cache, a planted
   // script) are the other half of what a request leaves for the next one, and
   // the second f takes a nested repository with it.
@@ -2742,15 +2892,7 @@ async function prepareCheckout(config, job, repo, options = {}) {
   // the root configuration leave the checkout here, and writeAgent puts the
   // package's own agent back into an empty tree. This runs after the clean, or
   // the clean would restore them.
-  const stripped = await runProcess('bash', [path.join(PACKAGE_ROOT, 'scripts', 'strip_repo_config.sh'), dir], {
-    env: { ...gitEnv(), GIT_DIR: gitdir, GIT_WORK_TREE: dir },
-  });
-  if (stripped.code !== 0) {
-    throw new Error(`the checkout could not be stripped of its own opencode configuration: ${redact(stripped.stderr).trim()}`);
-  }
-  for (const line of stripped.stdout.split('\n')) {
-    if (line.trim().startsWith('removed ')) log('warn', `${repo.fullName}: ${line.trim()}`);
-  }
+  await stripRepoConfig(workspace);
 
   // The action stages the whole tree in CI and this runner stages the whole
   // tree too, so the agent file has to be invisible to git or it would land in
@@ -3994,6 +4136,12 @@ async function treeIsTheBase(workspace, repo) {
   if (!repo) {
     return fs.readdirSync(workspace.dir).every(runnerOwnEntry);
   }
+  // A repository the agent left in a submodule path or anywhere below the root is
+  // taken out before any git call reads the tree (see scrubPlantedRepositories),
+  // and is a difference whether it is found now or was found when reclaim took
+  // the checkout back.
+  const planted = await scrubPlantedRepositories(workspace);
+  if (planted.length > 0 || (workspace.planted && workspace.planted.length > 0)) return false;
   resetGitDir(workspace.gitdir, workspace.cleanUrl);
   excludeFromGit(workspace.gitdir, '.opencode/');
   excludeFromGit(workspace.gitdir, `${MEMORY_COPY}/`);
@@ -4010,9 +4158,11 @@ async function treeIsTheBase(workspace, repo) {
     const git = (args) => runProcess('git', [...named, ...args], { env, cwd: workspace.dir });
     const head = await git(['rev-parse', 'HEAD']);
     if (head.code !== 0 || head.stdout.trim() !== workspace.baseSha) return false;
-    const staged = await git(['diff-index', '--cached', '--quiet', workspace.baseSha]);
+    const staged = await git(['diff-index', '--ignore-submodules=all', '--cached', '--quiet', workspace.baseSha]);
     if (staged.code !== 0) return false;
-    const status = await git(['-c', 'core.quotePath=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
+    // --ignore-submodules=all: nothing is left in a submodule path to read (the
+    // scrub emptied them), and git must not start another git in one.
+    const status = await git(['-c', 'core.quotePath=false', 'status', '--ignore-submodules=all', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
     if (status.code !== 0) return false;
     return status.stdout.split('\0').filter(Boolean).every((entry) => runnerOwnEntry(entry.slice(3).replace(/\/$/, '')));
   } finally {
@@ -4066,6 +4216,13 @@ async function stageAndGate(workspace, memoryBlobs) {
   resetGitDir(gitdir, cleanUrl);
   excludeFromGit(gitdir, '.opencode/');
   excludeFromGit(gitdir, `${MEMORY_COPY}/`);
+  // A repository the agent left in a submodule path or below the root (found now,
+  // or when reclaim took the checkout back) is never read: the runner's git would
+  // start whatever driver its configuration names. It is removed, and nothing is
+  // staged. Past this point the tree holds no `.git` and no gitlink content, so
+  // the `add` below has no nested repository to descend into.
+  const planted = [...new Set([...(workspace.planted || []), ...(await scrubPlantedRepositories(workspace))])];
+  if (planted.length > 0) return { changed: planted, flagged: planted, memoryCopies: [], embedded: planted };
   // An embedded repository (the agent ran git init in a subdirectory) would be
   // added as a gitlink: a pointer at history that is in no pull request. git
   // lists such a directory, untracked, with a trailing slash; nothing is staged.
@@ -5692,7 +5849,7 @@ async function handleJob(config, job, options = {}) {
       const refused = config.fallbackModel ? providerRefusalOf(agent) : null;
       if (refused) {
         log('warn', `handoff ${job.handoff_id}: the AI provider refused the request (${refused.class}${refused.status ? `, HTTP ${refused.status}` : ''}) (first model)`);
-        firstQuiet = await reclaim(workspace.dir, home);
+        firstQuiet = await reclaim(workspace.dir, home, workspace);
         let decision = secondModelDecision({ config, first: agent, refusal: refused, quiet: firstQuiet, startedAt, now: Date.now() });
         if ((decision.try || decision.notTried === 'time') && !(await workspaceUnchanged(workspace, mem, repo))) {
           decision = { try: false, notTried: 'changed' };
@@ -5725,7 +5882,7 @@ async function handleJob(config, job, options = {}) {
       try {
         if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
         if (secondBundle) fs.rmSync(secondBundle.dir, { recursive: true, force: true });
-        agentProcessesEnded = (await reclaim(workspace.dir, home)) && firstQuiet;
+        agentProcessesEnded = (await reclaim(workspace.dir, home, workspace)) && firstQuiet;
         reclaimed = true;
       } finally {
         if (mem && reclaimed) closeMemory(mem, result);
@@ -6293,6 +6450,8 @@ module.exports = {
     secondModelDecision,
     changedByTools,
     workspaceUnchanged,
+    reclaim,
+    stageAndGate,
     poll,
     openMemory,
     closeMemory,

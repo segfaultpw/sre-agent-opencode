@@ -3966,6 +3966,85 @@ if jq -e '(.test.steps[] | select(.name == "model") | .ok) == false and (.test.s
 stop_fixture
 
 
+echo "--- 151. a repository the agent leaves in a submodule path or below the checkout is never read by the runner's git, and never published ---"
+# The base has a submodule at sub/. The runner never fills it, so whatever stands
+# there is the agent's: a repository with a clean filter and an fsmonitor that
+# write a marker file, which any git the runner starts inside it would run.
+remote3="$work/remote/gl.git"
+"$real_git" init -q --bare -b main "$remote3"
+"$real_git" init -q -b main "$work/seed3"
+printf 'the repository with a submodule\n' > "$work/seed3/README.md"
+"$real_git" -C "$work/seed3" add README.md
+"$real_git" -C "$work/seed3" update-index --add --cacheinfo "160000,$("$real_git" -C "$work/seed" rev-parse HEAD),sub"
+"$real_git" -C "$work/seed3" -c user.name=seed -c user.email=seed@example.invalid commit -q -m seed
+"$real_git" -C "$work/seed3" push -q "$remote3" main
+printf '%s' "$remote3" > "$work/ctl/remote"
+gl_tree="$workspace/repos/acme/gl"
+mkdir -p "$work/markers3"
+gl_marker="$work/markers3/filter"
+gl_run() { # $1 case label, $2 stub memory mode
+  start_fixture "$1"
+  queue_one "h-$1" acme/gl
+  export STUB_OPENCODE_MODE=fix STUB_OPENCODE_MEMORY="$2" STUB_PLANT_MARKER="$gl_marker"
+  run_once "$1"
+  unset STUB_OPENCODE_MEMORY STUB_PLANT_MARKER
+}
+plant_in_tree() { # $1 directory, $2 marker: a repository of the agent's, as an earlier request left it
+  mkdir -p "$1"
+  "$real_git" init -q "$1"
+  printf 'a\n' > "$1/f"
+  "$real_git" -C "$1" add f
+  "$real_git" -C "$1" -c user.name=a -c user.email=a@example.invalid commit -q -m inner
+  printf 'b\n' > "$1/f"
+  printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s.fsmonitor\n' "$2" "$2" >> "$1/.git/config"
+  printf '* filter=evil\n' > "$1/.gitattributes"
+}
+gl_clean() { [ -z "$(ls -A "$work/markers3")" ]; }
+
+gl_run gl_submodule plantsub
+if [ "$rc" -eq 0 ] && jq -e '.evidence.flagged_paths | index("sub/")' <<<"$report" >/dev/null && jq -e '.summary | test("git repository")' <<<"$report" >/dev/null; then echo "ok   a repository in the submodule path is named and refused"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if gl_clean; then echo "ok   no filter or fsmonitor of the planted repository ran for the runner's staging"; else echo "FAIL these ran: $(ls "$work/markers3")"; fail=1; fi
+if ! "$real_git" --git-dir="$remote3" rev-parse --verify --quiet refs/heads/sre-agent/h-gl_submodule >/dev/null && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed and no pull request is opened"; else echo "FAIL a branch or pull request exists"; fail=1; fi
+if [ ! -e "$gl_tree/sub/.git" ] && [ -z "$(ls -A "$gl_tree/sub")" ]; then echo "ok   the submodule path is empty again when the run ends"; else echo "FAIL left in sub: $(ls -A "$gl_tree/sub")"; fail=1; fi
+stop_fixture
+
+gl_run gl_nested plantnested
+if [ "$rc" -eq 0 ] && jq -e '.evidence.flagged_paths | index("deep/inner/")' <<<"$report" >/dev/null && gl_clean && [ ! -e "$gl_tree/deep/inner/.git" ]; then echo "ok   a repository outside any submodule path is refused, never read, and its .git is removed"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+stop_fixture
+
+# An earlier request that did not end cleanly (the runner died before it took the
+# checkout back) left repositories behind: the next request starts clean, runs
+# nothing of theirs, and publishes only what its own agent changed.
+plant_in_tree "$gl_tree/sub" "$gl_marker"
+plant_in_tree "$gl_tree/deep/inner" "$gl_marker"
+gl_run gl_after ""
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean; then echo "ok   a request after a crash runs none of the repositories left behind, and opens its pull request"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+if [ -z "$("$real_git" --git-dir="$remote3" ls-tree -r --name-only refs/heads/sre-agent/h-gl_after | grep -v -x -e README.md -e sub)" ] && [ "$("$real_git" --git-dir="$remote3" ls-tree refs/heads/sre-agent/h-gl_after sub | cut -d' ' -f1)" = "160000" ]; then echo "ok   the pull request holds the README and the submodule pointer, and nothing of the planted trees"; else echo "FAIL tree: $("$real_git" --git-dir="$remote3" ls-tree -r refs/heads/sre-agent/h-gl_after)"; fail=1; fi
+if grep -q 'acme/gl: .* held a git repository left in the checkout by an earlier request; it was removed' "$out"; then echo "ok   the log says what was removed"; else echo "FAIL log: $(grep 'acme/gl' "$out")"; fail=1; fi
+stop_fixture
+
+# Two requests in a row: the first leaves a repository (and is refused), the second,
+# on the same checkout, is an ordinary fix.
+gl_run gl_first plantsub
+gl_run gl_second ""
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean && [ ! -e "$gl_tree/sub/.git" ]; then echo "ok   the request after a refused one publishes, and nothing planted ever ran"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+stop_fixture
+
+# The proof the second model rests on asks git about the tree too: the first run
+# only read, as far as the event stream shows, and left a repository in sub/.
+start_fixture gl_second_model
+queue_one h-gl-second-model acme/gl "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_plantsub STUB_OPENCODE_SECOND_MODE=fix STUB_PLANT_MARKER="$gl_marker" STUB_RECORD_ENV="ANTHROPIC_API_KEY OPENAI_API_KEY"
+run_timeout=300
+with_second_model run_once gl_second_model
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE STUB_PLANT_MARKER STUB_RECORD_ENV
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed"' <<<"$report" >/dev/null; then echo "ok   a repository planted during a refused first run is a change: the second model is not started"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+if gl_clean; then echo "ok   the proof ran nothing of the planted repository"; else echo "FAIL these ran: $(ls "$work/markers3")"; fail=1; fi
+stop_fixture
+rm -f "$work/ctl/remote"
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

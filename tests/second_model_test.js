@@ -295,7 +295,7 @@ async function main() {
   });
 
   await check('workspaceUnchanged: the checkout is the base commit, byte for byte, and nothing else of the agent\'s is left', async () => {
-    const { workspaceUnchanged, setIdentity, openMemory } = runner.internals;
+    const { workspaceUnchanged, setIdentity, openMemory, reclaim, stageAndGate } = runner.internals;
     setIdentity({ mode: 'none', runner: null, agent: null });
     const git = (cwd, ...args) => {
       const done = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
@@ -304,7 +304,19 @@ async function main() {
     };
     // A checkout the way the runner makes one: the git directory is a separate one the
     // agent never holds, the tree is only files, the base commit is what HEAD is.
-    const make = (label) => {
+    // A commit of another repository, which a gitlink of the base can point at.
+    const submoduleCommit = (() => {
+      const source = path.join(work, 'submodule-source');
+      fs.mkdirSync(source, { recursive: true });
+      git(source, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(source, 'f'), 'a\n');
+      git(source, 'add', 'f');
+      git(source, 'commit', '-q', '-m', 'inner');
+      return git(source, 'rev-parse', 'HEAD');
+    })();
+    // `gitlink` puts a submodule at sub/ in the base commit; the runner never fills
+    // it, so the directory is empty, as a checkout leaves it.
+    const make = (label, { gitlink = false } = {}) => {
       const root = path.join(work, `proof-${label}`);
       const dir = path.join(root, 'tree');
       const gitdir = path.join(root, 'gitdir');
@@ -318,8 +330,10 @@ async function main() {
       fs.writeFileSync(path.join(dir, 'src', 'app.txt'), 'app\n');
       const named = (...args) => git(dir, `--git-dir=${gitdir}`, `--work-tree=${dir}`, ...args);
       named('add', '-A');
+      if (gitlink) named('update-index', '--add', '--cacheinfo', `160000,${submoduleCommit},sub`);
       named('commit', '-q', '-m', 'base');
       const baseSha = named('rev-parse', 'HEAD');
+      if (gitlink) fs.mkdirSync(path.join(dir, 'sub'));
       // The runner takes the repository's own opencode configuration out of the tree and marks it so.
       named('update-index', '--skip-worktree', 'opencode.json');
       fs.rmSync(path.join(dir, 'opencode.json'));
@@ -371,6 +385,114 @@ async function main() {
       change(made);
       assert.equal(await unchanged(made), false, label);
     }
+
+    // What the agent can leave for the runner's own git: a repository with a filter
+    // driver and attributes that name it, in a path the base keeps for a submodule
+    // or anywhere else below the root. A driver runs as whoever runs git, so its
+    // marker file must never be written, whatever the runner does next.
+    const plantRepository = (at, marker) => {
+      fs.mkdirSync(at, { recursive: true });
+      git(at, 'init', '-q', '-b', 'main');
+      fs.writeFileSync(path.join(at, 'f'), 'a\n');
+      git(at, 'add', 'f');
+      git(at, 'commit', '-q', '-m', 'inner');
+      fs.writeFileSync(path.join(at, 'f'), 'b\n');
+      fs.appendFileSync(path.join(at, '.git', 'config'), `[filter "evil"]\n\tclean = touch ${marker}\n[core]\n\tfsmonitor = touch ${marker}.fsmonitor\n`);
+      fs.writeFileSync(path.join(at, '.gitattributes'), '* filter=evil\n');
+    };
+    const ran = (marker) => [marker, `${marker}.fsmonitor`].filter((file) => fs.existsSync(file));
+
+    const gitlinkClean = make('gitlink-clean', { gitlink: true });
+    assert.equal(await unchanged(gitlinkClean), true, 'an empty submodule directory is the base');
+    assert.deepEqual((await stageAndGate(gitlinkClean.workspace, new Set())).changed, [], 'and stages nothing');
+
+    const inSubmodule = make('gitlink-plant', { gitlink: true });
+    const markerSubmodule = path.join(work, 'marker-submodule');
+    plantRepository(path.join(inSubmodule.dir, 'sub'), markerSubmodule);
+    assert.equal(await unchanged(inSubmodule), false, 'a repository in a submodule path is a difference');
+    assert.deepEqual(ran(markerSubmodule), [], 'the planted filter never ran for the proof');
+    assert.deepEqual(fs.readdirSync(path.join(inSubmodule.dir, 'sub')), [], 'the submodule path is emptied');
+
+    const nestedOutside = make('nested-plant');
+    const markerNested = path.join(work, 'marker-nested');
+    plantRepository(path.join(nestedOutside.dir, 'a', 'b'), markerNested);
+    assert.equal(await unchanged(nestedOutside), false, 'a repository outside any submodule path is a difference');
+    assert.deepEqual(ran(markerNested), []);
+    assert.equal(fs.existsSync(path.join(nestedOutside.dir, 'a', 'b', '.git')), false, 'its .git is removed');
+    assert.equal(fs.existsSync(path.join(nestedOutside.dir, 'a', 'b', 'f')), true, 'the files around it are the tree\'s and stay');
+
+    const stagedPlant = make('gitlink-stage', { gitlink: true });
+    const markerStaged = path.join(work, 'marker-staged');
+    plantRepository(path.join(stagedPlant.dir, 'sub'), markerStaged);
+    fs.appendFileSync(path.join(stagedPlant.dir, 'README.md'), 'a real change\n');
+    const refused = await stageAndGate(stagedPlant.workspace, new Set());
+    assert.deepEqual(ran(markerStaged), [], 'the planted filter never ran for staging');
+    assert.deepEqual(refused.embedded, ['sub/'], 'a repository in a submodule path is refused, by its path');
+    assert.deepEqual(refused.flagged, ['sub/']);
+    assert.equal(stagedPlant.named('diff', '--cached', '--name-only'), '', 'and nothing is staged');
+
+    const nestedStage = make('nested-stage');
+    const markerNestedStage = path.join(work, 'marker-nested-stage');
+    plantRepository(path.join(nestedStage.dir, 'deep', 'inner'), markerNestedStage);
+    const refusedNested = await stageAndGate(nestedStage.workspace, new Set());
+    assert.deepEqual(ran(markerNestedStage), []);
+    assert.deepEqual(refusedNested.embedded, ['deep/inner/']);
+    assert.equal(fs.existsSync(path.join(nestedStage.dir, 'deep', 'inner', '.git')), false);
+
+    // What reclaim found is remembered: the checkout holds nothing of it afterwards,
+    // and the proof and the gate still say it was there.
+    const reclaimed = make('gitlink-reclaim', { gitlink: true });
+    const markerReclaimed = path.join(work, 'marker-reclaimed');
+    plantRepository(path.join(reclaimed.dir, 'sub'), markerReclaimed);
+    plantRepository(path.join(reclaimed.dir, 'x', 'y'), `${markerReclaimed}-y`);
+    assert.equal(await reclaim(reclaimed.dir, null, reclaimed.workspace), true);
+    assert.deepEqual([...reclaimed.workspace.planted].sort(), ['sub/', 'x/y/']);
+    assert.deepEqual(fs.readdirSync(path.join(reclaimed.dir, 'sub')), []);
+    assert.equal(fs.existsSync(path.join(reclaimed.dir, 'x', 'y', '.git')), false);
+    assert.equal(await unchanged(reclaimed), false, 'the proof knows what reclaim removed');
+    const refusedAfter = await stageAndGate(reclaimed.workspace, new Set());
+    assert.deepEqual([...refusedAfter.embedded].sort(), ['sub/', 'x/y/'], 'and so does the gate');
+    assert.deepEqual([...ran(markerReclaimed), ...ran(`${markerReclaimed}-y`)], []);
+
+    // A request after one that left a repository: the next request's own checkout
+    // starts from what the runner made of it, so nothing is reported for it.
+    const later = make('gitlink-later', { gitlink: true });
+    assert.equal(await reclaim(later.dir, null, later.workspace), true);
+    assert.equal(later.workspace.planted, undefined, 'a quiet run records nothing');
+    assert.equal(await unchanged(later), true);
+
+    // The removal never follows a link: a link in a submodule path, a link above
+    // one, and a link to a directory that holds a repository all leave the target alone.
+    const links = make('links', { gitlink: true });
+    const outside = path.join(work, 'outside-target');
+    fs.mkdirSync(path.join(outside, 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'repo', '.git'), { recursive: true });
+    fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep\n');
+    fs.writeFileSync(path.join(outside, 'sub', 'keep.txt'), 'keep\n');
+    fs.writeFileSync(path.join(outside, 'repo', '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    fs.rmSync(path.join(links.dir, 'sub'), { recursive: true });
+    fs.symlinkSync(outside, path.join(links.dir, 'sub'));
+    fs.symlinkSync(outside, path.join(links.dir, 'link-to-repo'));
+    assert.equal(await unchanged(links), false, 'a link where the submodule was is a difference');
+    assert.equal(fs.existsSync(path.join(outside, 'keep.txt')), true, 'the target of a link is untouched');
+    assert.equal(fs.existsSync(path.join(outside, 'repo', '.git', 'HEAD')), true, 'a repository behind a link is not entered');
+    const above = make('links-above');
+    fs.writeFileSync(path.join(above.dir, 'src', '.keep'), '');
+    // A gitlink whose parent directory was replaced by a link out of the tree.
+    above.named('update-index', '--add', '--cacheinfo', `160000,${submoduleCommit},src/inner`);
+    fs.rmSync(path.join(above.dir, 'src'), { recursive: true });
+    fs.symlinkSync(outside, path.join(above.dir, 'src'));
+    await unchanged(above);
+    assert.equal(fs.existsSync(path.join(outside, 'sub', 'keep.txt')), true, 'nothing outside the tree is emptied');
+
+    // A directory the agent made unreadable is the runner's to open and remove.
+    const closed = make('closed');
+    plantRepository(path.join(closed.dir, 'locked', 'inner'), path.join(work, 'marker-closed'));
+    fs.chmodSync(path.join(closed.dir, 'locked', 'inner', '.git'), 0o000);
+    fs.chmodSync(path.join(closed.dir, 'locked'), 0o000);
+    assert.equal(await unchanged(closed), false);
+    assert.equal(fs.existsSync(path.join(closed.dir, 'locked', 'inner', '.git')), false);
+    assert.deepEqual(ran(path.join(work, 'marker-closed')), []);
 
     const staged = make('staged');
     fs.writeFileSync(path.join(staged.dir, 'new.txt'), 'x\n');
