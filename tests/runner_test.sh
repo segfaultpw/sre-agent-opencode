@@ -3294,13 +3294,19 @@ export PATH="$saved_path"
 unset STUB_RECORD_ENV
 
 echo "--- 117. progress rides on the heartbeat: the phases in order, the tool count, and nothing the agent ran ---"
-export FIXTURE_HEARTBEAT_SECONDS=1
+# A phase change sends one extra beat at once, but only the phase the runner is in
+# when that beat is built is named: a phase that is over before the event loop gets
+# to it is, by design, never beaten. `collected` is set just before the brief is
+# fetched, so the brief answers after 300 ms, which gives the beat all the time it
+# needs and makes the order below depend on what the runner does, not on how fast
+# this machine answers a request on loopback.
+export FIXTURE_HEARTBEAT_SECONDS=1 FIXTURE_BRIEF_DELAY_MS=300
 start_fixture progress
 queue_one h-progress acme/app
 export STUB_OPENCODE_MODE=tools
 run_once progress
 export STUB_OPENCODE_MODE=fix
-unset FIXTURE_HEARTBEAT_SECONDS
+unset FIXTURE_HEARTBEAT_SECONDS FIXTURE_BRIEF_DELAY_MS
 phases="$(jq -r 'select(.path | endswith("/heartbeat")) | .body.progress.phase // empty' "$fixture_log" | uniq | tr '\n' ' ')"
 if [ "$rc" -eq 0 ] && [ "$phases" = "collected cloning agent checks publishing " ]; then echo "ok   the beats name the phases in order: $phases"; else echo "FAIL rc=$rc phases: $phases"; fail=1; fi
 if jq -e -s '[.[] | select(.path | endswith("/heartbeat")) | select(.body.progress.phase == "agent" and .body.progress.tools == 3 and .body.progress.last_tool == "edit")] | length >= 1' "$fixture_log" >/dev/null; then echo "ok   a beat during the agent carries three tool calls and the kind of the last"; else echo "FAIL beats: $(jq -c 'select(.path | endswith("/heartbeat")) | .body' "$fixture_log" | tr '\n' ' ')"; fail=1; fi
@@ -4000,7 +4006,8 @@ remote3="$work/remote/gl.git"
 "$real_git" init -q --bare -b main "$remote3"
 "$real_git" init -q -b main "$work/seed3"
 printf 'the repository with a submodule\n' > "$work/seed3/README.md"
-"$real_git" -C "$work/seed3" add README.md
+printf 'vendor/\n' > "$work/seed3/.gitignore"
+"$real_git" -C "$work/seed3" add README.md .gitignore
 "$real_git" -C "$work/seed3" update-index --add --cacheinfo "160000,$("$real_git" -C "$work/seed" rev-parse HEAD),sub"
 "$real_git" -C "$work/seed3" -c user.name=seed -c user.email=seed@example.invalid commit -q -m seed
 "$real_git" -C "$work/seed3" push -q "$remote3" main
@@ -4028,10 +4035,14 @@ plant_in_tree() { # $1 directory, $2 marker: a repository of the agent's, as an 
 gl_clean() { [ -z "$(ls -A "$work/markers3")" ]; }
 
 gl_run gl_submodule plantsub
-if [ "$rc" -eq 0 ] && jq -e '.evidence.flagged_paths | index("sub/")' <<<"$report" >/dev/null && jq -e '.summary | test("git repository")' <<<"$report" >/dev/null; then echo "ok   a repository in the submodule path is named and refused"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && jq -e '.evidence.removed_repositories == ["sub/"] and (.evidence | has("flagged_paths") | not) and (.summary | test("git repository the agent left in sub/ was removed")) and (.actions | any(test("removed sub/")))' <<<"$report" >/dev/null; then echo "ok   a repository in the submodule path is removed and told, and the request goes on to its pull request"; else echo "FAIL rc=$rc report: $report"; fail=1; fi
 if gl_clean; then echo "ok   no filter or fsmonitor of the planted repository ran for the runner's staging"; else echo "FAIL these ran: $(ls "$work/markers3")"; fail=1; fi
-if ! "$real_git" --git-dir="$remote3" rev-parse --verify --quiet refs/heads/sre-agent/h-gl_submodule >/dev/null && [ ! -s "$gh_log" ]; then echo "ok   nothing is pushed and no pull request is opened"; else echo "FAIL a branch or pull request exists"; fail=1; fi
+if [ -z "$("$real_git" --git-dir="$remote3" ls-tree -r --name-only refs/heads/sre-agent/h-gl_submodule | grep -v -x -e README.md -e .gitignore -e sub)" ] && [ "$("$real_git" --git-dir="$remote3" ls-tree refs/heads/sre-agent/h-gl_submodule sub | cut -d' ' -f1)" = "160000" ]; then echo "ok   the pull request holds the change and the submodule pointer as the base had it, and nothing of the planted tree"; else echo "FAIL tree: $("$real_git" --git-dir="$remote3" ls-tree -r refs/heads/sre-agent/h-gl_submodule)"; fail=1; fi
 if [ ! -e "$gl_tree/sub/.git" ] && [ -z "$(ls -A "$gl_tree/sub")" ]; then echo "ok   the submodule path is empty again when the run ends"; else echo "FAIL left in sub: $(ls -A "$gl_tree/sub")"; fail=1; fi
+stop_fixture
+
+gl_run gl_ignored plantignored
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && jq -e '.evidence.removed_repositories == ["vendor/pkg/"] and (.evidence | has("flagged_paths") | not)' <<<"$report" >/dev/null && gl_clean && [ ! -e "$gl_tree/vendor/pkg/.git" ]; then echo "ok   a repository under an ignored directory is removed and told, runs nothing, and the request still ends in its pull request"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
 stop_fixture
 
 gl_run gl_nested plantnested
@@ -4045,15 +4056,25 @@ plant_in_tree "$gl_tree/sub" "$gl_marker"
 plant_in_tree "$gl_tree/deep/inner" "$gl_marker"
 gl_run gl_after ""
 if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean; then echo "ok   a request after a crash runs none of the repositories left behind, and opens its pull request"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
-if [ -z "$("$real_git" --git-dir="$remote3" ls-tree -r --name-only refs/heads/sre-agent/h-gl_after | grep -v -x -e README.md -e sub)" ] && [ "$("$real_git" --git-dir="$remote3" ls-tree refs/heads/sre-agent/h-gl_after sub | cut -d' ' -f1)" = "160000" ]; then echo "ok   the pull request holds the README and the submodule pointer, and nothing of the planted trees"; else echo "FAIL tree: $("$real_git" --git-dir="$remote3" ls-tree -r refs/heads/sre-agent/h-gl_after)"; fail=1; fi
+if [ -z "$("$real_git" --git-dir="$remote3" ls-tree -r --name-only refs/heads/sre-agent/h-gl_after | grep -v -x -e README.md -e .gitignore -e sub)" ] && [ "$("$real_git" --git-dir="$remote3" ls-tree refs/heads/sre-agent/h-gl_after sub | cut -d' ' -f1)" = "160000" ]; then echo "ok   the pull request holds the README and the submodule pointer, and nothing of the planted trees"; else echo "FAIL tree: $("$real_git" --git-dir="$remote3" ls-tree -r refs/heads/sre-agent/h-gl_after)"; fail=1; fi
 if grep -q 'acme/gl: .* held a git repository left in the checkout by an earlier request; it was removed' "$out"; then echo "ok   the log says what was removed"; else echo "FAIL log: $(grep 'acme/gl' "$out")"; fail=1; fi
 stop_fixture
 
-# Two requests in a row: the first leaves a repository (and is refused), the second,
-# on the same checkout, is an ordinary fix.
+# Two requests in a row: the first leaves a repository (and publishes without it),
+# the second, on the same checkout, is an ordinary fix.
 gl_run gl_first plantsub
 gl_run gl_second ""
-if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean && [ ! -e "$gl_tree/sub/.git" ]; then echo "ok   the request after a refused one publishes, and nothing planted ever ran"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && gl_clean && [ ! -e "$gl_tree/sub/.git" ]; then echo "ok   the request after one that left a repository publishes, and nothing planted ever ran"; else echo "FAIL rc=$rc report: $report markers: $(ls "$work/markers3")"; fail=1; fi
+stop_fixture
+
+# A checkout the runner cannot clean at all: a path longer than the system lets
+# any program name makes the scrub's read of it fail. That is no reason to fail
+# every later request for the repository: the checkout is removed with its git
+# directory and cloned again.
+mkdir -p "$gl_tree/vendor"
+(cd "$gl_tree/vendor" && for _ in $(seq 1 2100); do mkdir d && cd d || exit 1; done)
+gl_run gl_deep ""
+if [ "$rc" -eq 0 ] && [ "$(jq -r '.pr_url' <<<"$report")" = "$pr_url" ] && [ ! -e "$gl_tree/vendor/d" ] && grep -q 'acme/gl: the checkout from an earlier request could not be cleaned' "$out"; then echo "ok   a checkout that cannot be cleaned is removed and cloned again, and the request ends in its pull request"; else echo "FAIL rc=$rc report: $report log: $(grep 'acme/gl' "$out" | head -3)"; fail=1; fi
 stop_fixture
 
 # The proof the second model rests on asks git about the tree too: the first run
@@ -4091,7 +4112,12 @@ run_seam_once() {
       const runner = require(process.argv[1]);
       const jobs = JSON.parse(require("node:fs").readFileSync(process.argv[2], "utf8"));
       let calls = 0;
-      runner.internals.setAgentKiller(async () => { calls += 1; return calls > 1; });
+      const throwing = process.env.SEAM_KILLER === "throws";
+      runner.internals.setAgentKiller(async () => {
+        calls += 1;
+        if (throwing && calls === 1) throw new Error("the agent account could not be reached");
+        return throwing ? true : calls > 1;
+      });
       const config = runner.loadConfig();
       runner.serveJob(config, jobs[0]).then(
         () => process.exit(0),
@@ -4109,6 +4135,18 @@ unset STUB_OPENCODE_SECOND_MODE
 if jq -e '(.test.steps[] | select(.name == "model") | (.ok == false and (.detail | test("could not be ended")))) and (.test.steps[] | select(.name == "fallback_model") | (.ok == false and .detail == "not run"))' <<<"$report" >/dev/null; then echo "ok   the model step fails for the survivor and the second model's step is reported as not run"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report") $(tail -n 3 "$out")"; fail=1; fi
 if [ "$(runs_of)" = "1" ] && jq -e '.actions | any(test("second model.s step was not run"))' <<<"$report" >/dev/null; then echo "ok   only one model call was made, and the actions say why the other was not"; else echo "FAIL runs=$(runs_of) actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
 if ! grep -qF -e "$second_key" "$opencode_log" "$out"; then echo "ok   the second key was never put in the environment of a process"; else echo "FAIL the second key reached a run"; fail=1; fi
+stop_fixture
+
+# A reclaim that throws (the account could not be reached at all) is not quiet
+# either: the second model's step must not start after it.
+start_fixture second_test_throws
+queue_test_job h-second-test-throws ""
+export STUB_OPENCODE_MODE=oneline STUB_OPENCODE_SECOND_MODE=oneline SEAM_KILLER=throws
+with_second_model run_seam_once second_test_throws
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE SEAM_KILLER
+if jq -e '(.test.steps[] | select(.name == "model") | .ok == false) and (.test.steps[] | select(.name == "fallback_model") | (.ok == false and .detail == "not run"))' <<<"$report" >/dev/null; then echo "ok   a reclaim that threw fails the model step, and the second model's step is reported as not run"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report") $(tail -n 3 "$out")"; fail=1; fi
+if [ "$(runs_of)" = "1" ] && ! grep -qF -e "$second_key" "$opencode_log" "$out"; then echo "ok   only one model call was made, and the second key reached no process"; else echo "FAIL runs=$(runs_of)"; fail=1; fi
 stop_fixture
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"

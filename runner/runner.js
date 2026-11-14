@@ -5756,8 +5756,9 @@ async function runTestJob(config, job, heartbeat) {
   // too: the hooks run once per test job. null until they have.
   let preparedEnv = null;
   // Whether the agent's account was quiet after the model step; the second
-  // model's step starts nothing while it is not.
-  let modelQuiet = true;
+  // model's step starts nothing while it is not. False until the model step's
+  // reclaim has answered, so a reclaim that threw is not quiet either.
+  let modelQuiet = false;
   const memoryRoot = config.layout.memory;
   const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
