@@ -839,6 +839,53 @@ prove_survivor() {
 
 prove_survivor
 
+# The second model needs the agent's account quiet: a first run that was refused
+# while a process of the account could not be ended is the failure it always was,
+# and the second model is not started on top of it. The loop is the one above;
+# the first run only reads and is refused, which is a case for the second model
+# with a quiet account.
+prove_survivor_second_model() {
+  local label="root-survivor-second" owner="$runner_uid"
+  local ws="$work/$label-ws" runner_home="$work/home/$label-runner" agent_home="$work/home/$label-agent" out="$work/$label.out" agent_log="$work/$label.agent.log"
+  echo "--- $label: a refusal with a process of the agent's account that cannot be ended starts no second model ---"
+  mkdir -p "$ws" "$runner_home" "$agent_home"
+  chown -R "$owner:$owner" "$ws" "$runner_home" "$work/remote"
+  chmod 700 "$ws"
+  printf '%s' "$work/$label.git-uids" > "$work/ctl/git_uid_log"
+  printf '%s' "$work/$label.gh-uids" > "$work/ctl/gh_uid_log"
+  printf '%s' "$work/$label.git-creds" > "$work/ctl/git_cred_log"
+  : > "$work/$label.git-uids"; : > "$work/$label.gh-uids"; : > "$work/$label.git-creds"
+  chmod 666 "$work/$label.git-uids" "$work/$label.gh-uids" "$work/$label.git-creds"
+  : > "$work/ctl/git_home_log"; : > "$work/ctl/gh_home_log"
+  : > "$agent_log"; chmod 666 "$agent_log"
+  start_fixture
+  queue_job "h-$label" acme/app
+  jq '.[0].failure_kinds = ["provider_refused"]' "$work/queue.json" > "$work/queue.next" && mv "$work/queue.next" "$work/queue.json"
+  local briefs_before
+  briefs_before="$(jq -c 'select(.path | endswith("/brief"))' "$work/requests.jsonl" | wc -l)"
+  ( until [ "$(jq -c 'select(.path | endswith("/brief"))' "$work/requests.jsonl" | wc -l)" -gt "$briefs_before" ]; do sleep 0.02; done
+    while :; do setpriv --reuid="$agent_uid" --regid="$agent_uid" --clear-groups sleep 6 </dev/null >/dev/null 2>&1 & sleep 0.01; done ) &
+  local spawner=$!
+  survivors+=("$spawner")
+  local rc=0
+  timeout 120 setpriv --groups=20001,20002 -- env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" \
+    SRE_MODEL_FALLBACK="openai/gpt-5" SRE_MODEL_FALLBACK_KEY="$(printf 'sk-second-fixture-%048d' 5)" STUB_SECOND_MODEL="openai/gpt-5" STUB_OPENCODE_SECOND_MODE=fix \
+    SRE_WORKSPACE="$ws" SRE_GITHUB_TOKEN="$github_token" SRE_RUN_TIMEOUT_SECONDS=300 \
+    SRE_RUNNER_UID="$owner" SRE_RUNNER_GID="$owner" SRE_RUNNER_HOME="$runner_home" \
+    SRE_AGENT_UID="$agent_uid" SRE_AGENT_GID="$agent_uid" SRE_AGENT_HOME="$agent_home" \
+    HOME="$runner_home" STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_LOG="$agent_log" STUB_PROBE_GIT="$real_git" \
+    node "$runner" > "$out" 2>&1 || rc=$?
+  stop_fixture
+  kill "$spawner" 2>/dev/null || true
+  local report
+  report="$(jq -c 'select(.path | endswith("/h-'"$label"'/report")) | .body' "$work/requests.jsonl" | tail -n 1)"
+  if [ "$rc" -eq 0 ] && jq -e '.failure.kind == "processes_survived" and .evidence.agent_processes_survived == true and (has("pr_url") | not) and (.evidence | has("fallback_used") | not)' <<<"$report" >/dev/null; then echo "ok   $label: the request fails as processes_survived and names no second run"; else echo "FAIL $label: rc=$rc report=$report"; fail=1; fi
+  if [ "$(grep -c '^argv: ' "$agent_log")" = "1" ]; then echo "ok   $label: the agent ran once"; else echo "FAIL $label: runs=$(grep -c '^argv: ' "$agent_log")"; fail=1; fi
+}
+
+prove_survivor_second_model
+
 # The same loop already running when the runner starts: the start ends what it
 # can, and a worker that cannot end everything refuses to take a request.
 prove_survivor_at_start() {

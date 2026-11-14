@@ -96,7 +96,7 @@ function scriptTable() {
 
 async function main() {
   const runner = load().runner;
-  const { providerKeyVariable, runEnvForModel } = runner.internals;
+  const { providerKeyVariable, runEnvForModel, secondModelDecision } = runner.internals;
 
   await check('the table is the script\'s: every pair, the same variables in the same order', async () => {
     const { names, prefixes } = scriptTable();
@@ -266,6 +266,153 @@ async function main() {
     const answer = load({ SRE_MODEL_FALLBACK: 'openai/gpt-5', SRE_MODEL_FALLBACK_KEY: 'first-half-of-it\nsecond-half-of-it' });
     assert.equal(answer.error.fatal, true);
     assert.equal(answer.error.message, 'SRE_MODEL_FALLBACK_KEY has a line break inside its value, so it cannot be one secret; set it again as a single line (the value is not printed)');
+  });
+
+  await check('secondModelDecision: every condition, one at a time', async () => {
+    const config = { fallbackModel: 'openai/gpt-5', runTimeoutMs: 1_800_000 };
+    const refusal = { class: 'billing', status: 400, message: 'm' };
+    const first = { toolNames: ['read', 'glob', 'grep', 'list'], toolNamesOverflow: false };
+    const startedAt = 1_000_000;
+    const base = { config, first, refusal, quiet: true, startedAt, now: startedAt + 1000 };
+    assert.deepEqual(secondModelDecision(base), { try: true, notTried: null });
+    assert.deepEqual(secondModelDecision({ ...base, first: { toolNames: [], toolNamesOverflow: false } }), { try: true, notTried: null }, 'a run that used no tool');
+    assert.deepEqual(secondModelDecision({ ...base, refusal: null }), { try: false, notTried: null }, 'not refused');
+    assert.deepEqual(secondModelDecision({ ...base, config: { ...config, fallbackModel: null } }), { try: false, notTried: null }, 'no second model');
+    assert.deepEqual(secondModelDecision({ ...base, quiet: false }), { try: false, notTried: null }, 'processes of the agent are left');
+    for (const tool of ['edit', 'write', 'bash', 'patch', 'webfetch', 'task', '(unnamed)']) {
+      assert.deepEqual(secondModelDecision({ ...base, first: { toolNames: ['read', tool], toolNamesOverflow: false } }), { try: false, notTried: 'changed' }, tool);
+    }
+    assert.deepEqual(secondModelDecision({ ...base, first: { toolNames: ['read'], toolNamesOverflow: true } }), { try: false, notTried: 'changed' }, 'more tools than were counted');
+    const left = (milliseconds) => ({ ...base, now: startedAt + config.runTimeoutMs - milliseconds });
+    assert.deepEqual(secondModelDecision(left(119_999)), { try: false, notTried: 'time' }, 'just under two minutes left');
+    assert.deepEqual(secondModelDecision(left(120_000)), { try: true, notTried: null }, 'exactly two minutes left');
+    assert.deepEqual(secondModelDecision(left(600_000)), { try: true, notTried: null });
+    assert.deepEqual(secondModelDecision({ ...left(60_000), first: { toolNames: ['bash'], toolNamesOverflow: false } }), { try: false, notTried: 'changed' }, 'a tool is told before the time');
+    assert.deepEqual(secondModelDecision({ ...base, config: { ...config, runTimeoutMs: 100_000 } }), { try: false, notTried: 'time' }, 'a run limit under two minutes never has room');
+  });
+
+  await check('workspaceUnchanged: the checkout is the base commit, byte for byte, and nothing else of the agent\'s is left', async () => {
+    const { workspaceUnchanged, setIdentity, openMemory } = runner.internals;
+    setIdentity({ mode: 'none', runner: null, agent: null });
+    const git = (cwd, ...args) => {
+      const done = spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
+      assert.equal(done.status, 0, `git ${args.join(' ')}: ${done.stderr}`);
+      return done.stdout.trim();
+    };
+    // A checkout the way the runner makes one: the git directory is a separate one the
+    // agent never holds, the tree is only files, the base commit is what HEAD is.
+    const make = (label) => {
+      const root = path.join(work, `proof-${label}`);
+      const dir = path.join(root, 'tree');
+      const gitdir = path.join(root, 'gitdir');
+      fs.mkdirSync(dir, { recursive: true });
+      git(dir, 'init', '-q', '-b', 'main', `--separate-git-dir=${gitdir}`);
+      fs.rmSync(path.join(dir, '.git'), { force: true });
+      fs.writeFileSync(path.join(dir, 'README.md'), 'the repository\n');
+      fs.writeFileSync(path.join(dir, '.gitignore'), 'cache/\n');
+      fs.writeFileSync(path.join(dir, 'opencode.json'), '{}\n');
+      fs.mkdirSync(path.join(dir, 'src'));
+      fs.writeFileSync(path.join(dir, 'src', 'app.txt'), 'app\n');
+      const named = (...args) => git(dir, `--git-dir=${gitdir}`, `--work-tree=${dir}`, ...args);
+      named('add', '-A');
+      named('commit', '-q', '-m', 'base');
+      const baseSha = named('rev-parse', 'HEAD');
+      // The runner takes the repository's own opencode configuration out of the tree and marks it so.
+      named('update-index', '--skip-worktree', 'opencode.json');
+      fs.rmSync(path.join(dir, 'opencode.json'));
+      fs.mkdirSync(path.join(dir, '.opencode', 'agents'), { recursive: true });
+      fs.writeFileSync(path.join(dir, '.opencode', 'agents', 'sre-fix.md'), 'the agent\n');
+      const workspace = { dir, gitdir, cleanUrl: 'https://github.com/acme/app.git', baseSha, repo: { owner: 'acme', name: 'app', fullName: 'acme/app' } };
+      return { workspace, dir, named };
+    };
+    const unchanged = (made, mem = null) => workspaceUnchanged(made.workspace, mem, made.workspace.repo);
+
+    const clean = make('clean');
+    assert.equal(await unchanged(clean), true, 'the base tree, with the runner\'s own files, is unchanged');
+    assert.equal(await unchanged(clean), true, 'and asking again changes nothing');
+    assert.equal(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith('sre-agent-proof-')).length, 0, 'the throwaway index is removed');
+
+    const touched = make('touched');
+    fs.utimesSync(path.join(touched.dir, 'README.md'), new Date(), new Date(Date.now() + 5000));
+    assert.equal(await unchanged(touched), true, 'a file whose time moved and whose bytes did not is unchanged');
+
+    const cases = {
+      'an edited file': (m) => fs.appendFileSync(path.join(m.dir, 'README.md'), 'one more line\n'),
+      'a new file': (m) => fs.writeFileSync(path.join(m.dir, 'new.txt'), 'x\n'),
+      'a deleted file': (m) => fs.rmSync(path.join(m.dir, 'src', 'app.txt')),
+      'a changed mode': (m) => fs.chmodSync(path.join(m.dir, 'README.md'), 0o755),
+      'a file under an ignored path': (m) => {
+        fs.mkdirSync(path.join(m.dir, 'cache'));
+        fs.writeFileSync(path.join(m.dir, 'cache', 'out.txt'), 'x\n');
+      },
+      'a file under a path the git directory ignores': (m) => {
+        fs.appendFileSync(path.join(m.workspace.gitdir, 'info', 'exclude'), 'build/\n');
+        fs.mkdirSync(path.join(m.dir, 'build'));
+        fs.writeFileSync(path.join(m.dir, 'build', 'out.txt'), 'x\n');
+      },
+      'an empty directory\'s file in a new place': (m) => {
+        fs.mkdirSync(path.join(m.dir, 'deep', 'er'), { recursive: true });
+        fs.writeFileSync(path.join(m.dir, 'deep', 'er', 'file'), 'x\n');
+      },
+      'a file in the base replaced by a link': (m) => {
+        fs.rmSync(path.join(m.dir, 'README.md'));
+        fs.symlinkSync('/etc/hostname', path.join(m.dir, 'README.md'));
+      },
+      'a nested repository': (m) => {
+        fs.mkdirSync(path.join(m.dir, 'sub'));
+        git(path.join(m.dir, 'sub'), 'init', '-q');
+      },
+    };
+    for (const [label, change] of Object.entries(cases)) {
+      const made = make(label.replace(/[^a-z]+/g, '-'));
+      change(made);
+      assert.equal(await unchanged(made), false, label);
+    }
+
+    const staged = make('staged');
+    fs.writeFileSync(path.join(staged.dir, 'new.txt'), 'x\n');
+    staged.named('add', 'new.txt');
+    assert.equal(await unchanged(staged), false, 'an index that differs from the base commit is a difference');
+
+    const moved = make('moved');
+    moved.workspace.baseSha = '0'.repeat(40);
+    assert.equal(await unchanged(moved), false, 'a base commit that is not HEAD of the runner\'s git directory');
+
+    const memoryOf = (label, files) => {
+      const config = { layout: { memory: path.join(work, `memory-${label}`) } };
+      fs.mkdirSync(config.layout.memory, { recursive: true });
+      const dir = path.join(config.layout.memory, 'acme', 'app');
+      fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+      for (const [rel, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, rel), body);
+      return config;
+    };
+    const withMemory = async (label, change) => {
+      const made = make(`memory-${label}`);
+      const config = memoryOf(label, { 'NOTES.md': 'the notes of an earlier run\n', 'scripts/check.sh': '#!/bin/sh\n# checks\n' });
+      const mem = openMemory(config, made.workspace, made.workspace.repo);
+      if (change) change(mem);
+      return unchanged(made, mem);
+    };
+    assert.equal(await withMemory('same', null), true, 'a memory copy as it was handed over');
+    assert.equal(await withMemory('edit', (mem) => fs.appendFileSync(path.join(mem.copy, 'NOTES.md'), 'a new note\n')), false, 'an edited note');
+    assert.equal(await withMemory('script', (mem) => fs.writeFileSync(path.join(mem.copy, 'scripts', 'new.sh'), '#!/bin/sh\n')), false, 'a new script');
+    assert.equal(await withMemory('removed', (mem) => fs.rmSync(path.join(mem.copy, 'scripts', 'check.sh'))), false, 'a removed script');
+    assert.equal(await withMemory('mode', (mem) => fs.chmodSync(path.join(mem.copy, 'scripts', 'check.sh'), 0o755)), false, 'a changed mode');
+    assert.equal(await withMemory('link', (mem) => fs.symlinkSync('/etc/passwd', path.join(mem.copy, 'scripts', 'link.sh'))), false, 'a link');
+    assert.equal(await withMemory('stray', (mem) => fs.writeFileSync(path.join(mem.copy, 'stray.txt'), 'x\n')), false, 'a file that is neither notes nor a script');
+    assert.equal(await withMemory('gone', (mem) => fs.rmSync(mem.copy, { recursive: true, force: true })), false, 'a memory copy that is gone');
+    assert.equal(await withMemory('replaced', (mem) => {
+      fs.rmSync(mem.copy, { recursive: true, force: true });
+      fs.symlinkSync('/etc', mem.copy);
+    }), false, 'a memory copy replaced by a link');
+
+    const scratch = path.join(work, 'scratch');
+    fs.mkdirSync(path.join(scratch, '.opencode'), { recursive: true });
+    fs.mkdirSync(path.join(scratch, '.sre-agent-memory'));
+    const none = { dir: scratch, gitdir: null, repo: null, branch: null, defaultBranch: null, cleanUrl: null };
+    assert.equal(await workspaceUnchanged(none, null, null), true, 'a scratch directory with only the runner\'s own entries');
+    fs.writeFileSync(path.join(scratch, 'notes.txt'), 'x\n');
+    assert.equal(await workspaceUnchanged(none, null, null), false, 'a scratch directory with a file the agent made');
   });
 
   if (failed > 0) {

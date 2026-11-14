@@ -340,7 +340,7 @@ run_once() {
   # The image's entrypoint is a bash script, so the runner carries the
   # container's own PWD; this hands it one that names no workspace, the
   # starting point opencode must not resolve a run's project from.
-  timeout 120 env SRE_ONCE=1 \
+  timeout "${case_wall:-120}" env SRE_ONCE=1 \
     PWD="$work" \
     SRE_SERVER_URL="$server_url" \
     SRE_API_KEY="$runner_api_key" \
@@ -3735,6 +3735,163 @@ if grep -qx "env_ANTHROPIC_API_KEY: $anthropic_key" "$opencode_log" && grep -qx 
 if grep -qx 'sees_SRE_MODEL_FALLBACK: no' "$opencode_log" && grep -qx "model: $first_model" "$opencode_log"; then echo "ok   neither second model variable reaches the agent, and the run names its model"; else echo "FAIL log: $(grep -E '^(sees_SRE_MODEL|model:)' "$opencode_log")"; fail=1; fi
 if ! grep -qF "$second_key" "$opencode_log" "$out" "$fixture_log"; then echo "ok   the second key is in no log line, no recording of the agent and no request"; else echo "FAIL the second key leaked"; fail=1; fi
 stop_fixture
+
+# One request whose first model is refused, with the second model configured and
+# the case's job listing failure_kinds. $1 names the case, $2 the first run's stub
+# mode, $3 the second run's. A second run needs two minutes of the run's time, so
+# the limit is raised for it. The caller reads $report, $out and the logs, and
+# stops the fixture.
+second_run_case() {
+  local label="$1" first="$2" second="$3"
+  start_fixture "$label"
+  queue_one "h-$label" acme/app "" "$refused_kinds"
+  export STUB_OPENCODE_MODE="$first" STUB_OPENCODE_SECOND_MODE="$second" STUB_RECORD_ENV="ANTHROPIC_API_KEY OPENAI_API_KEY"
+  run_timeout=300
+  with_second_model run_once "$label"
+  run_timeout=60
+  export STUB_OPENCODE_MODE=fix
+  unset STUB_OPENCODE_SECOND_MODE STUB_RECORD_ENV
+}
+runs_of() { grep -c '^argv: ' "$opencode_log" || true; }
+first_blocks='{class: "billing", status: 400, model: $first, message: $words}'
+footer="Made with this runner's second model, ${second_model}, because the first, ${first_model}, was refused."
+
+echo "--- 140. a refusal before anything changed runs the second model, which opens the pull request ---"
+second_run_case second_fix provider_billing_after_read fix
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ]; then echo "ok   two runs, and the runner exits 0"; else echo "FAIL rc=$rc runs=$(runs_of): $(tail -n 5 "$out")"; fail=1; fi
+if [ "$(grep '^model: ' "$opencode_log" | tr '\n' ' ')" = "model: $first_model model: $second_model " ]; then echo "ok   the first run is started with the first model and the second with the second"; else echo "FAIL models: $(grep '^model: ' "$opencode_log")"; fail=1; fi
+if [ "$(grep '^provider_keys: ' "$opencode_log" | tr '\n' ';')" = "provider_keys: ANTHROPIC_API_KEY;provider_keys: OPENAI_API_KEY;" ] && grep -qx "env_OPENAI_API_KEY: $second_key" "$opencode_log"; then echo "ok   each run holds one provider key, and the second run's is the second model's key"; else echo "FAIL keys: $(grep -E '^(provider_keys|env_)' "$opencode_log" | tr '\n' ';')"; fail=1; fi
+if jq -e --arg u "$pr_url" '.pr_url == $u and (has("failure") | not) and .outcome == "not_validated"' <<<"$report" >/dev/null; then echo "ok   the report is a pull request with no failure"; else echo "FAIL report: $report"; fail=1; fi
+if jq -e --arg a "$first_model" --arg b "$second_model" '.evidence.fallback_used == true and .evidence.models == [{model: $a, outcome: "refused", class: "billing"}, {model: $b, outcome: "ran"}]' <<<"$report" >/dev/null; then echo "ok   the evidence says the second model was used and lists both models"; else echo "FAIL evidence: $(jq -c '.evidence' <<<"$report")"; fail=1; fi
+if jq -e --arg first "$first_model" --arg words "$credit_words" ".evidence.first_refusal == ${first_blocks}" <<<"$report" >/dev/null; then echo "ok   evidence.first_refusal is the first model's block, with the provider's words"; else echo "FAIL first_refusal: $(jq -c '.evidence.first_refusal' <<<"$report")"; fail=1; fi
+if jq -e --arg a "$first_model" --arg b "$second_model" '.actions | index("the first model (" + $a + ") was refused before anything was changed (billing), so the run was started again with the second model (" + $b + ")")' <<<"$report" >/dev/null; then echo "ok   the actions say why the run was started again"; else echo "FAIL actions: $(jq -c '.actions' <<<"$report")"; fi
+footer_line="$(grep -nxF -- "$footer" "$gh_body" | head -n 1 | cut -d: -f1)"; marker_line="$(grep -nF -- "$marker" "$gh_body" | head -n 1 | cut -d: -f1)"
+if [ "$(grep -cxF -- "$footer" "$gh_body")" = "1" ] && [ -n "$footer_line" ] && [ -n "$marker_line" ] && [ "$footer_line" -lt "$marker_line" ]; then echo "ok   the pull request's body carries the second model sentence once, before the markers"; else echo "FAIL body: $(cat "$gh_body")"; fail=1; fi
+if grep -q "handoff h-second_fix: the first model was refused (billing) before anything was changed; starting the second model, $second_model, with " "$out" && grep -q "handoff h-second_fix: the AI provider refused the request (billing, HTTP 400) (first model)" "$out"; then echo "ok   the log names the refusal and the second model, and no provider words"; else echo "FAIL log: $(grep 'h-second_fix' "$out")"; fail=1; fi
+if ! grep -qF "$credit_words" "$out"; then echo "ok   the runner logs none of the provider's words"; else echo "FAIL the provider's words were logged"; fail=1; fi
+stop_fixture
+
+echo "--- 141. both models refused: both blocks, the second as the failure, nothing published ---"
+second_run_case second_both provider_billing_after_read provider_quota
+quota_words='Too many requests'
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ] && [ "$(count_path /report)" = "1" ]; then echo "ok   exactly two runs and one report"; else echo "FAIL rc=$rc runs=$(runs_of) reports=$(count_path /report)"; fail=1; fi
+if jq -e --arg b "$second_model" --arg w "$quota_words" '.failure.kind == "provider_refused" and .failure.provider.class == "quota" and .failure.provider.message == $w and .failure.provider.model == $b and (.failure.provider | has("changed_before_refusal") | not)' <<<"$report" >/dev/null; then echo "ok   failure.provider is the second model's refusal"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+if jq -e --arg a "$first_model" --arg b "$second_model" --arg w "$credit_words" '.failure.refusals == [{class: "billing", status: 400, model: $a, message: $w}, .failure.provider] and (.failure.refusals | map(.class) == ["billing", "quota"]) and .failure.refusals[1].model == $b' <<<"$report" >/dev/null; then echo "ok   failure.refusals is the first refusal and then the second"; else echo "FAIL refusals: $(jq -c '.failure.refusals' <<<"$report")"; fail=1; fi
+if jq -e --arg a "$first_model" --arg b "$second_model" '.evidence.models == [{model: $a, outcome: "refused", class: "billing"}, {model: $b, outcome: "refused", class: "quota"}] and .evidence.fallback_used == true and (.evidence | has("first_refusal") | not)' <<<"$report" >/dev/null; then echo "ok   both models are refused in the evidence, with no first_refusal"; else echo "FAIL evidence: $(jq -c '.evidence' <<<"$report")"; fail=1; fi
+if jq -e '.summary == "Both of this runner'"'"'s models were refused, so nothing was published." and (has("pr_url") | not)' <<<"$report" >/dev/null; then echo "ok   the summary says both were refused, and no pull request was opened"; else echo "FAIL summary: $(jq -c '[.summary, .pr_url]' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture second_both_agent_exit
+queue_one h-second-both-agent-exit acme/app
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=provider_quota
+run_timeout=300
+with_second_model run_once second_both_agent_exit
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+if jq -e '.failure.kind == "agent_exit" and (.failure.refusals | length) == 2 and .failure.provider.class == "quota"' <<<"$report" >/dev/null; then echo "ok   a job that does not list provider_refused gets agent_exit with the same blocks"; else echo "FAIL failure: $(jq -c '.failure' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 142. a tool that can change the checkout means no second run ---"
+for mode in provider_billing_after_edit provider_billing_after_bash; do
+  second_run_case "second_$mode" "$mode" fix
+  if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ]; then echo "ok   $mode: one run"; else echo "FAIL $mode: rc=$rc runs=$(runs_of)"; fail=1; fi
+  if jq -e --arg a "$first_model" '.failure.kind == "provider_refused" and .failure.provider.class == "billing" and .failure.provider.model == $a and .failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed" and (.failure | has("refusals") | not) and (.evidence | has("fallback_used") | not)' <<<"$report" >/dev/null; then echo "ok   $mode: the refusal says it came after a change, and the second model was not tried"; else echo "FAIL $mode: $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+  if jq -e '.summary | endswith("The second model was not tried, because the first had already run a tool that can change the checkout.")' <<<"$report" >/dev/null; then echo "ok   $mode: the summary ends with the sentence"; else echo "FAIL $mode summary: $(jq -c '.summary' <<<"$report")"; fail=1; fi
+  stop_fixture
+done
+
+echo "--- 143. a change the event stream did not show means no second run ---"
+ignored_gitdir="$workspace/gitdirs/acme/app"
+printf 'build/\n' >> "$ignored_gitdir/info/exclude"
+for mode in provider_billing_silent_change provider_billing_commit provider_billing_ignored_file; do
+  second_run_case "second_$mode" "$mode" fix
+  if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ]; then echo "ok   $mode: one run"; else echo "FAIL $mode: rc=$rc runs=$(runs_of)"; fail=1; fi
+  if jq -e '.failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed"' <<<"$report" >/dev/null; then echo "ok   $mode: reported as a refusal after a change"; else echo "FAIL $mode: $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+  stop_fixture
+done
+sed -i '/^build\/$/d' "$ignored_gitdir/info/exclude"
+
+echo "--- 144. a change to the memory copy means no second run ---"
+second_run_case second_memory provider_billing_memory fix
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed"' <<<"$report" >/dev/null; then echo "ok   one run, reported as a refusal after a change"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 145. with no agent account the processes proof is named, and a left process is the account split's case ---"
+second_run_case second_none provider_billing_after_read fix
+if grep -q 'with no agent account the proof its processes are gone is that opencode exited by itself after tools that start none' "$out"; then echo "ok   the decision line names the identity mode that has no process list"; else echo "FAIL log: $(grep 'h-second_none' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 146. too little time means no second run ---"
+start_fixture second_time
+queue_one h-second-time acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=fix
+run_timeout=100
+with_second_model run_once second_time
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.kind == "provider_refused" and .evidence.fallback_not_tried == "time" and (.failure.provider | has("changed_before_refusal") | not) and (.summary | endswith("The second model was not tried, because less than two minutes of SRE_RUN_TIMEOUT_SECONDS was left."))' <<<"$report" >/dev/null; then echo "ok   one run, the refusal is plain, and the report says the time was the reason"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence, .summary]' <<<"$report")"; fail=1; fi
+if grep -q 'handoff h-second-time: the second model was not tried (time)' "$out"; then echo "ok   the log says it"; else echo "FAIL log: $(grep 'h-second-time' "$out")"; fail=1; fi
+stop_fixture
+
+echo "--- 147. one second run at most, and the second run's own failure is reported as itself ---"
+second_run_case second_other provider_billing_after_read provider_then_other
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ]; then echo "ok   two runs and no third"; else echo "FAIL rc=$rc runs=$(runs_of)"; fail=1; fi
+if jq -e --arg a "$first_model" --arg b "$second_model" '.failure.kind == "agent_exit" and (.failure | has("provider") | not) and (.failure | has("refusals") | not) and .evidence.fallback_used == true and .evidence.first_refusal.class == "billing" and .evidence.models == [{model: $a, outcome: "refused", class: "billing"}, {model: $b, outcome: "ran"}]' <<<"$report" >/dev/null; then echo "ok   the second run failed for its own reason (agent_exit), and the first refusal is kept in the evidence"; else echo "FAIL report: $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture second_timed_out
+queue_one h-second-timed-out acme/app "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=hang STUB_OPENCODE_SLEEP=300
+run_timeout=124
+case_wall=240
+started_at="$(date +%s)"
+with_second_model run_once second_timed_out
+elapsed=$(( $(date +%s) - started_at ))
+run_timeout=60
+case_wall=120
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE STUB_OPENCODE_SLEEP
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ] && [ "$elapsed" -lt 150 ] && jq -e '.failure.kind == "timeout" and .evidence.fallback_used == true and .evidence.first_refusal.class == "billing" and (.summary | contains("SRE_RUN_TIMEOUT_SECONDS (124 seconds)"))' <<<"$report" >/dev/null; then echo "ok   a second run that passes the time left is a timeout, in ${elapsed} seconds, with the first refusal kept"; else echo "FAIL rc=$rc runs=$(runs_of) elapsed=$elapsed: $(jq -c '[.failure, .evidence.first_refusal, .summary]' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 148. a change on a pull request and a request with no repository follow the same rule ---"
+sha_second="$(make_branch feature/second-model)"
+start_fixture second_change
+queue_change h-second-change "$(push_change feature/second-model "$sha_second")"
+jq '.[0].failure_kinds = ["provider_refused"]' "$queue_file" > "$queue_file.next" && mv "$queue_file.next" "$queue_file"
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=fix
+run_timeout=300
+with_second_model run_once second_change
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+head_second="$(head_of feature/second-model)"
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ] && [ "$head_second" != "$sha_second" ] && jq -e --arg sha "$head_second" '.change == {result: "pushed", commit_sha: $sha} and .evidence.fallback_used == true and (has("failure") | not) and .evidence.first_refusal.class == "billing"' <<<"$report" >/dev/null; then echo "ok   a change refused by the first model is pushed by the second, and says so"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.change, .failure, .evidence]' <<<"$report") $(tail -n 4 "$out")"; fail=1; fi
+stop_fixture
+start_fixture second_untargeted
+queue_one h-second-untargeted "" "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_after_read STUB_OPENCODE_SECOND_MODE=diagnose
+run_timeout=300
+with_second_model run_once second_untargeted
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "2" ] && jq -e '(has("failure") | not) and (has("pr_url") | not) and (.summary | startswith("The failures come from the checkout service")) and .evidence.fallback_used == true' <<<"$report" >/dev/null; then echo "ok   a request that names no repository is answered with a diagnosis by the second model"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .summary, .evidence]' <<<"$report")"; fail=1; fi
+stop_fixture
+start_fixture second_untargeted_changed
+queue_one h-second-untargeted-changed "" "" "$refused_kinds"
+export STUB_OPENCODE_MODE=provider_billing_after_bash STUB_OPENCODE_SECOND_MODE=diagnose
+run_timeout=300
+with_second_model run_once second_untargeted_changed
+run_timeout=60
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+if [ "$rc" -eq 0 ] && [ "$(runs_of)" = "1" ] && jq -e '.failure.provider.changed_before_refusal == true and .evidence.fallback_not_tried == "changed"' <<<"$report" >/dev/null; then echo "ok   and one that used a shell is not run again"; else echo "FAIL rc=$rc runs=$(runs_of): $(jq -c '[.failure, .evidence]' <<<"$report")"; fail=1; fi
+stop_fixture
+
+echo "--- 140 to 148. no key value in any request, log line or recorded command line ---"
+if ! grep -qF -e "$second_key" -e "$anthropic_key" -e "$openai_key" "$work"/second_*.out "$work"/second_*.requests.jsonl "$work/git_argv.log" "$work/gh_argv.log" "$git_log" "$gh_log"; then echo "ok   neither provider key nor the second key appears anywhere the second model cases wrote"; else echo "FAIL a key leaked: $(grep -lF -e "$second_key" -e "$anthropic_key" -e "$openai_key" "$work"/second_*.out "$work"/second_*.requests.jsonl 2>/dev/null)"; fail=1; fi
+
 
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do

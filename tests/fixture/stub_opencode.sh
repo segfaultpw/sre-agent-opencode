@@ -323,6 +323,19 @@ emit() {
   jq -cn --arg t "$text" '{type: "text", timestamp: 0, sessionID: "stub", part: {type: "text", text: $t}}'
 }
 
+# One tool event, the way opencode's --format json stream shows a tool the run used.
+tool_event() {
+  jq -cn --arg t "$1" '{type: "tool_use", timestamp: 0, sessionID: "stub", part: {type: "tool", tool: $t, state: {status: "completed", input: {}, output: "x"}}}'
+}
+
+# What an account with no credit looks like to opencode: an APIError event
+# (HTTP 400, Anthropic's sentence) and a non-zero exit.
+billing_refusal() {
+  jq -cn --arg m "${STUB_PROVIDER_MESSAGE:-Your credit balance is too low to access the Anthropic API.}" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "APIError", data: {message: $m, statusCode: 400, isRetryable: false, responseBody: ({type: "error", error: {type: "invalid_request_error", message: $m}} | tojson)}}}'
+  echo "opencode: the provider refused the request" >&2
+  exit 1
+}
+
 case "$mode" in
   fix)
     printf 'a line the fix added\n' >> README.md
@@ -476,6 +489,57 @@ d.yml"
     jq -cn '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "ProviderAuthError", data: {message: "User not found."}}}'
     echo "opencode: the provider refused the key" >&2
     exit 1
+    ;;
+  provider_billing_after_read)
+    # A first run that only read, then was refused: the case a second model is for.
+    tool_event read
+    tool_event grep
+    billing_refusal
+    ;;
+  provider_billing_after_edit)
+    # Refused after an edit: the tool and the file both say something was changed.
+    tool_event edit
+    printf 'a line the first run added\n' >> README.md
+    billing_refusal
+    ;;
+  provider_billing_after_bash)
+    # Refused after a shell call: whatever it did, nothing here can judge it.
+    tool_event bash
+    billing_refusal
+    ;;
+  provider_billing_silent_change)
+    # The event stream shows only a read while the tree changed.
+    tool_event read
+    printf 'a line the first run added\n' >> README.md
+    billing_refusal
+    ;;
+  provider_billing_commit)
+    # Only a read in the stream, while the agent committed a change inside its
+    # own repository: the working files differ from the base all the same.
+    tool_event read
+    printf 'a line the first run committed\n' >> README.md
+    git="${STUB_PROBE_GIT:?}"
+    "$git" -c user.name=a -c user.email=a@example.invalid -c commit.gpgsign=false commit -q -a -m "a commit of the first run"
+    billing_refusal
+    ;;
+  provider_billing_ignored_file)
+    # A file under a path the repository ignores: git status alone would not list it.
+    tool_event read
+    mkdir -p build
+    printf 'x\n' > build/out.txt
+    billing_refusal
+    ;;
+  provider_billing_memory)
+    # The agent's notes changed while the stream shows only a read.
+    tool_event read
+    printf 'a note the first run added\n' >> .sre-agent-memory/NOTES.md
+    billing_refusal
+    ;;
+  provider_billing_daemon)
+    # A process of the agent's account left behind, with every descriptor closed so the run ends.
+    tool_event read
+    setsid sleep 60 </dev/null >/dev/null 2>&1 &
+    billing_refusal
     ;;
   provider_billing)
     # What an account with no credit looks like to opencode: an APIError event

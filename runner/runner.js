@@ -3916,22 +3916,140 @@ function providerRefusalOf(agent) {
   );
 }
 
-// evidence.models: which model ran and how it ended. One entry in this release;
-// the platform reads its presence as "this runner classifies its own failures".
-function modelsEvidence(config, refusal) {
-  const model = providerRefusal.cutBytes(oneLine(config.model, Infinity), PROVIDER_MODEL_MAX_BYTES);
-  return [refusal ? { model, outcome: 'refused', class: refusal.class } : { model, outcome: 'ran' }];
+// One run's entry in evidence.models: the model and how its run ended.
+function modelEntry(model, refusal) {
+  const name = providerRefusal.cutBytes(oneLine(model, Infinity), PROVIDER_MODEL_MAX_BYTES);
+  return refusal ? { model: name, outcome: 'refused', class: refusal.class } : { model: name, outcome: 'ran' };
+}
+
+// evidence.models: which model ran and how it ended, one entry for each run in
+// the order they ran (the first run, then the second when there was one); each
+// run is {model, refusal}, the refusal null for a run that was not refused. The
+// platform reads its presence as "this runner classifies its own failures".
+function modelsEvidence(runs) {
+  return runs.map(({ model, refusal }) => modelEntry(model, refusal));
 }
 
 // The failure's block for the platform: what the provider said, in its own
-// words, scrubbed. The model is the one that was refused.
-function providerBlock(config, refusal) {
+// words, scrubbed. The model is the one of the run that was refused.
+function providerBlock(refusal, model) {
   return {
     class: refusal.class,
     status: refusal.status,
-    model: modelsEvidence(config, refusal)[0].model,
+    model: modelEntry(model, refusal).model,
     message: refusal.message,
   };
+}
+
+// The tools that only read. A tool outside this set can change the checkout or
+// reach outside it (a shell most of all, whose effects nothing can judge), so
+// a run that used one is never followed by a second model.
+const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list']);
+// The least time a second run is started with: opencode's start, the clone of
+// the agent's repository and one model round trip. A technical floor, not a
+// product limit, so it is a constant and not a setting.
+const FALLBACK_MIN_RUN_MS = 120_000;
+
+// Whether the run used a tool that can change something, or used more distinct
+// tools than were counted (which cannot be told apart from one that did).
+function changedByTools(agent) {
+  if (!agent || agent.toolNamesOverflow) return true;
+  return (agent.toolNames || []).some((name) => !READ_ONLY_TOOLS.has(name));
+}
+
+// Whether to start the second model after the first run, with everything that is
+// known without looking at the checkout. {try, notTried}: notTried is 'changed'
+// when a tool outside the read-only set ran, 'time' when less than
+// FALLBACK_MIN_RUN_MS of the run's time is left, and null when there is nothing
+// to say (no second model, no refusal, or an agent account that still has
+// processes, which fails the request as it always did).
+//   first      the first run's result (runAgent)
+//   refusal    what providerRefusal.classify said about it
+//   quiet      whether reclaim ended every process of the agent's account
+//   startedAt  when the first run started, now: Date.now() values
+function secondModelDecision({ config, first, refusal, quiet, startedAt, now }) {
+  if (!config || !config.fallbackModel || !refusal) return { try: false, notTried: null };
+  if (!quiet) return { try: false, notTried: null };
+  if (changedByTools(first)) return { try: false, notTried: 'changed' };
+  if (config.runTimeoutMs - (now - startedAt) < FALLBACK_MIN_RUN_MS) return { try: false, notTried: 'time' };
+  return { try: true, notTried: null };
+}
+
+// What the runner puts nowhere of its own in the checkout, and git ignores.
+function runnerOwnEntry(file) {
+  return file === '.opencode' || file.startsWith('.opencode/') || file === MEMORY_COPY || file.startsWith(`${MEMORY_COPY}/`);
+}
+
+// Whether the checkout is exactly the base commit's tree, with nothing the
+// runner did not put there. Through a throwaway copy of the index of the
+// runner's OWN git directory (the agent's repository inside the tree is the
+// agent's: it can commit there, and `git status` of it proves nothing): the
+// copy is compared with the base commit, and status then reads every file's
+// content again against it, which is what is needed because the hand-back
+// changed every file's ctime. An untracked file, an ignored one and a file
+// changed in place are all differences. stageAndGate is never used for this: it
+// stages, which is destructive. A request that names no repository has no
+// repository; its scratch directory must hold nothing the runner did not write.
+async function treeIsTheBase(workspace, repo) {
+  if (!repo) {
+    return fs.readdirSync(workspace.dir).every(runnerOwnEntry);
+  }
+  resetGitDir(workspace.gitdir, workspace.cleanUrl);
+  excludeFromGit(workspace.gitdir, '.opencode/');
+  excludeFromGit(workspace.gitdir, `${MEMORY_COPY}/`);
+  const proof = fs.mkdtempSync(path.join(os.tmpdir(), 'sre-agent-proof-'));
+  try {
+    fs.chmodSync(proof, 0o700);
+    ownByRunner(proof);
+    const index = path.join(proof, 'index');
+    fs.copyFileSync(path.join(workspace.gitdir, 'index'), index);
+    fs.chmodSync(index, 0o600);
+    ownByRunner(index);
+    const env = { ...gitEnv(), GIT_INDEX_FILE: index };
+    const named = [...GIT_HARDENING, `--git-dir=${workspace.gitdir}`, `--work-tree=${workspace.dir}`];
+    const git = (args) => runProcess('git', [...named, ...args], { env, cwd: workspace.dir });
+    const head = await git(['rev-parse', 'HEAD']);
+    if (head.code !== 0 || head.stdout.trim() !== workspace.baseSha) return false;
+    const staged = await git(['diff-index', '--cached', '--quiet', workspace.baseSha]);
+    if (staged.code !== 0) return false;
+    const status = await git(['-c', 'core.quotePath=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching', '--no-renames']);
+    if (status.code !== 0) return false;
+    return status.stdout.split('\0').filter(Boolean).every((entry) => runnerOwnEntry(entry.slice(3).replace(/\/$/, '')));
+  } finally {
+    fs.rmSync(proof, { recursive: true, force: true });
+  }
+}
+
+// Whether the memory copy is what the runner put there, byte for byte: still a
+// directory, holding only files and directories, and a read-only snapshot of it
+// equal to the one taken before the run (enforce() is not called: it changes
+// the copy).
+function memoryIsAsHanded(mem) {
+  const stat = statOrNull(mem.copy);
+  if (!stat || !stat.isDirectory()) return false;
+  const stack = [mem.copy];
+  while (stack.length > 0) {
+    const dir = stack.pop();
+    for (const name of fs.readdirSync(dir)) {
+      const entry = fs.lstatSync(path.join(dir, name));
+      if (entry.isDirectory()) stack.push(path.join(dir, name));
+      else if (!entry.isFile()) return false;
+    }
+  }
+  return !memoryDiffers(mem.before, memory.snapshot(mem.copy));
+}
+
+// The proofs about the files, after reclaim took the checkout back: the tree is
+// the base commit's and the memory copy is as handed over. Anything that cannot
+// be read is a difference.
+async function workspaceUnchanged(workspace, mem, repo) {
+  try {
+    if (!(await treeIsTheBase(workspace, repo))) return false;
+    return mem ? memoryIsAsHanded(mem) : true;
+  } catch (error) {
+    log('warn', `the checkout could not be compared with the base commit (${oneLine(redact(error.message), 200)}), so it is read as changed`);
+    return false;
+  }
 }
 
 // Step 5. The gate. The fences are opencode's own tool gates and the agent
@@ -4162,14 +4280,42 @@ function replaceBodyFile(args, file) {
   return args.map((arg, index) => (args[index - 1] === '--body-file' ? file : arg));
 }
 
-function pullRequestBody(message, brief, version, reason) {
+// A model's name in a sentence of a pull request body: one line, and no backtick
+// that would open a code span.
+function modelLabel(model) {
+  return oneLine(model, PROVIDER_MODEL_MAX_BYTES).replace(/`/g, "'");
+}
+
+// The sentence a pull request made by the second model carries, so the person
+// who reviews it knows which model wrote it and why.
+function secondModelNote(config, firstRun) {
+  if (!firstRun) return null;
+  return `Made with this runner's second model, ${modelLabel(config.fallbackModel)}, because the first, ${modelLabel(config.model)}, was refused.`;
+}
+
+// `note` goes after the draft reason and before the markers, which stay last.
+function pullRequestBody(message, brief, version, reason, note = null) {
   const marker = (MARKER_PATTERN.exec(brief) || [])[0] || '';
   const stamp = `<!-- sre-agent-opencode:v${version} -->`;
   let tail = '';
   if (marker && !message.includes(marker)) tail += `${marker}\n`;
   if (!message.includes(stamp)) tail += `${stamp}\n`;
-  const text = reason ? `${message}\n\n${reason}` : message;
+  let text = reason ? `${message}\n\n${reason}` : message;
+  if (note) text = `${text}\n\n${note}`;
   return tail ? `${text}\n\n${tail}` : `${text}\n`;
+}
+
+// The same sentence in a body somebody else wrote (a replacement's): before the
+// trailing markers when it ends with them, else at its end.
+function withNote(body, note) {
+  if (!note) return body;
+  const lines = String(body).split('\n');
+  let end = lines.length;
+  while (end > 0 && (lines[end - 1].trim() === '' || /^<!--.*-->$/.test(lines[end - 1].trim()))) end -= 1;
+  const head = lines.slice(0, end).join('\n');
+  const tail = lines.slice(end).join('\n').replace(/^\n+/, '').replace(/\n+$/, '');
+  const middle = head === '' ? note : `${head}\n\n${note}`;
+  return tail ? `${middle}\n\n${tail}\n` : `${middle}\n`;
 }
 
 // The identity is set on the command rather than in the repository, because a
@@ -4204,7 +4350,7 @@ async function publish(config, workspace, message, brief, result, title, draft) 
   await gitIn(workspace, ['push', cleanUrl, `HEAD:refs/heads/${branch}`], runnerToken);
   result.actions.push(`pushed ${branch} to ${repo.fullName}`);
 
-  const body = writePullRequestBody(pullRequestBody(message, brief, config.version, draft.reason));
+  const body = writePullRequestBody(pullRequestBody(message, brief, config.version, draft.reason, workspace.secondModelNote));
   const bodyPath = body.file;
 
   const ghEnv = ghEnvFor(workspace, runnerToken);
@@ -4237,7 +4383,7 @@ async function publish(config, workspace, message, brief, result, title, draft) 
         // not opening the pull request at all would strand the work where nobody looks for it.
         let readyBody = null;
         if (draft.ci.length > 0) {
-          readyBody = writePullRequestBody(pullRequestBody(message, brief, config.version, readyAnyway(draft.ci)));
+          readyBody = writePullRequestBody(pullRequestBody(message, brief, config.version, readyAnyway(draft.ci), workspace.secondModelNote));
           log('warn', 'the change edits CI configuration, so the pull request body says it is open for review');
         }
         try {
@@ -4745,7 +4891,7 @@ async function carryOutReplacement(config, workspace, change, answer, signal) {
 
     stage = 'open';
     stillHeld(signal);
-    const body = writePullRequestBody(answer.body);
+    const body = writePullRequestBody(withNote(answer.body, workspace.secondModelNote));
     let created;
     try {
       const create = (draft) =>
@@ -5233,7 +5379,7 @@ async function runTestJob(config, job, heartbeat) {
       } finally {
         quiet = await reclaim(scratch.dir, home);
       }
-      result.evidence.models = modelsEvidence(config, null);
+      result.evidence.models = modelsEvidence([{ model: config.model, refusal: null }]);
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
       result.actions.push(`asked model ${config.model} for one line through opencode run, within ${seconds} second${seconds === 1 ? '' : 's'}`);
       if (!quiet) {
@@ -5241,7 +5387,7 @@ async function runTestJob(config, job, heartbeat) {
         return { ok: false, detail: 'a process of the agent\'s account started by the model call could not be ended' };
       }
       const verdict = modelVerdict(agent, timeoutMs);
-      if (verdict.refusal) result.evidence.models = modelsEvidence(config, verdict.refusal);
+      if (verdict.refusal) result.evidence.models = modelsEvidence([{ model: config.model, refusal: verdict.refusal }]);
       if (!verdict.ok && agent.opencodeLogLines !== null) result.evidence.opencode_log_lines = agent.opencodeLogLines;
       return verdict;
     });
@@ -5448,8 +5594,17 @@ async function handleJob(config, job, options = {}) {
       log('warn', `memory could not be prepared (${redact(error.message)}); the run goes ahead without it`);
     }
     let agent;
+    // Set when the second model ran: the first run's result and its refusal.
+    let firstRun = null;
+    // Why a second model that is configured was not started after a refusal:
+    // 'changed' or 'time', else null.
+    let notTried = null;
     let reclaimed = false;
     let agentProcessesEnded = true;
+    // Whether the first reclaim (before the second run is decided) found the
+    // agent's account quiet; a refusal that leaves processes behind is the
+    // failure it always was, whatever the second reclaim finds.
+    let firstQuiet = true;
     hookWorkspace = workspace.dir;
     // The agent's home for this repository, or for the estate; none without an
     // account split, where the process's own home stands.
@@ -5457,6 +5612,8 @@ async function handleJob(config, job, options = {}) {
     // Made while the tree is still the runner's: the bundle needs the runner's
     // git directory, and nothing of the agent's.
     const bundle = repo ? await makeBaseBundle(workspace) : null;
+    let secondBundle = null;
+    const hookNotes = new Set();
     try {
       hooksBegan = true;
       const prepared = await prepareRequestEnv(config, job, { workspace: workspace.dir, signal });
@@ -5464,7 +5621,47 @@ async function handleJob(config, job, options = {}) {
       if (repo) await initAgentRepository(workspace, bundle, home);
       if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
       progress.phase('agent');
-      agent = await runAgent(config, workspace.dir, mem ? `${memoryBlock(mem)}\n\n${brief}` : brief, { home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress });
+      const prompt = mem ? `${memoryBlock(mem)}\n\n${brief}` : brief;
+      const startedAt = Date.now();
+      agent = await runAgent(config, workspace.dir, prompt, { home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress, hookNotes });
+
+      // The second model: only for a provider refusal of the first run, and only
+      // when it is proven that the first run changed nothing. The proofs, in
+      // order: no tool outside the read-only set was used and the time is there
+      // (secondModelDecision); the agent's processes are gone (reclaim); the
+      // tree is the base commit's and the memory copy is as it was handed over
+      // (workspaceUnchanged). In an identity mode with no agent account
+      // (`none`), reclaim cannot see the agent's processes, so the proof there
+      // is that opencode exited by itself (a run the runner had to stop is
+      // never classified as a refusal) after tools that start none.
+      const refused = config.fallbackModel ? providerRefusalOf(agent) : null;
+      if (refused) {
+        log('warn', `handoff ${job.handoff_id}: the AI provider refused the request (${refused.class}${refused.status ? `, HTTP ${refused.status}` : ''}) (first model)`);
+        firstQuiet = await reclaim(workspace.dir, home);
+        let decision = secondModelDecision({ config, first: agent, refusal: refused, quiet: firstQuiet, startedAt, now: Date.now() });
+        if ((decision.try || decision.notTried === 'time') && !(await workspaceUnchanged(workspace, mem, repo))) {
+          decision = { try: false, notTried: 'changed' };
+        }
+        if (decision.try) {
+          stillHeld(signal);
+          const remainingMs = Math.max(1000, config.runTimeoutMs - (Date.now() - startedAt));
+          const mode = identity.mode === 'none' ? '; with no agent account the proof its processes are gone is that opencode exited by itself after tools that start none' : '';
+          log('info', `handoff ${job.handoff_id}: the first model was refused (${refused.class}) before anything was changed; starting the second model, ${config.fallbackModel}, with ${Math.floor(remainingMs / 1000)} seconds left${mode}`);
+          fs.rmSync(path.join(workspace.dir, '.opencode'), { recursive: true, force: true });
+          writeAgent(config, workspace.dir);
+          secondBundle = repo ? await makeBaseBundle(workspace) : null;
+          await handOver(workspace.dir, home);
+          if (repo) await initAgentRepository(workspace, secondBundle, home);
+          if (secondBundle) fs.rmSync(secondBundle.dir, { recursive: true, force: true });
+          secondBundle = null;
+          const first = agent;
+          agent = await runAgent(config, workspace.dir, prompt, { model: config.fallbackModel, second: true, timeoutMs: remainingMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress, hookNotes });
+          firstRun = { agent: first, refusal: refused };
+        } else if (decision.notTried) {
+          notTried = decision.notTried;
+          log('info', `handoff ${job.handoff_id}: the second model was not tried (${notTried})`);
+        }
+      }
     } finally {
       // Whatever happened, the agent's processes end and the checkout is the
       // runner's again before the runner reads or stages anything in it. A
@@ -5472,7 +5669,8 @@ async function handleJob(config, job, options = {}) {
       // copy is dropped unread.
       try {
         if (bundle) fs.rmSync(bundle.dir, { recursive: true, force: true });
-        agentProcessesEnded = await reclaim(workspace.dir, home);
+        if (secondBundle) fs.rmSync(secondBundle.dir, { recursive: true, force: true });
+        agentProcessesEnded = (await reclaim(workspace.dir, home)) && firstQuiet;
         reclaimed = true;
       } finally {
         if (mem && reclaimed) closeMemory(mem, result);
@@ -5490,9 +5688,23 @@ async function handleJob(config, job, options = {}) {
     // code and its tree are the stop's, not the agent's.
     stillHeld(signal);
     result.actions.push(`ran opencode with agent sre-fix and model ${config.model}`);
+    if (firstRun) {
+      result.actions.push(
+        `the first model (${config.model}) was refused before anything was changed (${firstRun.refusal.class}), so the run was started again with the second model (${config.fallbackModel})`
+      );
+      result.actions.push(`ran opencode with agent sre-fix and model ${config.fallbackModel}`);
+      result.evidence.fallback_used = true;
+      // A run the second model finished (or failed for its own reasons) keeps what
+      // the first provider said; a run both models refused tells it in the failure.
+      result.evidence.first_refusal = providerBlock(firstRun.refusal, config.model);
+      workspace.secondModelNote = secondModelNote(config, firstRun);
+    }
     result.evidence.agent_exit_code = agent.code;
     if (agent.errors.length > 0) result.evidence.agent_errors = errorsEvidence(agent.errors);
-    result.evidence.models = modelsEvidence(config, null);
+    const ranModels = (finalRefusal) => (firstRun
+      ? [{ model: config.model, refusal: firstRun.refusal }, { model: config.fallbackModel, refusal: finalRefusal }]
+      : [{ model: config.model, refusal: finalRefusal }]);
+    result.evidence.models = modelsEvidence(ranModels(null));
 
     if (!agentProcessesEnded) {
       // A process of the agent's account outlived every attempt to end it. It
@@ -5558,9 +5770,26 @@ async function handleJob(config, job, options = {}) {
       // the block goes to every platform, and an older one ignores it.
       const refusal = providerRefusalOf(agent);
       if (refusal) {
-        result.failure.provider = providerBlock(config, refusal);
-        result.evidence.models = modelsEvidence(config, refusal);
-        log('warn', `handoff ${job.handoff_id}: the AI provider refused the request (${refusal.class}${refusal.status ? `, HTTP ${refusal.status}` : ''})`);
+        result.failure.provider = providerBlock(refusal, agent.model);
+        result.evidence.models = modelsEvidence(ranModels(refusal));
+        if (firstRun) {
+          // Both models were refused: the platform reads the second as the one
+          // that ended the run and the pair as the whole story.
+          result.failure.refusals = [providerBlock(firstRun.refusal, config.model), result.failure.provider];
+          result.summary = 'Both of this runner\'s models were refused, so nothing was published.';
+          delete result.evidence.first_refusal;
+        } else if (notTried === 'changed') {
+          result.failure.provider.changed_before_refusal = true;
+          result.summary = `${result.summary} The second model was not tried, because the first had already run a tool that can change the checkout.`;
+          result.evidence.fallback_not_tried = notTried;
+        } else if (notTried === 'time') {
+          result.summary = `${result.summary} The second model was not tried, because less than two minutes of SRE_RUN_TIMEOUT_SECONDS was left.`;
+          result.evidence.fallback_not_tried = notTried;
+        }
+        // The first model's refusal was told when it was seen, if a second model was configured.
+        if (firstRun || !config.fallbackModel) {
+          log('warn', `handoff ${job.handoff_id}: the AI provider refused the request (${refusal.class}${refusal.status ? `, HTTP ${refusal.status}` : ''})${firstRun ? ' (second model)' : ''}`);
+        }
       }
       return result;
     }
@@ -6006,6 +6235,9 @@ module.exports = {
   internals: {
     providerKeyVariable,
     runEnvForModel,
+    secondModelDecision,
+    changedByTools,
+    workspaceUnchanged,
     poll,
     openMemory,
     closeMemory,
