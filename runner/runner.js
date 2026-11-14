@@ -66,6 +66,10 @@ const HEARTBEAT_RETRY_DIVISOR = 5;
 const FAILURE_DETAIL_MAX_BYTES = 500;
 // The platform drops a provider block whose model is longer than this.
 const PROVIDER_MODEL_MAX_BYTES = 200;
+// The tool names a run is judged by: more distinct names than this is "too many to say".
+const TOOL_NAMES_MAX = 64;
+// What a tool event with no usable name is called; it is outside the read-only set.
+const UNNAMED_TOOL = '(unnamed)';
 // The failure kind a platform that reads it asks to be sent (the job's
 // failure_kinds), and the one a platform that does not gets instead.
 const PROVIDER_REFUSED = 'provider_refused';
@@ -375,19 +379,49 @@ function readPackageFile(relative) {
 }
 
 // Every model provider key opencode reads, which is what scripts/provider_env.sh
-// maps a model prefix to (tests/provider_env_test.sh holds the two lists equal).
-// The runner passes its whole environment on to the agent, so these are trimmed
-// where they are read, like the runner's own secrets.
-const PROVIDER_KEY_VARIABLES = [
-  'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY', 'OPENROUTER_API_KEY', 'XAI_API_KEY',
-  'GROQ_API_KEY', 'MISTRAL_API_KEY', 'DEEPSEEK_API_KEY', 'TOGETHER_API_KEY', 'FIREWORKS_API_KEY',
-  'CEREBRAS_API_KEY', 'MOONSHOT_API_KEY', 'DEEPINFRA_API_KEY', 'HF_TOKEN', 'ZHIPU_API_KEY',
-  'MINIMAX_API_KEY', 'NVIDIA_API_KEY', 'OPENCODE_API_KEY', 'AI_GATEWAY_API_KEY',
-];
+// maps a model prefix to, pair for pair and in the same order
+// (tests/provider_env_test.sh and tests/second_model_test.js hold the two equal).
+// The runner passes its environment on to the agent, so these are trimmed where
+// they are read, like the runner's own secrets, and a run is given the one its
+// model reads and no other (runEnvForModel).
+const PROVIDER_KEY_TABLE = Object.freeze({
+  anthropic: 'ANTHROPIC_API_KEY',
+  openai: 'OPENAI_API_KEY',
+  google: 'GOOGLE_GENERATIVE_AI_API_KEY',
+  openrouter: 'OPENROUTER_API_KEY',
+  xai: 'XAI_API_KEY',
+  groq: 'GROQ_API_KEY',
+  mistral: 'MISTRAL_API_KEY',
+  deepseek: 'DEEPSEEK_API_KEY',
+  togetherai: 'TOGETHER_API_KEY',
+  'fireworks-ai': 'FIREWORKS_API_KEY',
+  cerebras: 'CEREBRAS_API_KEY',
+  moonshotai: 'MOONSHOT_API_KEY',
+  deepinfra: 'DEEPINFRA_API_KEY',
+  huggingface: 'HF_TOKEN',
+  zai: 'ZHIPU_API_KEY',
+  minimax: 'MINIMAX_API_KEY',
+  nvidia: 'NVIDIA_API_KEY',
+  opencode: 'OPENCODE_API_KEY',
+  vercel: 'AI_GATEWAY_API_KEY',
+});
+const PROVIDER_KEY_VARIABLES = Object.values(PROVIDER_KEY_TABLE);
 const SECRET_VARIABLES = [
   'SRE_API_KEY', 'SRE_GITHUB_TOKEN', 'SRE_AGENT_GITHUB_TOKEN',
-  'SRE_GITHUB_APP_ID', 'SRE_GITHUB_APP_PRIVATE_KEY', ...PROVIDER_KEY_VARIABLES,
+  'SRE_GITHUB_APP_ID', 'SRE_GITHUB_APP_PRIVATE_KEY', 'SRE_MODEL_FALLBACK_KEY', ...PROVIDER_KEY_VARIABLES,
 ];
+
+// The variable a model's provider key goes in: the prefix before the first
+// slash, looked up in the table. null for a prefix the table does not hold and
+// for anything that is not a provider/model string.
+function providerKeyVariable(model) {
+  if (typeof model !== 'string') return null;
+  const at = model.indexOf('/');
+  if (at <= 0) return null;
+  const prefix = model.slice(0, at);
+  return Object.prototype.hasOwnProperty.call(PROVIDER_KEY_TABLE, prefix) ? PROVIDER_KEY_TABLE[prefix] : null;
+}
+
 // The App's private key is the one secret that is many lines by design: a PEM
 // signs the JWT and never travels in a header, a command line or an argument,
 // so it keeps its internal line breaks and is trimmed of surrounding
@@ -419,12 +453,71 @@ function trimSecrets(env) {
   return changed;
 }
 
+// The second model is `provider/model` of a provider the table maps, so the
+// runner can tell which variable its key goes in; its key has its own variable
+// so it may be another account of the first model's provider.
+const SECOND_MODEL_FORM = /^[a-z0-9][a-z0-9-]*\/[^/\s]\S*$/;
+
+// The model this runner falls back to and the variable its key goes in, or null
+// when neither SRE_MODEL_FALLBACK nor SRE_MODEL_FALLBACK_KEY is set. Refuses the
+// start (fatal) for what it cannot honour; no sentence carries a key. Only the
+// second model's prefix is judged: refusing an unmapped first model would break
+// installs that work today.
+function loadSecondModel(env, primaryModel) {
+  const model = typeof env.SRE_MODEL_FALLBACK === 'string' ? env.SRE_MODEL_FALLBACK.trim() : '';
+  const key = typeof env.SRE_MODEL_FALLBACK_KEY === 'string' ? env.SRE_MODEL_FALLBACK_KEY : '';
+  if (model === '' && key === '') return null;
+  if (model === '' || key === '') {
+    throw fatal('SRE_MODEL_FALLBACK and SRE_MODEL_FALLBACK_KEY go together: set both to give the runner a second model, or neither (the key is not printed)');
+  }
+  if (!SECOND_MODEL_FORM.test(model)) {
+    throw fatal('SRE_MODEL_FALLBACK must be provider/model, for example openai/gpt-5');
+  }
+  const keyVariable = providerKeyVariable(model);
+  if (keyVariable === null) {
+    throw fatal(
+      `SRE_MODEL_FALLBACK names the provider prefix ${model.slice(0, model.indexOf('/'))}, which the runner does not map, so it cannot tell which variable its key goes in; use one of ${Object.keys(PROVIDER_KEY_TABLE).join(', ')}`
+    );
+  }
+  const first = String(primaryModel || '').trim();
+  const firstVariable = providerKeyVariable(first);
+  const firstKey = firstVariable && typeof env[firstVariable] === 'string' ? env[firstVariable] : '';
+  const sameKey = firstVariable === keyVariable && firstKey !== '' && firstKey === key;
+  if (model === first && sameKey) {
+    throw fatal(
+      'SRE_MODEL_FALLBACK is SRE_MODEL with the same key, so whatever refuses the first would refuse the second; give the second model another key or another model (the keys are not printed)'
+    );
+  }
+  return { model, keyVariable, sameKey };
+}
+
+// What the start says without refusing. Values of keys are never in them.
+function startWarnings(config, env, second) {
+  const lines = [];
+  if (second && env.SRE_HOOKS_DIR) {
+    lines.push(`a second model is configured (${second.model}); the start check of its key cannot see keys the credentials hook sets for a request`);
+  }
+  if (second && second.sameKey) {
+    lines.push(
+      'the second model uses the same key as the first, so a key, credit or quota refusal of the first will refuse the second too; it still helps when the first model is not found or rate limited'
+    );
+  }
+  if (config.primaryKeyVariable === null) {
+    const prefix = oneLine(String(config.model).split('/')[0], 60);
+    lines.push(
+      `SRE_MODEL's prefix ${prefix} is not one the runner maps, so its runs keep every provider key variable the runner holds; a mapped provider's run gets only its own key`
+    );
+  }
+  return lines;
+}
+
 function loadConfig() {
   const trimmed = trimSecrets(process.env);
   const missing = ['SRE_SERVER_URL', 'SRE_API_KEY', 'SRE_MODEL'].filter((name) => !process.env[name]);
   if (missing.length > 0) {
     throw fatal(`the runner needs ${missing.join(', ')} in its environment and will not start without it`);
   }
+  const second = loadSecondModel(process.env, process.env.SRE_MODEL);
 
   const timeoutSeconds = Number.parseInt(process.env.SRE_RUN_TIMEOUT_SECONDS || '1800', 10);
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
@@ -515,6 +608,11 @@ function loadConfig() {
     serverUrl: process.env.SRE_SERVER_URL.replace(/\/+$/, ''),
     apiKey: process.env.SRE_API_KEY,
     model: process.env.SRE_MODEL,
+    // The second model, tried when the first is refused before anything was
+    // changed, or null. Its key stays in process.env like every provider key.
+    fallbackModel: second ? second.model : null,
+    primaryKeyVariable: providerKeyVariable(process.env.SRE_MODEL),
+    fallbackKeyVariable: second ? second.keyVariable : null,
     workspace: process.env.SRE_WORKSPACE || '/workspace',
     // Where this instance works and where the memory lives: the split above.
     layout,
@@ -564,6 +662,7 @@ function loadConfig() {
   config.hooks = loadHookSettings(process.env, layout, hookAgents, identity.mode === 'root' ? identity.runner : null);
   hookSettings = config.hooks;
   registerConfigSecrets(config);
+  for (const line of startWarnings(config, process.env, second)) log('warn', line);
   credential = newCredential(config.serverUrl, config.apiKey);
   return config;
 }
@@ -583,6 +682,8 @@ function registerConfigSecrets(config) {
   for (const name of PROVIDER_KEY_VARIABLES) {
     if (process.env[name]) constantSecrets.push(process.env[name]);
   }
+  // The second model's key is held exactly like the first's.
+  if (process.env.SRE_MODEL_FALLBACK_KEY) constantSecrets.push(process.env.SRE_MODEL_FALLBACK_KEY);
 }
 
 // The credential the runner sends the queue with, and the state that renews it.
@@ -1220,7 +1321,11 @@ async function poll(config) {
   // does not know is never handed to it. A GET with a body is what the wire
   // contract says, and the length is spelled out so the body is framed whatever
   // the platform reads it with.
-  const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}`, capabilities: CAPABILITIES });
+  // The two models it will use, by name (never a key), so the platform can show
+  // them beside the instance; the second is null for a runner with none.
+  const modelName = (model) => providerRefusal.cutBytes(oneLine(model, Infinity), PROVIDER_MODEL_MAX_BYTES);
+  const models = { primary: modelName(config.model), fallback: config.fallbackModel ? modelName(config.fallbackModel) : null };
+  const body = JSON.stringify({ instance: config.instance, heartbeat: true, version: `v${config.version}`, capabilities: CAPABILITIES, models });
   let tokenRetries = 0;
   for (let attempt = 1; attempt <= POLL_ATTEMPTS; attempt += 1) {
     let response = null;
@@ -3522,12 +3627,49 @@ async function prepareRequestEnv(config, job, context) {
   return answer;
 }
 
+// The environment of one run: the base the runner built for the agent, with the
+// provider keys narrowed to the run's own. A model the table maps gets exactly one
+// provider key variable, the one its prefix names: the first model's from the
+// runner's environment, the second model's from SRE_MODEL_FALLBACK_KEY (the
+// variable it goes in may be the very one the first model reads, which is how
+// another account of the same provider is used). A model it does not map keeps
+// today's environment, every provider key the runner holds, because narrowing it
+// would break an install that works. What the credentials hook printed is applied
+// last: a provider key it printed for another variable than the run's is left out
+// (its name is pushed to options.leftOut), and the hook's value for the variable
+// both models read was set for the first run, so the second run keeps its own key.
+// SRE_MODEL_FALLBACK and its key never reach any agent. Pure: `env` is not changed.
+function runEnvForModel(env, model, config, extraEnv = {}, options = {}) {
+  const out = { ...env };
+  const fallbackKey = options.fallbackKey !== undefined ? options.fallbackKey : env.SRE_MODEL_FALLBACK_KEY;
+  delete out.SRE_MODEL_FALLBACK;
+  delete out.SRE_MODEL_FALLBACK_KEY;
+  const extra = extraEnv || {};
+  const variable = providerKeyVariable(model);
+  if (variable === null) return Object.assign(out, extra);
+  const firstVariable = providerKeyVariable(config && config.model);
+  const own = options.second ? fallbackKey : env[variable];
+  for (const name of PROVIDER_KEY_VARIABLES) delete out[name];
+  if (typeof own === 'string' && own !== '') out[variable] = own;
+  for (const [name, value] of Object.entries(extra)) {
+    if (PROVIDER_KEY_VARIABLES.includes(name)) {
+      if (name !== variable) {
+        if (options.leftOut) options.leftOut.push(name);
+        continue;
+      }
+      if (options.second && variable === firstVariable) continue;
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
 // Step 4. Run the agent, one shot, with the brief on stdin and the package's
 // fences handed over as opencode's configuration. The runner's own
 // credentials are stripped from the child's environment: the agent has a
 // shell, so anything left there is reachable, and it needs none of them.
 async function runAgent(config, workspace, prompt, options = {}) {
-  const env = {
+  let env = {
     ...process.env,
     OPENCODE_CONFIG_CONTENT: agentConfigContent(),
     // A binary that updated itself mid-run would be a different matcher
@@ -3622,12 +3764,24 @@ async function runAgent(config, workspace, prompt, options = {}) {
     }
   }
   // After every removal above: what the credentials hook printed is meant to
-  // reach the agent, AWS variables included, and its names were checked.
-  Object.assign(env, options.extraEnv || {});
+  // reach the agent, AWS variables included, and its names were checked. The
+  // run holds the one provider key its model reads, and neither variable of the
+  // second model, whichever run this is.
+  const model = options.model || config.model;
+  const leftOut = [];
+  env = runEnvForModel(env, model, config, options.extraEnv || {}, { second: Boolean(options.second), leftOut, fallbackKey: process.env.SRE_MODEL_FALLBACK_KEY });
+  delete env.SRE_MODEL_FALLBACK;
+  delete env.SRE_MODEL_FALLBACK_KEY;
+  const noted = options.hookNotes || new Set();
+  for (const name of leftOut) {
+    if (noted.has(name)) continue;
+    noted.add(name);
+    log('info', `the credentials hook set ${name}, which this run's model does not read, so it was left out of the run`);
+  }
 
   // No --auto: the configuration leaves no permission at ask, and an
   // unexpected one is rejected rather than approved.
-  const args = ['run', '--agent', 'sre-fix', '--model', config.model, '--format', 'json'];
+  const args = ['run', '--agent', 'sre-fix', '--model', model, '--format', 'json'];
   let result;
   try {
     result = await runProcess('opencode', args, {
@@ -3653,6 +3807,11 @@ async function runAgent(config, workspace, prompt, options = {}) {
   const errors = [];
   // What the classifier reads: the last error events of the run, structured.
   const errorEvents = [];
+  // The distinct tools the run used, by name: what decides whether a second
+  // model may be started after a refusal. More than the cap is "too many to
+  // say", which counts as a change.
+  const toolNames = [];
+  let toolNamesOverflow = false;
   for (const line of result.stdout.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed.startsWith('{')) continue;
@@ -3665,6 +3824,13 @@ async function runAgent(config, workspace, prompt, options = {}) {
     if (event.type === 'text' && event.part && typeof event.part.text === 'string') {
       const text = event.part.text.trim();
       if (text) texts.push(text);
+    }
+    if (event.type === 'tool_use') {
+      const name = event.part && typeof event.part.tool === 'string' && event.part.tool !== '' ? event.part.tool : UNNAMED_TOOL;
+      if (!toolNames.includes(name)) {
+        if (toolNames.length >= TOOL_NAMES_MAX) toolNamesOverflow = true;
+        else toolNames.push(name);
+      }
     }
     if (event.type === 'error') {
       const detail = (event.error && ((event.error.data && event.error.data.message) || event.error.name)) || 'unknown';
@@ -3681,6 +3847,9 @@ async function runAgent(config, workspace, prompt, options = {}) {
     finalMessage: texts.length > 0 ? texts[texts.length - 1] : '',
     errors,
     errorEvents,
+    toolNames,
+    toolNamesOverflow,
+    model,
     stderr: result.stderr,
     opencodeLogLines,
   };
@@ -5833,7 +6002,10 @@ module.exports = {
   startMemory,
   serveJob,
   PROVIDER_KEY_VARIABLES,
+  PROVIDER_KEY_TABLE,
   internals: {
+    providerKeyVariable,
+    runEnvForModel,
     poll,
     openMemory,
     closeMemory,

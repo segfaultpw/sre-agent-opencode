@@ -114,8 +114,20 @@ check "the runner's repository token is trimmed" test "$(jq -r '.githubToken' <<
 check "the agent's repository token is trimmed" test "$(jq -r '.agentGithubToken' <<<"$loaded")" = "$agent_token"
 check "the provider key the agent inherits is trimmed" test "$(jq -r '.provider' <<<"$loaded")" = "$provider_key"
 
+echo "--- 1c. the second model's key is trimmed, and is a held secret ---"
+second_key="$(printf 'sk-second-fixture-%048d' 5)"
+loaded_second="$(cd "$work" && env SRE_SERVER_URL="$server_url" SRE_API_KEY="$api_key" SRE_MODEL="$model" SRE_GITHUB_TOKEN="$github_token" OPENROUTER_API_KEY="$provider_key" \
+  SRE_MODEL_FALLBACK=" openai/gpt-5"$'\n' SRE_MODEL_FALLBACK_KEY=$'\t'"${second_key}"$'\r\n' node -e '
+    const runner = require(process.argv[1]);
+    const config = runner.loadConfig();
+    console.log(JSON.stringify({ key: process.env.SRE_MODEL_FALLBACK_KEY, model: config.fallbackModel, variable: config.fallbackKeyVariable, redacted: runner.internals.redact("the provider said " + process.env.SRE_MODEL_FALLBACK_KEY) }));
+  ' "$runner")"
+check "the second model's key is trimmed" test "$(jq -r '.key' <<<"$loaded_second")" = "$second_key"
+check "the second model is trimmed and mapped to its variable" test "$(jq -r '[.model, .variable] | join(" ")' <<<"$loaded_second")" = "openai/gpt-5 OPENAI_API_KEY"
+check "the trimmed key is removed from the runner's lines" test "$(jq -r '.redacted' <<<"$loaded_second")" = "the provider said [redacted]"
+
 echo "--- 2. a line break inside a secret is refused at start, and the value is never printed ---"
-for name in SRE_API_KEY SRE_GITHUB_TOKEN SRE_AGENT_GITHUB_TOKEN SRE_GITHUB_APP_ID OPENROUTER_API_KEY ANTHROPIC_API_KEY; do
+for name in SRE_API_KEY SRE_GITHUB_TOKEN SRE_AGENT_GITHUB_TOKEN SRE_GITHUB_APP_ID OPENROUTER_API_KEY ANTHROPIC_API_KEY SRE_MODEL_FALLBACK_KEY; do
   first="before-$(printf '%s' "$name" | tr -c 'A-Za-z' 'x')-break"
   second="after-$(printf '%s' "$name" | tr -c 'A-Za-z' 'x')-break"
   queue_one "h-inner-$name"

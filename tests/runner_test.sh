@@ -3691,6 +3691,51 @@ if [ -n "$raw_report" ] && [ -z "$surrogate_leaks" ] && jq -e '.evidence.agent_e
 if [ -n "$raw_report" ] && ! grep -qiP '\\ud[89a-f][0-9a-f]{2}' <<<"$raw_report" && grep -q 'the agent said' <<<"$raw_report"; then echo "ok   the report holds no lone surrogate escape, the summary's included"; else echo "FAIL a surrogate escape reached the report: $(grep -oiP '.{10}\\ud[89a-f][0-9a-f]{2}.{5}' <<<"$raw_report" | head -n 2)"; fail=1; fi
 stop_fixture
 
+# The second model: its key, and the keys of the other providers the runner holds,
+# assembled at run time like every key here.
+second_key="$(printf 'sk-second-fixture-%048d' 5)"
+anthropic_key="$(printf 'sk-ant-fixture-%048d' 4)"
+openai_key="$(printf 'sk-openai-fixture-%048d' 6)"
+second_model="openai/gpt-5"
+first_model="anthropic/claude-sonnet-4-5"
+# Runs one case with the first model set to $first_model, the two provider keys of
+# the runner and a second model, then puts the suite's model back.
+with_second_model() {
+  local saved_model="$model"
+  model="$first_model"
+  export ANTHROPIC_API_KEY="$anthropic_key" OPENAI_API_KEY="$openai_key" SRE_MODEL_FALLBACK="$second_model" SRE_MODEL_FALLBACK_KEY="$second_key" STUB_SECOND_MODEL="$second_model"
+  "$@"
+  model="$saved_model"
+  unset ANTHROPIC_API_KEY OPENAI_API_KEY SRE_MODEL_FALLBACK SRE_MODEL_FALLBACK_KEY STUB_SECOND_MODEL
+}
+
+echo "--- 138. a poll declares the two models, and never a key ---"
+start_fixture models_declared
+queue_none
+with_second_model run_once models_declared
+poll_body="$(jq -c 'select(.path == "/api/fix-runner/queue") | .body' "$fixture_log" | head -n 1)"
+if jq -e --arg a "$first_model" --arg b "$second_model" '.models == {primary: $a, fallback: $b}' <<<"$poll_body" >/dev/null; then echo "ok   the poll body carries models: the first model and the second"; else echo "FAIL poll body: $poll_body"; fail=1; fi
+if ! grep -qF -e "$second_key" -e "$anthropic_key" -e "$openai_key" "$fixture_log"; then echo "ok   no key value is in any request the platform received"; else echo "FAIL a key reached the platform"; fail=1; fi
+stop_fixture
+start_fixture models_single
+queue_none
+run_once models_single
+poll_body="$(jq -c 'select(.path == "/api/fix-runner/queue") | .body' "$fixture_log" | head -n 1)"
+if jq -e --arg a "$model" '.models == {primary: $a, fallback: null}' <<<"$poll_body" >/dev/null; then echo "ok   a runner with no second model declares fallback null"; else echo "FAIL poll body: $poll_body"; fail=1; fi
+stop_fixture
+
+echo "--- 139. each run holds one provider key, and never the second model's pair ---"
+start_fixture one_key
+queue_one h-one-key acme/app
+export STUB_RECORD_ENV="ANTHROPIC_API_KEY OPENAI_API_KEY"
+with_second_model run_once one_key
+unset STUB_RECORD_ENV
+if [ "$(grep -c '^provider_keys: ANTHROPIC_API_KEY$' "$opencode_log")" = "1" ] && ! grep -q '^provider_keys: .*OPENAI' "$opencode_log"; then echo "ok   the first run holds ANTHROPIC_API_KEY and no other provider key"; else echo "FAIL provider keys: $(grep -E '^provider_keys' "$opencode_log")"; fail=1; fi
+if grep -qx "env_ANTHROPIC_API_KEY: $anthropic_key" "$opencode_log" && grep -qx 'env_OPENAI_API_KEY: unset' "$opencode_log"; then echo "ok   it holds the first model's own key, and the other provider's key is not set"; else echo "FAIL recorded: $(grep -E '^env_' "$opencode_log")"; fail=1; fi
+if grep -qx 'sees_SRE_MODEL_FALLBACK: no' "$opencode_log" && grep -qx "model: $first_model" "$opencode_log"; then echo "ok   neither second model variable reaches the agent, and the run names its model"; else echo "FAIL log: $(grep -E '^(sees_SRE_MODEL|model:)' "$opencode_log")"; fail=1; fi
+if ! grep -qF "$second_key" "$opencode_log" "$out" "$fixture_log"; then echo "ok   the second key is in no log line, no recording of the agent and no request"; else echo "FAIL the second key leaked"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

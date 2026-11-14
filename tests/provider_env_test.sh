@@ -56,6 +56,21 @@ if command -v node >/dev/null 2>&1; then
   if [ "$runner_list" = "$want_all" ]; then echo "ok   the runner trims exactly the variables --all lists"; else echo "FAIL the runner's list differs from --all: $runner_list"; fail=1; fi
 fi
 
+# The runner also holds the table itself (prefix to variable, which it needs to
+# give each run the one key its model reads), and each pair must be what the
+# script answers for that prefix.
+if command -v node >/dev/null 2>&1; then
+  runner_pairs="$(node -e 'for (const [prefix, variable] of Object.entries(require(process.argv[1]).PROVIDER_KEY_TABLE)) console.log(prefix + " " + variable)' "$here/../runner/runner.js")"
+  want_pairs="$(sed -n "/^table='/,/'\$/p" "$script" | sed -e "s/^table='//" -e "s/'\$//")"
+  if [ -n "$want_pairs" ] && [ "$runner_pairs" = "$want_pairs" ]; then echo "ok   the runner's table is the script's, pair for pair and in the same order"; else echo "FAIL the runner's table differs from the script's: $runner_pairs"; fail=1; fi
+  each_pair_ok=1
+  while read -r prefix variable; do
+    [ -n "$prefix" ] || continue
+    if [ "$(bash "$script" "$prefix/some-model" 2>/dev/null)" != "$variable" ]; then each_pair_ok=0; echo "FAIL the script does not answer $variable for $prefix"; fi
+  done <<<"$runner_pairs"
+  if [ "$each_pair_ok" = 1 ]; then echo "ok   the script answers each of the runner's variables for its prefix"; else fail=1; fi
+fi
+
 refuse amazon-bedrock/anthropic.claude-sonnet-4-5
 refuse azure/gpt-5
 refuse ollama/llama3

@@ -12,6 +12,17 @@ set -euo pipefail
 brief="$(cat)"
 mode="${STUB_OPENCODE_MODE:-fix}"
 
+# The model this run was started with. A run started with STUB_SECOND_MODEL plays
+# STUB_OPENCODE_SECOND_MODE instead, so one case can script the first model's
+# refusal and what the second does.
+model_arg=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--model" ]; then model_arg="$argument"; fi
+  previous="$argument"
+done
+if [ -n "${STUB_SECOND_MODEL:-}" ] && [ "$model_arg" = "$STUB_SECOND_MODEL" ]; then mode="${STUB_OPENCODE_SECOND_MODE:-fix}"; fi
+
 # This process's pid, for a case that proves the runner stopped the agent.
 if [ -n "${STUB_OPENCODE_PIDFILE:-}" ]; then printf '%s\n' "$$" > "$STUB_OPENCODE_PIDFILE"; fi
 
@@ -45,6 +56,11 @@ if [ -n "${STUB_OPENCODE_LOG:-}" ]; then
     printf 'aws_env: %s\n' "$(env | cut -d= -f1 | grep -E '^(AWS_|ECS_CONTAINER_METADATA_URI)' | LC_ALL=C sort | tr '\n' ' ')"
     if [ -n "${SRE_AGENT_AWS_ACCESS+set}" ]; then printf 'sees_SRE_AGENT_AWS_ACCESS: yes\n'; else printf 'sees_SRE_AGENT_AWS_ACCESS: no\n'; fi
     printf 'provider_key: [%s]\n' "${OPENROUTER_API_KEY-unset}"
+    printf 'model: %s\n' "$model_arg"
+    # The provider key variables this run holds, by name and sorted (never a
+    # value). The list is the one in scripts/provider_env.sh.
+    printf 'provider_keys: %s\n' "$(env | cut -d= -f1 | grep -xE 'ANTHROPIC_API_KEY|OPENAI_API_KEY|GOOGLE_GENERATIVE_AI_API_KEY|OPENROUTER_API_KEY|XAI_API_KEY|GROQ_API_KEY|MISTRAL_API_KEY|DEEPSEEK_API_KEY|TOGETHER_API_KEY|FIREWORKS_API_KEY|CEREBRAS_API_KEY|MOONSHOT_API_KEY|DEEPINFRA_API_KEY|HF_TOKEN|ZHIPU_API_KEY|MINIMAX_API_KEY|NVIDIA_API_KEY|OPENCODE_API_KEY|AI_GATEWAY_API_KEY' | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')"
+    printf 'sees_SRE_MODEL_FALLBACK: %s\n' "$(if [ -n "${SRE_MODEL_FALLBACK+set}" ] || [ -n "${SRE_MODEL_FALLBACK_KEY+set}" ]; then echo yes; else echo no; fi)"
     printf 'opencode_print_logs: %s\n' "${OPENCODE_PRINT_LOGS:-missing}"
     printf 'opencode_log_level: %s\n' "${OPENCODE_LOG_LEVEL:-missing}"
     if [ -n "${OPENCODE_LOG_PATH+set}" ]; then printf 'sees_OPENCODE_LOG_PATH: yes\n'; else printf 'sees_OPENCODE_LOG_PATH: no\n'; fi

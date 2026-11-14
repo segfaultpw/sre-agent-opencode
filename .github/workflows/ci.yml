@@ -63,6 +63,7 @@ jobs:
       - run: node tests/supervisor_test.js
       - run: node tests/task_protection_test.js
       - run: node tests/poll_test.js
+      - run: node tests/second_model_test.js
       - run: bash tests/runner_test.sh
       - run: bash tests/bucket_test.sh
       - run: bash tests/secret_trim_test.sh
