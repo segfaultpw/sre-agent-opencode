@@ -2574,6 +2574,9 @@ async function scrubPlantedRepositories(workspace) {
   return [...found];
 }
 
+// The seam the tests use to make the agent's account not quiet; null in production.
+let agentKiller = null;
+
 // Takes the agent's processes, its home and the checkout back, in that order, and
 // answers whether the account is quiet. The home goes back first, so that even a
 // checkout that cannot be taken back leaves the agent unable to enter a home no
@@ -2581,7 +2584,7 @@ async function scrubPlantedRepositories(workspace) {
 // that git would read as a repository is removed (scrubPlantedRepositories) and
 // recorded on it as `planted`, for the proof and the gate that come after.
 async function reclaim(dir, home, workspace = null) {
-  const quiet = await killAgentProcesses();
+  const quiet = await (agentKiller || killAgentProcesses)();
   closeAgentHome(home);
   await chownTree(dir, 'runner');
   if (identity.mode !== 'none') fs.chmodSync(dir, 0o700);
@@ -5498,6 +5501,9 @@ async function runTestJob(config, job, heartbeat) {
   // What the model step's hooks answered, which the second model's step uses
   // too: the hooks run once per test job. null until they have.
   let preparedEnv = null;
+  // Whether the agent's account was quiet after the model step; the second
+  // model's step starts nothing while it is not.
+  let modelQuiet = true;
   const memoryRoot = config.layout.memory;
   const memoryDirectory = () => memory.memoryDirIn(memoryRoot, repo ? { owner: repo.owner, name: repo.name } : null);
 
@@ -5558,6 +5564,7 @@ async function runTestJob(config, job, heartbeat) {
         agent = await runAgent(config, scratch.dir, TEST_MODEL_PROMPT, { timeoutMs, home, repo, signal, extraEnv: prepared.extraEnv, awsReplaced: prepared.awsReplaced, progress });
       } finally {
         quiet = await reclaim(scratch.dir, home);
+        modelQuiet = quiet;
       }
       result.evidence.models = modelsEvidence([{ model: config.model, refusal: null }]);
       const seconds = Math.max(1, Math.round(timeoutMs / 1000));
@@ -5577,6 +5584,14 @@ async function runTestJob(config, job, heartbeat) {
     await step('fallback_model', async () => {
       if (!config.fallbackModel) return { ok: true, detail: 'no second model is configured' };
       if (!preparedEnv) return { ok: false, detail: TEST_NOT_RUN };
+      // A process of the agent's account that the model step could not end can
+      // read the environment of any later process of that account, and this step
+      // would put the second key in one. The step is not run, and says why.
+      if (!modelQuiet) {
+        result.actions.push('the second model\'s step was not run, because a process of the agent\'s account started by the model step could not be ended and the second key would have been in reach of it');
+        log('warn', `test job ${job.handoff_id}: fallback_model: not run: a process of the agent's account from the model step could not be ended`);
+        return { ok: false, detail: TEST_NOT_RUN };
+      }
       const scratch = prepareScratch(config);
       writeAgent(config, scratch.dir);
       const timeoutMs = Math.min(config.runTimeoutMs, TEST_MODEL_TIMEOUT_MS);
@@ -6515,6 +6530,9 @@ module.exports = {
     clearRequestSecrets,
     setIdentity: (value) => {
       identity = value;
+    },
+    setAgentKiller: (value) => {
+      agentKiller = value;
     },
     // The one seam for the GitHub API's base URL, for the tests' stand-in.
     setGithubApiBase: (value) => {

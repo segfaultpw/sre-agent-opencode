@@ -4071,6 +4071,46 @@ if gl_clean; then echo "ok   the proof ran nothing of the planted repository"; e
 stop_fixture
 rm -f "$work/ctl/remote"
 
+echo "--- 152. the second model's test step is not run while the model step left a process of the agent's account ---"
+# The seam makes the first reclaim find the account not quiet, which only a
+# split-account run can otherwise show (tests/uid_split_test.sh runs real ones).
+run_seam_once() {
+  : > "$git_log"
+  : > "$gh_log"
+  : > "$opencode_log"
+  out="$work/$1.out"
+  rc=0
+  timeout 120 env SRE_ONCE=1 \
+    SRE_SERVER_URL="$server_url" \
+    SRE_API_KEY="$runner_api_key" \
+    SRE_MODEL="$model" \
+    SRE_WORKSPACE="$workspace" \
+    SRE_GITHUB_TOKEN="$github_token" \
+    SRE_RUN_TIMEOUT_SECONDS="$run_timeout" \
+    node -e '
+      const runner = require(process.argv[1]);
+      const jobs = JSON.parse(require("node:fs").readFileSync(process.argv[2], "utf8"));
+      let calls = 0;
+      runner.internals.setAgentKiller(async () => { calls += 1; return calls > 1; });
+      const config = runner.loadConfig();
+      runner.serveJob(config, jobs[0]).then(
+        () => process.exit(0),
+        (error) => { console.error(error.message); process.exit(1); }
+      );
+    ' "$runner" "$queue_file" > "$out" 2>&1 || rc=$?
+  report="$(jq -c 'select(.path | endswith("/report")) | .body' "$fixture_log" | tail -n 1)"
+}
+start_fixture second_test_survivor
+queue_test_job h-second-test-survivor ""
+export STUB_OPENCODE_MODE=oneline STUB_OPENCODE_SECOND_MODE=oneline
+with_second_model run_seam_once second_test_survivor
+export STUB_OPENCODE_MODE=fix
+unset STUB_OPENCODE_SECOND_MODE
+if jq -e '(.test.steps[] | select(.name == "model") | (.ok == false and (.detail | test("could not be ended")))) and (.test.steps[] | select(.name == "fallback_model") | (.ok == false and .detail == "not run"))' <<<"$report" >/dev/null; then echo "ok   the model step fails for the survivor and the second model's step is reported as not run"; else echo "FAIL steps: $(jq -c '.test.steps' <<<"$report") $(tail -n 3 "$out")"; fail=1; fi
+if [ "$(runs_of)" = "1" ] && jq -e '.actions | any(test("second model.s step was not run"))' <<<"$report" >/dev/null; then echo "ok   only one model call was made, and the actions say why the other was not"; else echo "FAIL runs=$(runs_of) actions: $(jq -c '.actions' <<<"$report")"; fail=1; fi
+if ! grep -qF -e "$second_key" "$opencode_log" "$out"; then echo "ok   the second key was never put in the environment of a process"; else echo "FAIL the second key reached a run"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"
