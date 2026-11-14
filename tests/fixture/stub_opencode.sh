@@ -209,6 +209,12 @@ if [ -n "${STUB_OPENCODE_PROBE:-}" ]; then
       printf 'gitdir_write: %s\n' "$writable"
     fi
   } >> "$STUB_OPENCODE_PROBE"
+  # A directory opened to every account (and, where the tools exist, to one named
+  # account by an ACL), which another account that holds it would write in once
+  # the run is over: the runner closes the whole tree when it takes it back.
+  mkdir -p open777/inner
+  chmod 777 open777 open777/inner
+  if [ -n "${STUB_ACL_UID:-}" ] && command -v setfacl >/dev/null 2>&1; then setfacl -m "u:${STUB_ACL_UID}:rwx" open777 open777/inner 2>/dev/null || true; fi
   if [ -n "${STUB_PLANT_MARKER:-}" ]; then
     mkdir -p .git
     printf '[filter "evil"]\n\tclean = touch %s\n[core]\n\tfsmonitor = touch %s\n' "$STUB_PLANT_MARKER" "${STUB_PLANT_MARKER}.fsmonitor" > .git/config
@@ -318,6 +324,11 @@ case "${STUB_OPENCODE_MEMORY:-}" in
   plantnested)
     # The same, in a directory that is no submodule of the base.
     plant_repository deep/inner
+    ;;
+  plantignored)
+    # The same, under a directory the repository's .gitignore covers: what a
+    # tool that checks a dependency out leaves.
+    plant_repository vendor/pkg
     ;;
   plant)
     # What an agent that owns its tree can leave for the runner's git: a .git

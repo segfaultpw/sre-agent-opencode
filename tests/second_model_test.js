@@ -424,22 +424,45 @@ async function main() {
     assert.equal(fs.existsSync(path.join(nestedOutside.dir, 'a', 'b', '.git')), false, 'its .git is removed');
     assert.equal(fs.existsSync(path.join(nestedOutside.dir, 'a', 'b', 'f')), true, 'the files around it are the tree\'s and stay');
 
+    // A submodule the agent initialised to build or test is no reason to refuse the
+    // request: its path is emptied before git reads it, the change beside it is
+    // staged, and the path is told as removed.
     const stagedPlant = make('gitlink-stage', { gitlink: true });
     const markerStaged = path.join(work, 'marker-staged');
     plantRepository(path.join(stagedPlant.dir, 'sub'), markerStaged);
     fs.appendFileSync(path.join(stagedPlant.dir, 'README.md'), 'a real change\n');
-    const refused = await stageAndGate(stagedPlant.workspace, new Set());
+    const published = await stageAndGate(stagedPlant.workspace, new Set());
     assert.deepEqual(ran(markerStaged), [], 'the planted filter never ran for staging');
-    assert.deepEqual(refused.embedded, ['sub/'], 'a repository in a submodule path is refused, by its path');
-    assert.deepEqual(refused.flagged, ['sub/']);
-    assert.equal(stagedPlant.named('diff', '--cached', '--name-only'), '', 'and nothing is staged');
+    assert.deepEqual(published.embedded, [], 'a repository in a submodule path is not refused');
+    assert.deepEqual(published.flagged, []);
+    assert.deepEqual(published.removed, ['sub/'], 'it is told as removed, by its path');
+    assert.deepEqual(published.changed, ['README.md'], 'the change beside it is staged');
+    assert.equal(stagedPlant.named('diff', '--cached', '--name-only'), 'README.md', 'and nothing of the submodule is');
+    assert.equal(stagedPlant.named('diff', '--cached', '--raw', '--', 'sub'), '', 'the base pointer is as the base had it');
+    assert.equal(stagedPlant.named('ls-files', '-t', 'sub'), 'H sub', 'and the mark that kept git out of the path is taken off again');
+    assert.deepEqual(fs.readdirSync(path.join(stagedPlant.dir, 'sub')), [], 'the path is empty');
+
+    // Under an ignored directory, by the ignore file or by a rule above it.
+    const ignoredStage = make('ignored-stage');
+    fs.appendFileSync(path.join(ignoredStage.workspace.gitdir, 'info', 'exclude'), 'vendor/\n');
+    const markerIgnored = path.join(work, 'marker-ignored');
+    plantRepository(path.join(ignoredStage.dir, 'cache', 'pkg'), markerIgnored);
+    plantRepository(path.join(ignoredStage.dir, 'vendor', 'deep', 'pkg'), `${markerIgnored}-v`);
+    fs.appendFileSync(path.join(ignoredStage.dir, 'README.md'), 'a real change\n');
+    const ignoredResult = await stageAndGate(ignoredStage.workspace, new Set());
+    assert.deepEqual([...ran(markerIgnored), ...ran(`${markerIgnored}-v`)], [], 'no filter ran');
+    assert.deepEqual(ignoredResult.embedded, [], 'a repository under an ignored directory is not refused');
+    assert.deepEqual(ignoredResult.removed, ['cache/pkg/', 'vendor/deep/pkg/']);
+    assert.deepEqual(ignoredResult.changed, ['README.md'], 'and the change beside them is staged');
+    assert.equal(fs.existsSync(path.join(ignoredStage.dir, 'vendor', 'deep', 'pkg', '.git')), false);
 
     const nestedStage = make('nested-stage');
     const markerNestedStage = path.join(work, 'marker-nested-stage');
     plantRepository(path.join(nestedStage.dir, 'deep', 'inner'), markerNestedStage);
     const refusedNested = await stageAndGate(nestedStage.workspace, new Set());
     assert.deepEqual(ran(markerNestedStage), []);
-    assert.deepEqual(refusedNested.embedded, ['deep/inner/']);
+    assert.deepEqual(refusedNested.embedded, ['deep/inner/'], 'a repository in a path the pull request could hold is still refused');
+    assert.deepEqual(refusedNested.removed, []);
     assert.equal(fs.existsSync(path.join(nestedStage.dir, 'deep', 'inner', '.git')), false);
 
     // What reclaim found is remembered: the checkout holds nothing of it afterwards,
@@ -450,11 +473,14 @@ async function main() {
     plantRepository(path.join(reclaimed.dir, 'x', 'y'), `${markerReclaimed}-y`);
     assert.equal(await reclaim(reclaimed.dir, null, reclaimed.workspace), true);
     assert.deepEqual([...reclaimed.workspace.planted].sort(), ['sub/', 'x/y/']);
+    assert.deepEqual(reclaimed.workspace.plants.submodule, ['sub/']);
+    assert.deepEqual(reclaimed.workspace.plants.embedded, ['x/y/']);
     assert.deepEqual(fs.readdirSync(path.join(reclaimed.dir, 'sub')), []);
     assert.equal(fs.existsSync(path.join(reclaimed.dir, 'x', 'y', '.git')), false);
     assert.equal(await unchanged(reclaimed), false, 'the proof knows what reclaim removed');
     const refusedAfter = await stageAndGate(reclaimed.workspace, new Set());
-    assert.deepEqual([...refusedAfter.embedded].sort(), ['sub/', 'x/y/'], 'and so does the gate');
+    assert.deepEqual(refusedAfter.embedded, ['x/y/'], 'and the gate refuses the one the pull request could hold');
+    assert.deepEqual(refusedAfter.removed, ['sub/'], 'and tells the other');
     assert.deepEqual([...ran(markerReclaimed), ...ran(`${markerReclaimed}-y`)], []);
 
     // A request after one that left a repository: the next request's own checkout
@@ -469,9 +495,11 @@ async function main() {
     const links = make('links', { gitlink: true });
     const outside = path.join(work, 'outside-target');
     fs.mkdirSync(path.join(outside, 'sub'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'inner'), { recursive: true });
     fs.mkdirSync(path.join(outside, 'repo', '.git'), { recursive: true });
     fs.writeFileSync(path.join(outside, 'keep.txt'), 'keep\n');
     fs.writeFileSync(path.join(outside, 'sub', 'keep.txt'), 'keep\n');
+    fs.writeFileSync(path.join(outside, 'inner', 'keep.txt'), 'keep\n');
     fs.writeFileSync(path.join(outside, 'repo', '.git', 'HEAD'), 'ref: refs/heads/main\n');
     fs.rmSync(path.join(links.dir, 'sub'), { recursive: true });
     fs.symlinkSync(outside, path.join(links.dir, 'sub'));
@@ -486,7 +514,8 @@ async function main() {
     fs.rmSync(path.join(above.dir, 'src'), { recursive: true });
     fs.symlinkSync(outside, path.join(above.dir, 'src'));
     await unchanged(above);
-    assert.equal(fs.existsSync(path.join(outside, 'sub', 'keep.txt')), true, 'nothing outside the tree is emptied');
+    assert.equal(fs.existsSync(path.join(outside, 'inner', 'keep.txt')), true, 'the directory the gitlink names, behind the link above it, is not emptied');
+    assert.equal(fs.existsSync(path.join(outside, 'sub', 'keep.txt')), true, 'nor is anything else outside the tree');
 
     // A directory the agent made unreadable is the runner's to open and remove.
     const closed = make('closed');
@@ -496,6 +525,115 @@ async function main() {
     assert.equal(await unchanged(closed), false);
     assert.equal(fs.existsSync(path.join(closed.dir, 'locked', 'inner', '.git')), false);
     assert.deepEqual(ran(path.join(work, 'marker-closed')), []);
+
+    // A directory the agent made unreadable holds a link to somewhere outside: the
+    // runner opens what is its own and never chmods what the link points at.
+    const guarded = path.join(work, 'outside-mode');
+    fs.mkdirSync(guarded, { recursive: true });
+    fs.chmodSync(guarded, 0o500);
+    const linked = make('closed-link');
+    plantRepository(path.join(linked.dir, 'locked', 'inner'), path.join(work, 'marker-closed-link'));
+    fs.symlinkSync(guarded, path.join(linked.dir, 'locked', 'inner', '.git', 'link-out'));
+    fs.chmodSync(path.join(linked.dir, 'locked', 'inner', '.git'), 0o000);
+    assert.equal(await unchanged(linked), false);
+    assert.equal(fs.existsSync(path.join(linked.dir, 'locked', 'inner', '.git')), false);
+    assert.equal(fs.statSync(guarded).mode & 0o777, 0o500, 'the directory behind a link is not given another mode');
+
+    // git reads `.git` whatever its case on a file system that folds it.
+    const upper = make('upper-case');
+    fs.mkdirSync(path.join(upper.dir, 'mixed', 'pkg'), { recursive: true });
+    fs.mkdirSync(path.join(upper.dir, 'mixed', 'pkg', '.GIT'));
+    fs.writeFileSync(path.join(upper.dir, 'mixed', 'pkg', '.GIT', 'HEAD'), 'ref: refs/heads/main\n');
+    assert.equal(await unchanged(upper), false);
+    assert.equal(fs.existsSync(path.join(upper.dir, 'mixed', 'pkg', '.GIT')), false, 'a .GIT is removed too');
+
+    // A path component swapped for a link while the runner is cleaning, as another
+    // account that still holds a directory of the tree could: the removal must not
+    // reach what the link points at. fs is patched at the one call where the swap
+    // happens, the way that account's write would land between two of the runner's
+    // calls; nothing of the runner is changed for it.
+    const swapped = make('swapped');
+    swapped.named('update-index', '--add', '--cacheinfo', `160000,${submoduleCommit},third/lib`);
+    const victim = path.join(work, 'swap-victim');
+    fs.rmSync(victim, { recursive: true, force: true });
+    fs.mkdirSync(path.join(victim, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(victim, 'lib', 'precious.txt'), 'keep me\n');
+    fs.mkdirSync(path.join(victim, 'other', '.git'), { recursive: true });
+    fs.writeFileSync(path.join(victim, 'other', '.git', 'HEAD'), 'ref: refs/heads/main\n');
+    fs.mkdirSync(path.join(swapped.dir, 'third', 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(swapped.dir, 'third', 'lib', 'planted'), 'x\n');
+    fs.mkdirSync(path.join(swapped.dir, 'w', 'd'), { recursive: true });
+    const realListing = fs.promises.readdir;
+    const realListingSync = fs.readdirSync;
+    let swappedGitlink = false;
+    let swappedWalk = false;
+    // One swap for each listing the runner makes, whichever way it makes it.
+    const swapBefore = (target) => {
+      if (!swappedGitlink && String(target) === path.join(swapped.dir, 'third', 'lib')) {
+        swappedGitlink = true;
+        fs.renameSync(path.join(swapped.dir, 'third'), path.join(work, 'swap-third-moved'));
+        fs.symlinkSync(victim, path.join(swapped.dir, 'third'));
+      }
+    };
+    const swapAfter = (target) => {
+      if (!swappedWalk && String(target) === path.join(swapped.dir, 'w')) {
+        swappedWalk = true;
+        fs.rmSync(path.join(swapped.dir, 'w', 'd'), { recursive: true });
+        fs.symlinkSync(victim, path.join(swapped.dir, 'w', 'd'));
+      }
+    };
+    fs.promises.readdir = async function patched(target, options) {
+      swapBefore(target);
+      const listed = await realListing.call(fs.promises, target, options);
+      swapAfter(target);
+      return listed;
+    };
+    fs.readdirSync = function patchedSync(target, options) {
+      swapBefore(target);
+      const listed = realListingSync.call(fs, target, options);
+      swapAfter(target);
+      return listed;
+    };
+    try {
+      assert.equal(await reclaim(swapped.dir, null, swapped.workspace), true);
+    } finally {
+      fs.promises.readdir = realListing;
+      fs.readdirSync = realListingSync;
+    }
+    assert.ok(swappedGitlink && swappedWalk, 'both swaps happened');
+    assert.equal(fs.existsSync(path.join(victim, 'lib', 'precious.txt')), true, 'a link swapped in above a gitlink path is not followed by the removal');
+    assert.equal(fs.existsSync(path.join(victim, 'other', '.git', 'HEAD')), true, 'a link swapped in for a directory the walk was about to enter is not entered');
+    assert.deepEqual(swapped.workspace.plants && swapped.workspace.plants.embedded, ['third/lib/', 'w/d/'], 'both are told, and refuse the request');
+
+    // A repository put back in a submodule path after the scrub and before the
+    // runner stages (the window another account that holds a directory of the
+    // tree would have): git is not let look under the base's gitlink paths at all.
+    const lateDir = path.join(work, 'late-wrapper');
+    fs.mkdirSync(lateDir, { recursive: true });
+    const lateTemplate = path.join(work, 'late-template');
+    const markerLate = path.join(work, 'marker-late');
+    plantRepository(lateTemplate, markerLate);
+    const lateGit = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+    const lateMade = make('late-replant', { gitlink: true });
+    const lateTarget = path.join(lateMade.dir, 'sub');
+    fs.writeFileSync(
+      path.join(lateDir, 'git'),
+      `#!/usr/bin/env bash\nfor argument in "$@"; do\n  if [ "$argument" = add ] && [ ! -e "${lateTarget}/.git" ]; then\n    mkdir -p "${lateTarget}" && cp -a "${lateTemplate}/." "${lateTarget}/"\n  fi\ndone\nexec "${lateGit}" "$@"\n`,
+      { mode: 0o755 }
+    );
+    fs.appendFileSync(path.join(lateMade.dir, 'README.md'), 'a real change\n');
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${lateDir}:${savedPath}`;
+    let lateResult;
+    try {
+      lateResult = await stageAndGate(lateMade.workspace, new Set());
+    } finally {
+      process.env.PATH = savedPath;
+    }
+    assert.ok(fs.existsSync(path.join(lateMade.dir, 'sub', '.git')), 'the repository was put back while the runner staged');
+    assert.deepEqual(ran(markerLate), [], 'and its filter did not run');
+    assert.deepEqual(lateResult.changed, ['README.md'], 'the change is staged, and the submodule is not touched');
+    assert.equal(lateMade.named('ls-files', '-t', 'sub'), 'H sub', 'the mark is off again');
 
     const staged = make('staged');
     fs.writeFileSync(path.join(staged.dir, 'new.txt'), 'x\n');

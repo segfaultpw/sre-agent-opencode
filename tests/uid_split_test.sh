@@ -321,7 +321,7 @@ prove() {
       STUB_OPENCODE_MODE=fix STUB_OPENCODE_PROBE="$probe_file" STUB_PROBE_WORKSPACE="$ws" STUB_PROBE_SURVIVOR="$survivor_file" \
       STUB_OPENCODE_MEMORY=edit STUB_PROBE_GIT="$real_git" STUB_CLONE_SOURCE="$clone_src" STUB_EXPECT_GH_TOKEN="$github_token" STUB_RUNNER_TOKEN="$github_token" \
       "${extra_runner_env[@]}" \
-      STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" \
+      STUB_PROBE_GITDIR="$ws/gitdirs/acme/app" STUB_PLANT_MARKER="$work/markers/tree-config" STUB_ACL_UID="$caps_uid" \
       node "$runner" > "$out" 2>&1 || rc=$?
     stop_fixture
   }
@@ -366,6 +366,12 @@ prove() {
   if [ -s "$ghuidlog" ] && ! grep -qvx "$owner" "$ghuidlog"; then echo "ok   $label: gh ran as the runner's account"; else echo "FAIL $label: gh uids: $(sort -u "$ghuidlog" | tr '\n' ' ')"; fail=1; fi
   if grep -qF -- '<!-- sre-agent-opencode:v' "$ghbodylog" && grep -qF -- 'sre-agent:remediation:99999999-8888-7777-6666-555555555555' "$ghbodylog"; then echo "ok   $label: gh opened and read the pull request body as the runner's account, and it is the agent's message with the markers"; else echo "FAIL $label: gh could not read the body, or it is not the body: $(cat "$ghbodylog")"; fail=1; fi
   if [ "$(stat -c %u "$ws/repos/acme/app")" = "$owner" ] && [ "$(stat -c %u "$ws/repos/acme/app/README.md")" = "$owner" ] && [ ! -e "$ws/repos/acme/app/.git" ]; then echo "ok   $label: the checkout is the runner's again once the run ends, and the .git the agent planted is gone"; else echo "FAIL $label: $(stat -c '%u %n' "$ws/repos/acme/app" "$ws/repos/acme/app/README.md"; ls -a "$ws/repos/acme/app")"; fail=1; fi
+  # The agent left a directory open to every account (and named one account in an
+  # ACL). Another account's process that still held it could write in it after
+  # the run, while the runner reads and stages the tree, so the runner takes
+  # every other account's access to the whole tree away the moment it has it back.
+  if [ "$(stat -c '%a %u' "$ws/repos/acme/app/open777")" = "700 $owner" ] && [ "$(stat -c '%a %u' "$ws/repos/acme/app/open777/inner")" = "700 $owner" ]; then echo "ok   $label: a subdirectory the agent opened to every account is closed to every account but the runner's once the run ends"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/repos/acme/app/open777" "$ws/repos/acme/app/open777/inner")"; fail=1; fi
+  if ! command -v getfacl >/dev/null 2>&1 || ! getfacl -cp "$ws/repos/acme/app/open777" | grep -q '^user:'; then echo "ok   $label: (no ACL entry was made here, so the ACL mask is not read)"; elif getfacl -cp "$ws/repos/acme/app/open777" | grep -qx 'mask::---'; then echo "ok   $label: an ACL entry the agent made for another account has no effective permission left (the mask is none)"; else echo "FAIL $label: $(getfacl -cp "$ws/repos/acme/app/open777" | tr '\n' ' ')"; fail=1; fi
   if [ "$(stat -c '%a %u' "$ws/memory")" = "700 $owner" ] && [ "$(stat -c '%a %u' "$ws/memory/acme/app/NOTES.md")" = "600 $owner" ]; then echo "ok   $label: memory is 0700 and the files are 0600, all the runner's"; else echo "FAIL $label: $(stat -c '%a %u %n' "$ws/memory" "$ws/memory/acme/app/NOTES.md")"; fail=1; fi
   if [ "$(tail -n 1 "$ws/memory/acme/app/NOTES.md")" = "the pool ceiling is 40 on the primary" ]; then echo "ok   $label: the agent's note reached memory through the copy"; else echo "FAIL $label: $(cat "$ws/memory/acme/app/NOTES.md")"; fail=1; fi
   if [ "$(stat -c '%a' "$ws/repos")" = "711" ] && [ "$(stat -c '%a' "$ws/repos/acme")" = "711" ] && [ "$(stat -c '%a' "$ws")" = "711" ]; then echo "ok   $label: the directories above the checkout can be walked through but not listed"; else echo "FAIL $label: $(stat -c '%a %n' "$ws" "$ws/repos" "$ws/repos/acme")"; fail=1; fi
