@@ -314,18 +314,22 @@ function addRotatingSecret(value) {
 // redacted from every line like the secrets above for as long as the request lasts.
 let requestSecrets = [];
 
-// A held value shorter than this is not removed, by redact() or by the
-// scrubber: a placeholder key (`none`, `x`) would blank those letters out of
-// every line and every sentence the runner writes, and no credential is that
-// short.
+// A held value shorter than this is not removed when it is nothing but
+// letters: a placeholder key (`none`, `EMPTY`, `dummy`) would blank those
+// words out of every line and every sentence the runner writes, and no
+// credential is a short run of letters. A short value with a digit or
+// punctuation in it (LiteLLM's documented default master key is `sk-1234`) is a
+// key and is removed, by redact() and by the scrubber alike: this is the one
+// check both use.
 const MIN_SECRET_BYTES = 8;
 
 function removable(secret) {
-  return typeof secret === 'string' && Buffer.byteLength(secret) >= MIN_SECRET_BYTES;
+  if (typeof secret !== 'string' || secret.trim() === '') return false;
+  return Buffer.byteLength(secret) >= MIN_SECRET_BYTES || !/^\p{L}+$/u.test(secret);
 }
 
 function redact(text) {
-  let out = String(text);
+  let out = providerRefusal.wellFormed(String(text));
   for (const secret of constantSecrets) {
     if (removable(secret)) out = out.split(secret).join('[redacted]');
   }
@@ -3710,6 +3714,9 @@ function printedWords(stderr) {
 // The evidence's tail of what the process printed: scrubbed first, then the
 // last `maxBytes` bytes of the result, cut on a character.
 const EVIDENCE_STDERR_BYTES = 1000;
+// The platform keeps 100 entries; the last error is the one the classifier
+// reads, so the tail is what is kept.
+const EVIDENCE_ERRORS_MAX = 20;
 function stderrEvidence(stderr) {
   return providerRefusal.cutBytesFromEnd(printedWords(stderr), EVIDENCE_STDERR_BYTES);
 }
@@ -3718,7 +3725,7 @@ function stderrEvidence(stderr) {
 // provider echoed across a line break, percent-encoded or JSON-escaped, and an
 // account identifier, are masked in the evidence as they are in the detail.
 function errorsEvidence(errors) {
-  return errors.map((error) => providerRefusal.scrub(error, redact, heldSecrets(), EVIDENCE_STDERR_BYTES));
+  return errors.slice(-EVIDENCE_ERRORS_MAX).map((error) => providerRefusal.scrub(error, redact, heldSecrets(), EVIDENCE_STDERR_BYTES));
 }
 
 function exitWords(agent, limit = STDERR_TAIL_CHARS) {
@@ -4766,6 +4773,11 @@ async function report(job, result) {
   // agent_exit with the same block, which an older one ignores and a newer one
   // reads whatever the kind.
   const wantsRefusal = Array.isArray(job.failure_kinds) && job.failure_kinds.includes(PROVIDER_REFUSED);
+  // Every string is made well formed on the way out: a lone surrogate (from the
+  // agent's final message, or a cut that halved a pair) would be written as an
+  // escape that the platform's strict decoder refuses, and the whole report
+  // with it.
+  const wellFormedValue = (_key, value) => (typeof value === 'string' ? providerRefusal.wellFormed(value) : value);
   const bodyFor = (kind) =>
     JSON.stringify({
       outcome: result.outcome,
@@ -4777,7 +4789,7 @@ async function report(job, result) {
       ...(result.failure ? { failure: kind && result.failure.provider ? { ...result.failure, kind } : result.failure } : {}),
       ...memoryReport(result),
       ...testReport(result),
-    });
+    }, wellFormedValue);
   let sentKind = wantsRefusal && result.failure && result.failure.provider ? PROVIDER_REFUSED : null;
   let body = bodyFor(sentKind);
   let resent = false;

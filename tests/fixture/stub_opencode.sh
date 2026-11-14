@@ -487,7 +487,27 @@ d.yml"
     # STUB_STDERR_ECHO what the process printed. No status, so it is never a
     # refusal: the evidence is what is under test.
     jq -cn --arg m "${STUB_PROVIDER_MESSAGE:-boom}" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "UnknownError", data: {message: $m}}}'
+    if [ -n "${STUB_TEXT_ECHO:-}" ]; then
+      jq -cn --arg t "$STUB_TEXT_ECHO" '{type: "text", timestamp: 0, sessionID: "stub", part: {type: "text", text: $t}}'
+    fi
     printf '%s' "${STUB_STDERR_ECHO:-}" >&2
+    exit 1
+    ;;
+  provider_many)
+    # STUB_ERROR_COUNT error events (500 unless set), each with its own number,
+    # and a failed exit: the evidence keeps the tail of them.
+    for n in $(seq 1 "${STUB_ERROR_COUNT:-500}"); do
+      jq -cn --arg m "error number $n" '{type: "error", timestamp: 0, sessionID: "stub", error: {name: "UnknownError", data: {message: $m}}}'
+    done
+    exit 1
+    ;;
+  provider_surrogate)
+    # Lone surrogates the way a provider's JSON escape leaves them: written
+    # as raw JSON, because jq turns a lone surrogate into U+FFFD. They split an
+    # Anthropic key and an access key id in an error event, and sit in the
+    # agent's own text, which becomes the report's summary.
+    printf '%s\n' '{"type":"error","timestamp":0,"sessionID":"stub","error":{"name":"UnknownError","data":{"message":"bad key sk-ant-api03-abcdefghij\ud800klmnopqrstuvwxyz0123 and AKIAIOSFOD\udc00NN7EXAMPLE"}}}'
+    printf '%s\n' '{"type":"text","timestamp":0,"sessionID":"stub","part":{"type":"text","text":"the agent said \ud800 and \udc00 here"}}'
     exit 1
     ;;
   provider_then_other)

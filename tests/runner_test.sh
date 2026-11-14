@@ -3650,6 +3650,47 @@ unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE STUB_STDERR_ECHO
 if jq -e '.evidence.agent_errors == ["none of the models answered"] and (.evidence.agent_stderr | endswith("\" none of them")) and (.failure.detail | test("none of the models answered"))' <<<"$report" >/dev/null; then echo "ok   a held value of fewer than eight bytes (a placeholder key) blanks no word of the report"; else echo "FAIL evidence: $(jq -c '[.evidence.agent_errors, .evidence.agent_stderr, .failure.detail]' <<<"$report")"; fail=1; fi
 stop_fixture
 
+# A held key of fewer than eight bytes that is not all letters (LiteLLM's
+# documented default master key) is still removed from every field of the
+# report, from the summary the agent's own words become, and from the log.
+export OPENROUTER_API_KEY='sk-1234' STUB_PROVIDER_MESSAGE="the gateway rejected sk-1234 for this account" STUB_TEXT_ECHO="I tried sk-1234 and it failed" STUB_STDERR_ECHO="echo of sk-1234 on stderr"
+export STUB_OPENCODE_MODE=provider_echo
+start_fixture evidence_short_digit_key
+queue_one h-evidence-short-digit-key acme/app
+run_once evidence_short_digit_key
+export STUB_OPENCODE_MODE=fix
+unset OPENROUTER_API_KEY STUB_PROVIDER_MESSAGE STUB_TEXT_ECHO STUB_STDERR_ECHO
+if ! jq -c '.' <<<"$report" | grep -qF -e 'sk-1234' && jq -e '.evidence.agent_errors == ["the gateway rejected [redacted] for this account"] and (.summary | contains("I tried [redacted] and it failed"))' <<<"$report" >/dev/null; then echo "ok   a held key of seven bytes with a digit and a hyphen is in no field of the report, the summary included"; else echo "FAIL the report: $(jq -c '[.summary, .evidence.agent_errors, .evidence.agent_stderr, .failure.detail]' <<<"$report")"; fail=1; fi
+if ! grep -qF -e 'sk-1234' "$work/evidence_short_digit_key.out"; then echo "ok   and in no line of the runner's log"; else echo "FAIL the log holds it: $(grep -F 'sk-1234' "$work/evidence_short_digit_key.out" | head -n 2)"; fail=1; fi
+stop_fixture
+# A run with 500 error events reports the last 20 and a report of sane size.
+export STUB_OPENCODE_MODE=provider_many STUB_ERROR_COUNT=500
+start_fixture evidence_many_errors
+queue_one h-evidence-many-errors acme/app
+run_once evidence_many_errors
+export STUB_OPENCODE_MODE=fix
+unset STUB_ERROR_COUNT
+if jq -e '(.evidence.agent_errors | length) == 20 and .evidence.agent_errors[0] == "error number 481" and .evidence.agent_errors[19] == "error number 500"' <<<"$report" >/dev/null && [ "${#report}" -lt 20000 ]; then echo "ok   500 error events are reported as the last 20, and the report is ${#report} bytes"; else echo "FAIL agent_errors: $(jq -c '[(.evidence.agent_errors | length), .evidence.agent_errors[0]]' <<<"$report"), report ${#report} bytes"; fail=1; fi
+stop_fixture
+# A lone surrogate in a provider's words or the agent's own leaves nothing of
+# the keys it split, and the posted report holds no surrogate escape (the
+# platform's strict decoder refuses one).
+export STUB_OPENCODE_MODE=provider_surrogate
+start_fixture evidence_surrogate
+queue_one h-evidence-surrogate acme/app
+run_once evidence_surrogate
+export STUB_OPENCODE_MODE=fix
+raw_report="$(grep '/report"' "$work/evidence_surrogate.requests.jsonl" | tail -n 1)"
+surrogate_leaks=""
+for fragment in abcdefghij klmnopqrst AKIAIOSF NN7EXAMPLE; do
+  if grep -qF -e "$fragment" <<<"$raw_report"; then surrogate_leaks="${surrogate_leaks}${fragment} "; fi
+done
+if [ -n "$raw_report" ] && [ -z "$surrogate_leaks" ] && jq -e '.evidence.agent_errors == ["bad key [redacted] and [redacted]"]' <<<"$report" >/dev/null; then echo "ok   a lone surrogate leaves no half of either key in the report"; else echo "FAIL the report holds: ${surrogate_leaks}$(jq -c '.evidence.agent_errors' <<<"$report")"; fail=1; fi
+# The request log is the server's own JSON.stringify of the body it decoded, which
+# writes a lone surrogate as an escape and a pair as the character itself.
+if [ -n "$raw_report" ] && ! grep -qiP '\\ud[89a-f][0-9a-f]{2}' <<<"$raw_report" && grep -q 'the agent said' <<<"$raw_report"; then echo "ok   the report holds no lone surrogate escape, the summary's included"; else echo "FAIL a surrogate escape reached the report: $(grep -oiP '.{10}\\ud[89a-f][0-9a-f]{2}.{5}' <<<"$raw_report" | head -n 2)"; fail=1; fi
+stop_fixture
+
 echo "--- 49. no credential was on any command line of any git or gh call in any case above ---"
 for token_name in github_token agent_token app_runner_token app_agent_token; do
   token="${!token_name}"

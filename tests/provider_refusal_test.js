@@ -16,7 +16,7 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub } = require(path.join(root, 'runner', 'provider_refusal.js'));
+const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, wellFormed } = require(path.join(root, 'runner', 'provider_refusal.js'));
 
 const FIXTURE_PATH = path.join(__dirname, 'fixture', 'provider_messages.json');
 const FIXTURE_SHA256 = '4f245e3a446a3fb3f2f0434418c192c55f04efa5c8543e2aad788fe7c205ed76';
@@ -115,7 +115,7 @@ const TEMPLATES = [
 
 // A line break, a tab, a NUL, and every kind of invisible or exotic space: each
 // is a gap or a marker to the rules, never something that hides a key.
-const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000', '\uFFFD', '\u0301', '\u0301\u0302'];
+const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000', '\uFFFD', '\u0301', '\u0301\u0302', '\uD800', '\uDC00'];
 
 function windows(secret, size) {
   const chars = Array.from(secret);
@@ -683,6 +683,70 @@ check('the follow-up scrubber rules, one by one', () => {
   assert.equal(scrub('id 1234-123456789012 failed', null, []), 'id 1234-[redacted] failed');
   assert.equal(scrub('id 123e4567-e89b-12d3-a456-123456789012 stays', null, []), 'id 123e4567-e89b-12d3-a456-123456789012 stays');
   assert.equal(scrub('id 123E4567-E89B-12D3-A456-123456789012 stays', null, []), 'id 123E4567-E89B-12D3-A456-123456789012 stays');
+});
+
+check('a lone surrogate leaves nothing of the key it split, and the output is well formed', () => {
+  const lone = JSON.parse('"sk-ant-api03-abcdefghij\\ud800klmnopqrstuvwxyz0123 and AKIAIOSFOD\\udc00NN7EXAMPLE"');
+  assert.equal(lone.isWellFormed(), false);
+  const out = scrub(lone, null, []);
+  assert.equal(out, '[redacted] and [redacted]');
+  assert.equal(out.isWellFormed(), true);
+  for (const piece of ['abcdefghij', 'klmnopqrst', 'AKIAIOSF', 'NN7EXAMPLE']) assert.equal(out.includes(piece), false, piece);
+  assert.equal(scrub('\ud800', null, []), '');
+  assert.equal(scrub('a\udc00b', null, []), 'ab');
+  assert.equal(scrub('smile 😀 ok', null, []), 'smile 😀 ok');
+});
+
+check('a lone surrogate in an error event is a replacement character before anything reads it, and the verdict serialises with no surrogate escape', () => {
+  assert.equal(wellFormed('x\ud800y\udc00z'), 'x�y�z');
+  assert.equal(wellFormed('😀'), '😀');
+  const event = eventFrom({ type: 'error', error: { name: 'APIError\ud800', data: { statusCode: 401, message: 'bad key sk-ant-api03-abcdefghij\ud800klmnopqrstuvwxyz0123', providerID: 'p\udc00', responseBody: '{"error":{"code":"x\ud800"}}' } } });
+  assert.equal(event.message.isWellFormed(), true);
+  assert.equal(event.name.isWellFormed(), true);
+  assert.equal(event.providerID.isWellFormed(), true);
+  const string = eventFrom({ type: 'error', error: 'oops\ud800' });
+  assert.equal(string.message, 'oops�');
+  const got = classify(remember([], { type: 'error', error: { name: 'APIError', data: { statusCode: 401, message: 'bad key sk-ant-api03-abcdefghij\ud800klmnopqrstuvwxyz0123 \udc00' } } }), { exitCode: 1, stopped: false });
+  assert.equal(got.class, 'auth');
+  const json = JSON.stringify(got);
+  assert.equal(/\\ud[89a-f][0-9a-f]{2}/i.test(json), false, json);
+  assert.equal(got.message, 'bad key [redacted]');
+});
+
+check('a short held value with a digit or punctuation (LiteLLM\'s default master key) is still removed; an all-letter one is not', () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-refusal-litellm-'));
+  const saved = { ...process.env };
+  try {
+    for (const name of Object.keys(process.env)) delete process.env[name];
+    Object.assign(process.env, { PATH: saved.PATH, HOME: work, SRE_SERVER_URL: 'http://127.0.0.1:9', SRE_API_KEY: `sre-agent-poll-${'3'.repeat(48)}`, SRE_MODEL: 'litellm/gpt-4o', SRE_WORKSPACE: path.join(work, 'ws'), SRE_ONCE: '1', OPENROUTER_API_KEY: 'sk-1234' });
+    fs.mkdirSync(process.env.SRE_WORKSPACE, { recursive: true });
+    const runner = require(path.join(root, 'runner', 'runner.js'));
+    runner.loadConfig();
+    const { redact, heldSecrets, addRotatingSecret } = runner.internals;
+    assert.ok(heldSecrets().includes('sk-1234'));
+    assert.equal(redact('the gateway rejected sk-1234 for this model'), 'the gateway rejected [redacted] for this model');
+    const scrubbed = scrub('Authentication failed for sk-1234, retry', redact, heldSecrets());
+    assert.equal(scrubbed, 'Authentication failed for [redacted], retry');
+    const refusal = classify(remember([], apiError(401, 'rejected sk-1234 for this account')), { exitCode: 1, stopped: false }, { redact, secrets: heldSecrets() });
+    assert.equal(refusal.message, 'rejected [redacted] for this account');
+    for (const short of ['p4ss', 'ab_cd', 'k-1', '1234567', 'ééé1']) {
+      addRotatingSecret(short);
+      assert.ok(heldSecrets().includes(short), short);
+      assert.equal(redact(`x ${short} y`), 'x [redacted] y', short);
+    }
+    for (const placeholder of ['none', 'EMPTY', 'dummy', 'abcdefg', 'ééé']) {
+      addRotatingSecret(placeholder);
+      assert.equal(heldSecrets().includes(placeholder), false, placeholder);
+      assert.equal(redact(`${placeholder} of the words`), `${placeholder} of the words`, placeholder);
+    }
+    addRotatingSecret('');
+    addRotatingSecret('  ');
+    assert.equal(redact('a b  c'), 'a b  c');
+  } finally {
+    for (const name of Object.keys(process.env)) delete process.env[name];
+    Object.assign(process.env, saved);
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 });
 
 if (failed > 0) {

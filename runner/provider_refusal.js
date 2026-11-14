@@ -47,6 +47,18 @@ const GAP = '\x01';
 const REMOVED = '\x02';
 const GAP_STAR = '[\\x01\\x02]*';
 
+// A JS string can hold a lone surrogate (opencode passes one through from a
+// provider's JSON `\ud800` escape). It is not text: Buffer reads it as U+FFFD,
+// a regex without the u flag reads it as a character that no rule matches, and
+// JSON.stringify writes it as an escape that a strict decoder refuses. Every
+// text is made well formed before anything reads it, so a lone surrogate is a
+// U+FFFD, which the scrubber removes like any invisible character.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+function wellFormed(text) {
+  if (typeof text !== 'string') return text;
+  return typeof text.toWellFormed === 'function' ? text.toWellFormed() : text.replace(LONE_SURROGATE, '\uFFFD');
+}
+
 // What is read out of one error event. The runner keeps the last EVENTS_MAX of
 // them, each message already cut at RAW_MAX_CODE_POINTS.
 function eventFrom(event) {
@@ -61,11 +73,11 @@ function eventFrom(event) {
   const data = error.data && typeof error.data === 'object' ? error.data : {};
   const message = typeof data.message === 'string' ? data.message : typeof error.message === 'string' ? error.message : '';
   return {
-    name: typeof error.name === 'string' ? error.name : '',
+    name: typeof error.name === 'string' ? wellFormed(error.name) : '',
     statusCode: statusOf(data.statusCode),
     message: cutRaw(message),
     bodyCode: bodyCodeOf(data.responseBody),
-    providerID: typeof data.providerID === 'string' ? data.providerID.slice(0, BODY_FIELD_MAX_CHARS) : null,
+    providerID: typeof data.providerID === 'string' ? wellFormed(data.providerID.slice(0, BODY_FIELD_MAX_CHARS)) : null,
   };
 }
 
@@ -102,7 +114,7 @@ function bodyCodeOf(body) {
   if (!parsed || typeof parsed !== 'object') return null;
   const parts = [];
   const take = (value) => {
-    if (typeof value === 'string' && value !== '') parts.push(value.slice(0, BODY_FIELD_MAX_CHARS));
+    if (typeof value === 'string' && value !== '') parts.push(wellFormed(value.slice(0, BODY_FIELD_MAX_CHARS)));
   };
   if (parsed.error && typeof parsed.error === 'object') {
     take(parsed.error.code);
@@ -159,7 +171,7 @@ function boundedText(text) {
 function classOf(event) {
   if (event.name === 'ProviderAuthError') return 'auth';
   if (event.name !== 'APIError') return null;
-  const text = boundedText(`${event.message} ${event.bodyCode || ''}`).toLowerCase();
+  const text = boundedText(wellFormed(`${event.message} ${event.bodyCode || ''}`)).toLowerCase();
   switch (event.statusCode) {
     case 401:
       return 'auth';
@@ -214,7 +226,9 @@ function classify(events, run, options = {}) {
 //   4. the secrets the runner holds, by value (as stored, percent-encoded,
 //      JSON-escaped, and as base64), a gap allowed between any two characters
 //      (the secrets of 8 bytes or more: a placeholder key would wipe its own
-//      letters from every message);
+//      letters from every message; a shorter one that is not all letters, such
+//      as `sk-1234`, is removed as stored by the runner's own redact(), which
+//      runs on the text before and after);
 //   5. the credential shapes, and last the Amazon resource names and the bare
 //      twelve digit numbers (account ids);
 //   6. gaps become spaces, markers are dropped, runs of spaces one space,
@@ -283,7 +297,8 @@ function readBounded(text) {
 // What an event's message is cut to before anything else is done with it: 2,000
 // code points, the token the cut ended inside of dropped like the scrubber's own
 // read does.
-function cutRaw(text) {
+function cutRaw(raw) {
+  const text = wellFormed(raw);
   if (text.length <= RAW_MAX_CODE_POINTS) return text;
   const points = Array.from(text.length > RAW_MAX_CODE_POINTS * 2 ? text.slice(0, RAW_MAX_CODE_POINTS * 2) : text);
   if (text.length <= RAW_MAX_CODE_POINTS * 2 && points.length <= RAW_MAX_CODE_POINTS) return text;
@@ -561,7 +576,7 @@ function scrub(message, redact, secrets, maxBytes = MESSAGE_MAX_BYTES) {
   if (typeof message !== 'string') return '';
   const own = typeof redact === 'function' ? redact : (text) => text;
   try {
-    const known = readBounded(own(message));
+    const known = readBounded(own(wellFormed(message)));
     const text = finish(maskShapes(removeKnown(gaps(strip(known)), secrets)), maxBytes);
     return own(text);
   } catch {
@@ -569,4 +584,4 @@ function scrub(message, redact, secrets, maxBytes = MESSAGE_MAX_BYTES) {
   }
 }
 
-module.exports = { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes, cutBytesFromEnd, cutRaw };
+module.exports = { wellFormed, CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, cutBytes, cutBytesFromEnd, cutRaw };
