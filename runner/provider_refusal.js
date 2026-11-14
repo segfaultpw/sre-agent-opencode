@@ -142,11 +142,14 @@ const MODEL_MISSING_CODE = /(?<![a-z0-9_])(?:not_found_error|model_not_found|unk
 // platform's PCRE reads \s as these six ASCII characters, so they are spelled
 // out), and the word must start a sentence: the start of the text, or one of
 // a line feed, a colon, a quote, a backquote, a parenthesis, a bracket, or a
-// full stop, semicolon, exclamation or question mark followed by blanks, then
+// full stop, semicolon, exclamation or question mark followed by blanks, or a
+// comma or a hyphen followed by at least one blank (a gateway prefixes the
+// provider's sentence as `OpenAIException - The model ...`; `gpt-model x` has no
+// blank), then
 // at most two of `the`, `requested` and `specified`. A word of another phrase
 // right before `model` (for, parameter, field, this) is no start. `^` without
 // the m flag is the start of the text, the platform's \A.
-const MODEL_MISSING_SENTENCE = /(?:^|[\n:"'`(\[.;!?][ \t\n\v\f\r]*)(?:(?:the|requested|specified)[ \t\n\v\f\r]+){0,2}model[ \t\n\v\f\r]+[`'"]?[\w.:/@-]+[`'"]?[ \t\n\v\f\r]+does not exist\b/;
+const MODEL_MISSING_SENTENCE = /(?:^|[\n:"'`(\[.;!?][ \t\n\v\f\r]*|[,-][ \t\n\v\f\r]+)(?:(?:the|requested|specified)[ \t\n\v\f\r]+){0,2}model[ \t\n\v\f\r]+[`'"]?[\w.:/@-]+[`'"]?[ \t\n\v\f\r]+does not exist\b/;
 // A 403 is an authentication refusal only when its words say so: a content
 // policy or safety block is a 403 too, and sending a person to their key for it
 // is the wrong place.
@@ -154,7 +157,11 @@ const FORBIDDEN_AUTH_WORDS = ['unauthorized', 'unauthenticated', 'authentication
 const FORBIDDEN_POLICY_WORDS = ['content policy', 'content_policy', 'content filter', 'content_filter', 'usage policy', 'policy violation', 'safety', 'moderation'];
 // Amazon Bedrock answers a 403 with this sentence when the account has not been
 // given the model: the key was accepted, so it is a missing model, not a key.
-const MODEL_ACCESS_SENTENCE = /\b(?:don't|don\u2019t|do not|dont) have access to the model\b/;
+const MODEL_ACCESS_SENTENCE = /\b(?:don't|don\u2019t|do not|dont|doesn't|doesn\u2019t|does not|doesnt) have access to (?:the )?model\b/;
+// OpenAI answers a project that may not use a model with a 403 and the body code
+// model_not_found (Project `x` does not have access to model `y`), read as a
+// whole token like the 400 code.
+const MODEL_CODE_403 = /(?<![a-z0-9_])model_not_found(?![a-z0-9_])/;
 const FORBIDDEN_FOR_KEY = /\bforbidden\b[^.]{0,60}\b(?:key|account|token|credentials?)\b/;
 // The platform counts the 60 in bytes, so the phrase is read as bytes too.
 function forbiddenForKey(text) {
@@ -186,7 +193,7 @@ function classOf(event) {
     case 401:
       return 'auth';
     case 403:
-      return forbiddenIsAuth(text) ? 'auth' : MODEL_ACCESS_SENTENCE.test(text) && !holdsAny(text, FORBIDDEN_POLICY_WORDS) ? 'model_not_found' : null;
+      return forbiddenIsAuth(text) ? 'auth' : (MODEL_ACCESS_SENTENCE.test(text) || MODEL_CODE_403.test(text)) && !holdsAny(text, FORBIDDEN_POLICY_WORDS) ? 'model_not_found' : null;
     case 402:
       return 'billing';
     case 404:
@@ -328,10 +335,13 @@ const ESCAPES = /\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B\n]*(?:\x07|\x1B\\)?|
 // of them in the middle of a key cannot hide it from a mask and one between a
 // word and a key cannot glue the key to the word.
 // The platform's tables are Unicode 16 and Node's are newer, so a code point
-// assigned later is unassigned there and a letter, symbol or mark here. Nothing
-// is lost by that: a key is ASCII, a mark after an ASCII character, a space or
-// a gap is removed by the mark rule below with the same output, and what stays
-// after a letter of another script cannot hide an ASCII key.
+// assigned later is unassigned there and a letter, symbol or mark here. The two
+// scrubbers agree for a mark after an ASCII character, a space or a gap (the
+// mark rule below removes it with the same output) and for a letter after a
+// letter of another script. They do not agree for a letter that only Unicode 17
+// knows inside a key: here it is a visible letter, as any other letter is, so
+// the key stays in clear in this output, and the platform masks it. The
+// platform scrubs the words again before it stores or shows anything.
 // U+FFFD, what Node decodes a byte that is not valid UTF-8 to, is one of them:
 // dropping it without a marker would glue a key to the word before it.
 const INVISIBLE = /[\p{Cf}\p{Cn}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\uFFFD\u115F\u1160\u3164\uFFA0]+/gu;

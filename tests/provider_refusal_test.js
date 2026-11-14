@@ -19,7 +19,7 @@ const root = path.resolve(__dirname, '..');
 const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub, wellFormed } = require(path.join(root, 'runner', 'provider_refusal.js'));
 
 const FIXTURE_PATH = path.join(__dirname, 'fixture', 'provider_messages.json');
-const FIXTURE_SHA256 = '8557e505122766636e27bf47482523148e44e450a10bf0329aa3df504dc15b8e';
+const FIXTURE_SHA256 = '8960c422f2b8c33df27a15939deefdff71cf234e62e3118f68760777c7af350c';
 
 let failed = 0;
 function check(name, fn) {
@@ -52,6 +52,19 @@ check('the shared fixture holds in the runner, and its digest is the platform\'s
     const secrets = entry.secrets.map(expand);
     const got = scrub(expand(entry.input), redactWith(secrets), secrets);
     if (got !== expand(entry.output)) wrong.push(`${entry.name}: ${JSON.stringify(got)}`);
+  }
+  assert.deepEqual(wrong, []);
+});
+
+check('the fixture\'s classifier rows hold: a status and a body are read as the platform reads them', () => {
+  assert.ok(Array.isArray(fixture.classes) && fixture.classes.length > 0);
+  assert.equal(new Set(fixture.classes.map((row) => row.name)).size, fixture.classes.length);
+  const wrong = [];
+  for (const row of fixture.classes) {
+    const error = row.code === null ? { message: row.message } : { message: row.message, code: row.code };
+    const got = verdict([apiError(row.status, row.message, { responseBody: JSON.stringify({ error }) })]);
+    const klass = got && got.class;
+    if (klass !== row.class) wrong.push(`${row.name}: ${JSON.stringify(klass)} (wanted ${JSON.stringify(row.class)})`);
   }
   assert.deepEqual(wrong, []);
 });

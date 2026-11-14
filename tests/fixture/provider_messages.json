@@ -933,5 +933,119 @@
       "secrets": [],
       "output": "redirect https://app.example.com/cb#access%255Ftoken=[redacted]&state=1 end"
     }
+  ],
+  "classes": [
+    {
+      "name": "a 403 whose body code is model_not_found and whose message names the project and the model",
+      "status": 403,
+      "message": "Project `proj_abc` does not have access to model `gpt-5`",
+      "code": "model_not_found",
+      "class": "model_not_found"
+    },
+    {
+      "name": "the same 403 sentence with no body code",
+      "status": 403,
+      "message": "Project `proj_abc` does not have access to model `gpt-5`",
+      "code": null,
+      "class": "model_not_found"
+    },
+    {
+      "name": "a 403 with only the model_not_found body code",
+      "status": 403,
+      "message": "Request refused.",
+      "code": "model_not_found",
+      "class": "model_not_found"
+    },
+    {
+      "name": "a 403 whose message names a key keeps its auth class over the access sentence",
+      "status": 403,
+      "message": "Invalid API key. The project does not have access to model gpt-5",
+      "code": null,
+      "class": "auth"
+    },
+    {
+      "name": "a 403 with the model_not_found code and a content policy veto",
+      "status": 403,
+      "message": "This request was blocked by the content policy",
+      "code": "model_not_found",
+      "class": null
+    },
+    {
+      "name": "a 403 whose body code merely starts with model_not_found",
+      "status": 403,
+      "message": "Your request was blocked.",
+      "code": "model_not_found_in_tools",
+      "class": null
+    },
+    {
+      "name": "a 403 whose body code merely ends in model_not_found",
+      "status": 403,
+      "message": "Your request was blocked.",
+      "code": "x_model_not_found",
+      "class": null
+    },
+    {
+      "name": "a 403 about a feature the project cannot use",
+      "status": 403,
+      "message": "The project does not have access to this feature",
+      "code": null,
+      "class": null
+    },
+    {
+      "name": "a 403 about a region",
+      "status": 403,
+      "message": "Country, region, or territory not supported",
+      "code": null,
+      "class": null
+    },
+    {
+      "name": "a 400 that opens with a gateway name, a dash and the sentence",
+      "status": 400,
+      "message": "OpenAIException - The model `gpt-9` does not exist",
+      "code": "invalid_request_error",
+      "class": "model_not_found"
+    },
+    {
+      "name": "a 400 that opens with a gateway name, a dash and the sentence, no code",
+      "status": 400,
+      "message": "OpenAIException - The model `gpt-9` does not exist",
+      "code": null,
+      "class": "model_not_found"
+    },
+    {
+      "name": "a 400 that opens with an error word, a comma and the sentence",
+      "status": 400,
+      "message": "Error, model gpt-9 does not exist",
+      "code": null,
+      "class": "model_not_found"
+    },
+    {
+      "name": "a 400 whose dash is part of a word before the model",
+      "status": 400,
+      "message": "gpt-model x does not exist",
+      "code": null,
+      "class": null
+    },
+    {
+      "name": "a 400 whose comma has no blank after it",
+      "status": 400,
+      "message": "field,model x does not exist",
+      "code": null,
+      "class": null
+    },
+    {
+      "name": "a 400 whose dash and comma sit in a phrase about a parameter",
+      "status": 400,
+      "message": "Unsupported parameter for model - 'temperature' does not exist",
+      "code": null,
+      "class": null
+    },
+    {
+      "name": "a 400 whose phrase about a parameter has a comma before the field",
+      "status": 400,
+      "message": "Unsupported parameter for model, 'temperature' does not exist",
+      "code": null,
+      "class": null
+    }
   ]
 }
