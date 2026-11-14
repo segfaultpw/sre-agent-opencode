@@ -19,7 +19,7 @@ const root = path.resolve(__dirname, '..');
 const { CLASSES, EVENTS_MAX, RAW_MAX_CODE_POINTS, MESSAGE_MAX_BYTES, eventFrom, remember, classify, scrub } = require(path.join(root, 'runner', 'provider_refusal.js'));
 
 const FIXTURE_PATH = path.join(__dirname, 'fixture', 'provider_messages.json');
-const FIXTURE_SHA256 = 'b33df8d81c1821d62814a81eccfa8844102a181bd9ebc7619a9560c170cadbbe';
+const FIXTURE_SHA256 = '830a01b9085b29fbe06f74abe7459ed4474c04dfa037f3de433353485a6ba693';
 
 let failed = 0;
 function check(name, fn) {
@@ -81,17 +81,37 @@ check('every case has a distinct name and no key-shaped literal is committed', (
 // secret may survive in the output.
 const TEMPLATES = [
   ['an access key id', 'Request from ', `AKIA${'B'.repeat(16)}`, ' failed', []],
+  ['a temporary access key id', 'session ', `ASIA${'C'.repeat(16)}`, ' expired', []],
   ['a google key', 'API key ', `AIza${'D'.repeat(35)}`, ' not valid', []],
   ['a github token', 'user ', `ghp_${'e'.repeat(30)}`, ' x', []],
+  ['a fine grained token', 'token ', `github_pat_${'f'.repeat(30)}`, ' bad', []],
+  ['a slack token', 'bot ', `xoxb-${'1'.repeat(12)}-abc`, ' revoked', []],
   ['an anthropic key', 'key ', `sk-ant-api03-${'A'.repeat(40)}`, ' rejected', []],
+  ['an openai key', 'key: ', `sk-proj-${'a'.repeat(30)}`, '. Next sentence', []],
+  ['a hugging face token', 'token ', `hf_${'a'.repeat(34)}`, ' bad', []],
+  ['a replicate token', 'model ', `r8_${'b'.repeat(37)}`, ' bad', []],
+  ['a gitlab token', 'token ', `glpat-${'d'.repeat(20)}`, ' bad', []],
+  ['a stripe key', 'key ', `sk_live_${'e'.repeat(24)}`, ' bad', []],
   ['a jwt', 'error at line abc ', `eyJ${'a'.repeat(10)}.${'b'.repeat(10)}.${'c'.repeat(10)}`, ' done', []],
   ['a bearer token', 'Authorization: Bearer ', 'abc123def456', ' x', []],
+  ['a basic credential', 'Authorization: Basic ', 'dXNlcjpwYXNzd29yZA==', ' x', []],
   ['an api key header', 'x-api-key: ', 'a'.repeat(32), ' sent', []],
+  ['an ocp apim subscription key header', 'Ocp-Apim-Subscription-Key: ', 'q'.repeat(32), ' sent', []],
+  ['a password field', 'login failed, password: ', 'hunter2xyz', ' for user', []],
   ['a json key', '{"api_key": "', 'd'.repeat(40), '", "m": 1}', []],
+  ['a json secret access key', '{"SecretAccessKey": "', `${'a'.repeat(20)}/${'B'.repeat(19)}`, '"}', []],
   ['a query token', 'GET https://api.example.com/v1/models?access_token=', 't'.repeat(20), '&x=1 failed', []],
+  ['a url fragment token', 'redirect https://app.example.com/cb#access_token=', 't'.repeat(30), '&state=1 end', []],
+  ['a url password', 'proxy https://user:', 'hunter2xyz', '@proxy.example.com failed', []],
+  ['an arn', 'role ', 'arn:aws:iam::123456789012:role/sre-agent-task', ' denied', []],
+  ['an account id', 'account ', '123456789012', ' is not subscribed', []],
   ['a long run', 'gw ', 'x'.repeat(60), ' end', []],
   ['a known key', 'key ', 'KEY12345678', ' rejected', ['KEY12345678']],
 ];
+
+// A line break, a tab, a NUL, and every kind of invisible or exotic space: each
+// is a gap or a marker to the rules, never something that hides a key.
+const BREAKS = ['\n', '\r\n    ', '\t', '\0', '\u00A0', '\u2028', '\uFEFF', '\u200B', '\u2060', '\u034F', '\uFE0F', '\u3000'];
 
 function windows(secret, size) {
   const chars = Array.from(secret);
@@ -104,7 +124,7 @@ check('no part of a secret survives a line break at any position', () => {
   const leaks = [];
   for (const [name, before, secret, after, keys] of TEMPLATES) {
     const whole = Array.from(before + secret + after);
-    for (const separator of ['\n', '\r\n    ', '\t', '\0']) {
+    for (const separator of BREAKS) {
       for (let at = 1; at < whole.length; at += 1) {
         const input = whole.slice(0, at).join('') + separator + whole.slice(at).join('');
         const out = scrub(input, redactWith(keys), keys).replace(/\s/g, '');
@@ -190,6 +210,126 @@ check('the redact function runs on the raw words and on the result', () => {
   assert.equal(scrub(`invalid key ${secret}`, redact, []), 'invalid key [redacted]');
   assert.equal(seen.length, 2);
   assert.ok(seen[0].includes(secret));
+});
+
+check('an invisible character leaves nothing behind but a gap: it hides no key and glues none to a word', () => {
+  const key = `AKIA${'B'.repeat(16)}`;
+  for (const invisible of ['\u200B', '\uFEFF', '\u2060', '\u034F', '\uFE0F', '\u{E0041}', '\u{E0100}']) {
+    assert.equal(scrub(`from${invisible}${key} failed`, null, []), 'from[redacted] failed', JSON.stringify(invisible));
+    assert.equal(scrub(`${key.slice(0, 9)}${invisible}${key.slice(9)} failed`, null, []), '[redacted] failed', JSON.stringify(invisible));
+  }
+  assert.equal(scrub('a\u200B\u200B\u200Bb', null, []), 'ab');
+  assert.equal(scrub('a \u200Bb', null, []), 'a b');
+  assert.equal(scrub('\u200B\u202E', null, []), '');
+});
+
+check('a whitespace run that holds anything but plain spaces is a gap, and the controls are one space', () => {
+  assert.equal(scrub('a\u0000b\u0085c\u2028d\u2029e\u00A0f\u3000g\v\fh', null, []), 'a b c d e f g h');
+  assert.equal(scrub('a   b\t\tc', null, []), 'a b c');
+  assert.equal(scrub(`key sk-ant-api03-${'A'.repeat(20)}\u3000${'A'.repeat(20)} rejected`, null, []), 'key [redacted] rejected');
+});
+
+check('an account identifier is masked: an Amazon resource name whole, and a bare twelve digit number that is not part of a longer one', () => {
+  assert.equal(scrub('User: arn:aws:iam::123456789012:role/sre-agent-task is not authorized', null, []), 'User: [redacted] is not authorized');
+  assert.equal(scrub('denied arn:aws-us-gov:iam::123456789012:user/ops now', null, []), 'denied [redacted] now');
+  assert.equal(scrub('Account 123456789012 is not subscribed', null, []), 'Account [redacted] is not subscribed');
+  assert.equal(scrub('request 1234567890123 and 12345678901 and 123e4567-e89b-12d3-a456-426614174000 stay', null, []), 'request 1234567890123 and 12345678901 and 123e4567-e89b-12d3-a456-426614174000 stay');
+});
+
+check('a field with a secret in it is masked: a password, a client secret, a percent-encoded query name, an Ocp-Apim key', () => {
+  assert.equal(scrub('login failed, password: hunter2xyz for user', null, []), 'login failed, password: [redacted] for user');
+  assert.equal(scrub('secret=s3cr3t-value used', null, []), 'secret=[redacted] used');
+  assert.equal(scrub('GET /v1/models?x%2Dapi%2Dkey=value123&y=2 failed', null, []), 'GET /v1/models?x%2Dapi%2Dkey=[redacted]&y=2 failed');
+  assert.equal(scrub(`Ocp-Apim-Subscription-Key: ${'a'.repeat(32)} was refused`, null, []), 'Ocp-Apim-Subscription-Key: [redacted] was refused');
+  assert.equal(scrub('{"type": "authentication_error", "token_type": "bearer_x"}', null, []), '{"type": "authentication_error", "token_type": "bearer_x"}');
+});
+
+check('a known key is removed in its base64 forms too, at each of the three alignments, and a key nobody gave is kept', () => {
+  const key = 'KEY12345678';
+  for (const encoded of ['S0VZMTIzNDU2Nzg=', 'eEtFWTEyMzQ1Njc4', 'eHlLRVkxMjM0NTY3OA==']) {
+    assert.equal(scrub(`token ${encoded} rejected`, null, [key]), 'token [redacted] rejected', encoded);
+  }
+  assert.equal(scrub('credential dXNlcjpLRVkxMjM0NTY3OA== rejected', null, [key]), 'credential dXNl[redacted] rejected');
+  assert.equal(scrub('token S0VZMTIzNDU2Nzg= rejected', null, []), 'token S0VZMTIzNDU2Nzg= rejected');
+  const urlSafe = Buffer.from(`xy${'k?>>'.repeat(3)}`).toString('base64');
+  assert.ok(urlSafe.includes('+') || urlSafe.includes('/'));
+  const secret = 'k?>>k?>>k?>>';
+  const echoed = Buffer.from(`xy${secret}`).toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+  assert.equal(scrub(`token ${echoed} rejected`, null, [secret]), 'token [redacted] rejected');
+  const accented = 'cl\u00E9-secr\u00E8te-1234';
+  assert.equal(scrub(`token ${Buffer.from(accented).toString('base64')} rejected`, null, [accented]), 'token [redacted] rejected');
+});
+
+check('a secret holding a control character is removed from its JSON-escaped form, which writes the code in upper case', () => {
+  const secret = 'abc\u001Fdef-ghi-jkl';
+  assert.equal(scrub('echoed abc\\u001Fdef-ghi-jkl in the body', null, [secret]), 'echoed [redacted] in the body');
+  const slashed = 'a/b\\u0061c-0123456789';
+  assert.equal(scrub(`echoed ${JSON.stringify(slashed).slice(1, -1)} in the body`, null, [slashed]), 'echoed [redacted] in the body');
+});
+
+// A hostile shape costs linear work in what is read, and a multi-megabyte body
+// costs what its first 64 KiB cost. A wall clock cannot be exact, so each bound
+// is far from both the measured cost and the cost of a search per start (the
+// quadratic form of the JWT rule took 620 ms at 64 KiB where this takes 2).
+const HOSTILE = [
+  ['a key prefix with no key', 'sk-ant-'],
+  ['a bearer word', 'Bearer '],
+  ['a jwt start', 'eyJ'],
+  ['a jwt start inside a run', 'eyJa.'],
+  ['a jwt start and a line break', 'eyJ\n'],
+  ['a jwt start after a space', ' eyJ'],
+  ['a jwt start and a dot', 'eyJ.'],
+  ['a jwt start and an invisible character', 'eyJ\u200B'],
+  ['an arn prefix', 'arn:aws:'],
+  ['an arn prefix and a line break', 'arn:aws:\n'],
+  ['digits', '1234567890'],
+  ['digits and line breaks', '12345\n6789012\n'],
+  ['a header name', 'password:'],
+  ['a query name', '?token='],
+  ['a user in a url', '://a:'],
+  ['a run of key characters', 'abcdefghij'],
+  ['an access key prefix', 'AKIA'],
+  ['line breaks between key characters', 'abcdef\n'],
+  ['spaces', ' '],
+  ['an escape start', '\x1b['],
+];
+
+function bestMilliseconds(work) {
+  let best = Infinity;
+  for (let round = 0; round < 3; round += 1) {
+    const started = process.hrtime.bigint();
+    work();
+    best = Math.min(best, Number(process.hrtime.bigint() - started) / 1e6);
+  }
+  return best;
+}
+
+function repeated(unit, size) {
+  return unit.repeat(Math.max(Math.floor(size / Buffer.byteLength(unit)), 1));
+}
+
+check('4 MiB costs what 256 KiB costs, because only the first 64 KiB is read', () => {
+  for (const [name, unit] of HOSTILE) {
+    const small = bestMilliseconds(() => scrub(repeated(unit, 262144), null, ['gw-secret-key-1']));
+    const large = bestMilliseconds(() => scrub(repeated(unit, 4194304), null, ['gw-secret-key-1']));
+    assert.ok(large <= 4 * small + 250, `${name}: ${small.toFixed(1)} ms for 256 KiB, ${large.toFixed(1)} ms for 4 MiB`);
+    assert.ok(large < 1500, `${name}: ${large.toFixed(1)} ms for 4 MiB`);
+  }
+});
+
+check('work grows linearly with what is read, up to the read bound', () => {
+  for (const [name, unit] of HOSTILE) {
+    const small = bestMilliseconds(() => scrub(repeated(unit, 16384), null, []));
+    const large = bestMilliseconds(() => scrub(repeated(unit, 65536), null, []));
+    assert.ok(large <= 8 * small + 150, `${name}: ${small.toFixed(1)} ms for 16 KiB, ${large.toFixed(1)} ms for 64 KiB`);
+  }
+});
+
+check('a hostile run of jwt starts is one long run, a start that is no jwt is left alone and one that is is masked from its first start', () => {
+  assert.equal(scrub(`${'eyJ\n'.repeat(5000)}x`, null, []), '[redacted]');
+  assert.equal(scrub('eyJ.eyJ.eyJ.eyJa.b.c done', null, []), 'eyJ.eyJ.eyJ.[redacted] done');
+  assert.equal(scrub('eyJ\neyJ\n x y z done', null, []), 'eyJ eyJ x y z done');
+  assert.equal(scrub('eyJ\neyJ\neyJ\na.b.c done', null, []), '[redacted] done');
 });
 
 // opencode's own shapes, as the --format json events carry them.

@@ -514,6 +514,214 @@
       "input": "error:\nAKIA{{repeat:B:16}}\nfailed",
       "secrets": [],
       "output": "error: [redacted] failed"
+    },
+    {
+      "name": "an arn names an account and a role",
+      "input": "User: arn:aws:iam::123456789012:role/sre-agent-task is not authorized to perform: bedrock:InvokeModel",
+      "secrets": [],
+      "output": "User: [redacted] is not authorized to perform: bedrock:InvokeModel"
+    },
+    {
+      "name": "an arn of a model keeps nothing of the account",
+      "input": "Access denied for arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-sonnet-4-5-v1:0 today",
+      "secrets": [],
+      "output": "Access denied for [redacted] today"
+    },
+    {
+      "name": "an arn of a partition suffix",
+      "input": "denied arn:aws-us-gov:iam::123456789012:user/ops now",
+      "secrets": [],
+      "output": "denied [redacted] now"
+    },
+    {
+      "name": "an arn split by a line break",
+      "input": "role arn:aws:iam::1234\n56789012:role/x denied",
+      "secrets": [],
+      "output": "role [redacted] denied"
+    },
+    {
+      "name": "an arn after a line break",
+      "input": "denied\narn:aws:sts::123456789012:assumed-role/r/s now",
+      "secrets": [],
+      "output": "denied [redacted] now"
+    },
+    {
+      "name": "a bare account id",
+      "input": "Account 123456789012 is not subscribed to this model",
+      "secrets": [],
+      "output": "Account [redacted] is not subscribed to this model"
+    },
+    {
+      "name": "a bare account id between line breaks",
+      "input": "account\n123456789012\nfailed",
+      "secrets": [],
+      "output": "account [redacted] failed"
+    },
+    {
+      "name": "a bare account id split by a line break",
+      "input": "account 1234567\n89012 failed",
+      "secrets": [],
+      "output": "account [redacted] failed"
+    },
+    {
+      "name": "a thirteen digit number is kept",
+      "input": "request 1234567890123 failed",
+      "secrets": [],
+      "output": "request 1234567890123 failed"
+    },
+    {
+      "name": "an eleven digit number is kept",
+      "input": "request 12345678901 failed",
+      "secrets": [],
+      "output": "request 12345678901 failed"
+    },
+    {
+      "name": "the base64 of a known key",
+      "input": "token S0VZMTIzNDU2Nzg= rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "token [redacted] rejected"
+    },
+    {
+      "name": "the base64 of a known key after one byte",
+      "input": "token eEtFWTEyMzQ1Njc4 rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "token [redacted] rejected"
+    },
+    {
+      "name": "the base64 of a known key after two bytes",
+      "input": "token eHlLRVkxMjM0NTY3OA== rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "token [redacted] rejected"
+    },
+    {
+      "name": "the base64 of a user name, a colon and a known key",
+      "input": "credential dXNlcjpLRVkxMjM0NTY3OA== rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "credential dXNl[redacted] rejected"
+    },
+    {
+      "name": "the base64 of a user letter, a colon and a known key",
+      "input": "credential dTpLRVkxMjM0NTY3OA== rejected",
+      "secrets": [
+        "KEY12345678"
+      ],
+      "output": "credential [redacted] rejected"
+    },
+    {
+      "name": "the base64 of a key nobody gave is kept",
+      "input": "token S0VZMTIzNDU2Nzg= rejected",
+      "secrets": [],
+      "output": "token S0VZMTIzNDU2Nzg= rejected"
+    },
+    {
+      "name": "an ocp apim subscription key header",
+      "input": "Ocp-Apim-Subscription-Key: {{repeat:a:32}} was refused",
+      "secrets": [],
+      "output": "Ocp-Apim-Subscription-Key: [redacted] was refused"
+    },
+    {
+      "name": "a password field",
+      "input": "login failed, password: hunter2xyz for user",
+      "secrets": [],
+      "output": "login failed, password: [redacted] for user"
+    },
+    {
+      "name": "a secret field",
+      "input": "secret=s3cr3t-value used",
+      "secrets": [],
+      "output": "secret=[redacted] used"
+    },
+    {
+      "name": "a client secret field",
+      "input": "client_secret: abc123def456 was sent",
+      "secrets": [],
+      "output": "client_secret: [redacted] was sent"
+    },
+    {
+      "name": "a percent-encoded query name",
+      "input": "GET /v1/models?api%5Fkey={{repeat:t:20}}&x=1 failed",
+      "secrets": [],
+      "output": "GET /v1/models?api%5Fkey=[redacted]&x=1 failed"
+    },
+    {
+      "name": "percent-encoded hyphens in a query name",
+      "input": "GET /v1/models?x%2Dapi%2Dkey=value123&y=2 failed",
+      "secrets": [],
+      "output": "GET /v1/models?x%2Dapi%2Dkey=[redacted]&y=2 failed"
+    },
+    {
+      "name": "a key split by a no-break space",
+      "input": "key AKIA{{repeat:B:8}}\u00a0{{repeat:B:8}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "a key split by an ideographic space",
+      "input": "key sk-ant-api03-{{repeat:A:20}}\u3000{{repeat:A:20}} rejected",
+      "secrets": [],
+      "output": "key [redacted] rejected"
+    },
+    {
+      "name": "U+FEFF between a word and an access key",
+      "input": "from\ufeffAKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "from[redacted] failed"
+    },
+    {
+      "name": "U+200B between a word and an access key",
+      "input": "from\u200bAKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "from[redacted] failed"
+    },
+    {
+      "name": "U+2060 between a word and an access key",
+      "input": "from\u2060AKIA{{repeat:B:16}} failed",
+      "secrets": [],
+      "output": "from[redacted] failed"
+    },
+    {
+      "name": "U+FEFF between a word and an sk key",
+      "input": "from\ufeffsk-ant-api03-{{repeat:A:30}} rejected",
+      "secrets": [],
+      "output": "from[redacted] rejected"
+    },
+    {
+      "name": "U+200B between a word and an sk key",
+      "input": "from\u200bsk-ant-api03-{{repeat:A:30}} rejected",
+      "secrets": [],
+      "output": "from[redacted] rejected"
+    },
+    {
+      "name": "U+2060 between a word and an sk key",
+      "input": "from\u2060sk-ant-api03-{{repeat:A:30}} rejected",
+      "secrets": [],
+      "output": "from[redacted] rejected"
+    },
+    {
+      "name": "U+FEFF between a word and a jwt",
+      "input": "from\ufeffeyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} done",
+      "secrets": [],
+      "output": "from[redacted] done"
+    },
+    {
+      "name": "U+200B between a word and a jwt",
+      "input": "from\u200beyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} done",
+      "secrets": [],
+      "output": "from[redacted] done"
+    },
+    {
+      "name": "U+2060 between a word and a jwt",
+      "input": "from\u2060eyJ{{repeat:a:10}}.{{repeat:b:10}}.{{repeat:c:10}} done",
+      "secrets": [],
+      "output": "from[redacted] done"
     }
   ]
 }

@@ -22,9 +22,11 @@
 // The words are scrubbed the way the platform scrubs them (the shape list and
 // its order are the platform's, and tests/fixture/provider_messages.json pins
 // both implementations to the same outputs, byte for byte): the secrets the
-// runner holds are removed by value, every credential shape is masked, nothing
-// invisible is left to hide a key from a mask, and what is left is one line of
-// at most 500 bytes cut on a character. This module never logs.
+// runner holds are removed by value, every credential shape is masked, an
+// account identifier (an Amazon resource name or a twelve digit number) is
+// masked, nothing invisible is left to hide a key from a mask, and what is
+// left is one line of at most 500 bytes cut on a character. This module never
+// logs.
 
 const CLASSES = ['auth', 'billing', 'quota', 'rate_limit', 'model_not_found'];
 const EVENTS_MAX = 20;
@@ -33,11 +35,16 @@ const MESSAGE_MAX_BYTES = 500;
 
 const READ_BYTES = 65536;
 const MIN_SECRET_BYTES = 8;
+const MIN_ENCODED_CHARS = 8;
 const WRAPPED_LINES = 8;
 const BODY_MAX_CHARS = 65536;
 const BODY_FIELD_MAX_CHARS = 200;
 const MASK = '[redacted]';
 const GAP = '\x01';
+// What a removed invisible character leaves behind: the rules read it as a gap
+// and the output drops it.
+const REMOVED = '\x02';
+const GAP_STAR = '[\\x01\\x02]*';
 
 // What is read out of one error event. The runner keeps the last EVENTS_MAX of
 // them, each message already cut at RAW_MAX_CODE_POINTS.
@@ -106,12 +113,14 @@ function bodyCodeOf(body) {
 }
 
 // What a billing, quota or model signal looks like in the lower-cased message
-// and body code. Loose words are not here on purpose: a bare "billing" or
-// "does not exist" appears in a bug in our own request as easily as in a
-// refusal.
+// and body code. Loose words are not here on purpose: a bare "billing" or "does
+// not exist" appears in a bug in our own request as easily as in a refusal.
 const BILLING_400 = ['credit balance', 'billing_hard_limit', 'billing hard limit', 'billing account', 'insufficient funds', 'purchase credits', 'payment required', 'account is not active'];
 const MODEL_400 = ['not_found_error', 'model_not_found', 'unknown model', 'model not found'];
 const MODEL_MISSING_SENTENCE = /\bmodel\b[^.]{0,120}\bdoes not exist\b/;
+function missingModelSentence(text) {
+  return MODEL_MISSING_SENTENCE.test(text);
+}
 const QUOTA_429 = ['insufficient_quota', 'exceeded your current quota', 'quota exceeded', 'free tier'];
 
 function holdsAny(text, words) {
@@ -133,7 +142,7 @@ function classOf(event) {
     case 400: {
       const found = [];
       if (holdsAny(text, BILLING_400)) found.push('billing');
-      if (holdsAny(text, MODEL_400) || MODEL_MISSING_SENTENCE.test(text)) found.push('model_not_found');
+      if (holdsAny(text, MODEL_400) || missingModelSentence(text)) found.push('model_not_found');
       return found.length === 1 ? found[0] : null;
     }
     case 429:
@@ -161,16 +170,21 @@ function classify(events, run, options = {}) {
 // ---------------------------------------------------------------------------
 // The scrubber. One reading of the text, in this order:
 //   1. at most the first 65,536 bytes, a token the cut ended inside of dropped;
-//   2. escape sequences and invisible characters removed;
+//   2. escape sequences removed, and invisible characters (every format
+//      character, the combining grapheme joiner, the variation selectors)
+//      replaced by one marker byte per run;
 //   3. every run of whitespace and control characters one space, or one gap
-//      byte when the run holds a control character or a line break, which the
-//      steps below see through;
-//   4. the secrets the runner holds, by value, a gap allowed between any two
-//      characters (the secrets of 8 bytes or more: a placeholder key would wipe
-//      its own letters from every message);
-//   5. the credential shapes;
-//   6. gaps become spaces, runs of spaces one space, trimmed, 500 bytes cut on
-//      a character.
+//      byte when the run holds anything but plain spaces (a control character,
+//      a line break, a no-break space, another Unicode space); the rules below
+//      see through both the gap and the marker;
+//   4. the secrets the runner holds, by value (as stored, percent-encoded,
+//      JSON-escaped, and as base64), a gap allowed between any two characters
+//      (the secrets of 8 bytes or more: a placeholder key would wipe its own
+//      letters from every message);
+//   5. the credential shapes, and last the Amazon resource names and the bare
+//      twelve digit numbers (account ids);
+//   6. gaps become spaces, markers are dropped, runs of spaces one space,
+//      trimmed, 500 bytes cut on a character.
 // ---------------------------------------------------------------------------
 
 // A token the cut ended inside of is dropped whole, and so is the token before
@@ -246,63 +260,124 @@ function cutRaw(text) {
 // or the end of the line), the string controls DCS, SOS, PM and APC (until ST),
 // and any other two or three byte escape.
 const ESCAPES = /\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B\n]*(?:\x07|\x1B\\)?|\x1B[PX^_][^\x07\x1B\n]*(?:\x1B\\)?|\x1B[ -/]*[0-~]/g;
-// Every format character, the combining grapheme joiner, the variation
-// selectors and the invalid-byte stand-in Node decodes a bad byte to.
-const INVISIBLE = /[\p{Cf}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}\uFFFD]/gu;
-const SPACE_RUN = /[\x00-\x20\x7F-\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+/gu;
-const HARD_WHITESPACE = /[\x00-\x1F\x7F-\x9F\u2028\u2029]/u;
+// Every format character, the combining grapheme joiner and the variation
+// selectors. A run of them leaves one marker byte: the rules read it as a gap
+// and the output drops it, so one of them in the middle of a key cannot hide
+// it from a mask and one between a word and a key cannot glue the key to the
+// word.
+const INVISIBLE = /[\p{Cf}\u034F\uFE00-\uFE0F\u{E0100}-\u{E01EF}]+/gu;
+// The stand-in Node decodes a byte that is not valid UTF-8 to: the platform
+// drops such a byte without a trace, and so does this.
+const BAD_BYTE = /\uFFFD/g;
+// Every run of whitespace and control characters except the marker byte.
+const SPACE_RUN = /[\x00\x01\x03-\x20\x7F-\xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]+/gu;
+const NOT_A_PLAIN_SPACE = /[^ ]/u;
 
 function strip(text) {
-  return text.replace(ESCAPES, '').replace(INVISIBLE, '');
+  return text.replace(ESCAPES, '').replace(INVISIBLE, REMOVED).replace(BAD_BYTE, '');
 }
 
+// A run that holds anything but plain spaces (a control character, a line
+// break, a no-break space, another Unicode space) is a gap: a terminal wrapped
+// the text, or something was inserted.
 function gaps(text) {
-  return text.replace(SPACE_RUN, (run) => (HARD_WHITESPACE.test(run) ? GAP : ' '));
+  return text.replace(SPACE_RUN, (run) => (NOT_A_PLAIN_SPACE.test(run) ? GAP : ' '));
 }
 
-// The characters of a literal with a gap allowed between each two, as a pattern.
+// The characters of a literal with a gap or a marker allowed between each two
+// (graphemes, as the platform reads them), as a pattern.
+const GRAPHEMES = typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function' ? new Intl.Segmenter('und', { granularity: 'grapheme' }) : null;
+
+function graphemes(text) {
+  return GRAPHEMES ? Array.from(GRAPHEMES.segment(text), (part) => part.segment) : Array.from(text);
+}
+
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&');
+}
+
 function literal(text) {
-  return Array.from(text)
-    .map((character) => character.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&'))
-    .join('\\x01*');
+  return graphemes(text).map(escapeRegex).join(GAP_STAR);
 }
 
 function alt(names) {
   return names.map(literal).join('|');
 }
 
+// The names of a secret field, which a URL may spell with a percent-encoded
+// underscore or hyphen (`api%5Fkey`).
+function nameLiteral(name) {
+  return graphemes(name)
+    .map((character) => (character === '_' ? '(?:_|%5[Ff])' : character === '-' ? '(?:-|%2[Dd])' : escapeRegex(character)))
+    .join(GAP_STAR);
+}
+
+function nameAlt(names) {
+  return names.map(nameLiteral).join('|');
+}
+
 const QUERY_NAMES = ['access_token', 'id_token', 'refresh_token', 'token', 'api_key', 'apikey', 'api-key', 'key', 'secret', 'client_secret', 'password', 'passwd', 'pwd', 'signature', 'sig', 'auth', 'authorization', 'x-api-key'];
 const JSON_NAMES = [...QUERY_NAMES, 'secret_access_key', 'secretaccesskey', 'aws_secret_access_key', 'session_token', 'x-goog-api-key'];
-const HEADER_NAMES = ['x-api-key', 'x-goog-api-key', 'api-key', 'authorization', 'proxy-authorization', 'x-auth-token'];
+const HEADER_NAMES = ['x-api-key', 'x-goog-api-key', 'api-key', 'authorization', 'proxy-authorization', 'x-auth-token', 'ocp-apim-subscription-key'];
+const FIELD_NAMES = ['password', 'passwd', 'client_secret', 'secret', 'api_key', 'apikey', 'access_token', 'refresh_token'];
 const SCHEMES = ['basic', 'bearer', 'digest', 'negotiate', 'ntlm', 'token', 'apikey', 'api-key', 'key', 'hmac'];
 
-const GAP_STAR = '\\x01*';
-const WS = '[\\s\\x01]';
-const TOKEN = '[^\\s\\x01]+(?:\\x01+[^\\s\\x01]+)*';
-const JSON_VALUE = '[^"\'\\s,}\\x01]+(?:\\x01+[^"\'\\s,}\\x01]+)*';
+const WS = '[\\s\\x01\\x02]';
+const TOKEN = '[^\\s\\x01\\x02]+(?:[\\x01\\x02]+[^\\s\\x01\\x02]+)*';
+const FIELD_VALUE = '[^&;,"\'<>\\s\\x01\\x02]+(?:[\\x01\\x02]+[^&;,"\'<>\\s\\x01\\x02]+)*';
+const JSON_VALUE = '[^"\'\\s,}\\x01\\x02]+(?:[\\x01\\x02]+[^"\'\\s,}\\x01\\x02]+)*';
 const NOT_IN_WORD = '(?<![A-Za-z0-9])';
 
 function run(characterClass) {
-  return `(${characterClass}+(?:\\x01+${characterClass}+)*)`;
+  return `(${characterClass}+(?:[\\x01\\x02]+${characterClass}+)*)`;
 }
 
-function segment() {
-  return '[A-Za-z0-9_-]+(?:\\x01+[A-Za-z0-9_-]+)*';
+// The platform reads a JWT with possessive quantifiers, so a hostile run of
+// `eyJ` starts costs one pass each instead of a search. A regex engine without
+// them would still cost one pass per start, so the rule is a function: after a
+// start that failed, every later start inside the same run of segment
+// characters and gaps fails the same way (its run ends where this one did), and
+// the search resumes after that run. Linear in the text.
+const JWT_SEGMENT = '[A-Za-z0-9_-]+(?:[\\x01\\x02]+[A-Za-z0-9_-]+)*';
+const JWT_START = new RegExp(`(?<![A-Za-z0-9_-])${literal('eyJ')}${GAP_STAR}`, 'g');
+const JWT_SEGMENT_AT = new RegExp(JWT_SEGMENT, 'y');
+const JWT_REST_AT = new RegExp(`${JWT_SEGMENT}${GAP_STAR}\\.${GAP_STAR}${JWT_SEGMENT}${GAP_STAR}\\.${GAP_STAR}${JWT_SEGMENT}`, 'y');
+
+function maskJwts(text) {
+  let out = '';
+  let copied = 0;
+  JWT_START.lastIndex = 0;
+  for (let found = JWT_START.exec(text); found !== null; found = JWT_START.exec(text)) {
+    const bodyAt = JWT_START.lastIndex;
+    JWT_REST_AT.lastIndex = bodyAt;
+    if (JWT_REST_AT.test(text)) {
+      out += text.slice(copied, found.index) + MASK;
+      copied = JWT_REST_AT.lastIndex;
+      JWT_START.lastIndex = copied;
+    } else {
+      JWT_SEGMENT_AT.lastIndex = bodyAt;
+      JWT_START.lastIndex = JWT_SEGMENT_AT.test(text) ? JWT_SEGMENT_AT.lastIndex : found.index + 1;
+    }
+  }
+  return out + text.slice(copied);
 }
 
 // A `count` rule masks the whole match only when its first group (the run of
-// key characters, the gaps between them not counted) holds at least `minimum`
-// characters, which is how `{20,}` is written once gaps are allowed inside a run.
+// key characters, the gaps and markers between them not counted) holds at least
+// `minimum` characters, which is how `{20,}` is written once gaps are allowed
+// inside a run.
 function count(source, minimum) {
-  return [new RegExp(source, 'g'), (whole, keyRun) => (keyRun.split(GAP).join('').length >= minimum ? MASK : whole)];
+  return [new RegExp(source, 'g'), (whole, keyRun) => (keyRun.replace(/[\x01\x02]/g, '').length >= minimum ? MASK : whole)];
 }
 
 function replace(source, flags, replacement) {
   return [new RegExp(source, `g${flags}`), replacement];
 }
 
+const ARN_CLASS = '[A-Za-z0-9+=,.@_:/*-]';
+
 const SHAPES = [
-  replace(`([?&;#])${GAP_STAR}(${alt(QUERY_NAMES)})${GAP_STAR}=[^&\\s"'<>]+`, 'i', (_whole, mark, name) => `${mark}${name}=${MASK}`),
+  replace(`([?&;#])${GAP_STAR}(${nameAlt(QUERY_NAMES)})${GAP_STAR}=[^&\\s"'<>]+`, 'i', (_whole, mark, name) => `${mark}${name}=${MASK}`),
   replace(`(:${GAP_STAR}/${GAP_STAR}/)[^/\\s:@]+:[^/\\s@]+@`, '', (_whole, scheme) => `${scheme}${MASK}@`),
   count(NOT_IN_WORD + literal('sk-ant-') + GAP_STAR + run('[A-Za-z0-9_-]'), 20),
   count(NOT_IN_WORD + literal('sk-') + GAP_STAR + run('[A-Za-z0-9_-]'), 20),
@@ -322,14 +397,21 @@ const SHAPES = [
   count(NOT_IN_WORD + literal('npm_') + GAP_STAR + run('[A-Za-z0-9]'), 30),
   replace(`${literal('bearer')}${WS}+${TOKEN}`, 'i', () => `Bearer ${MASK}`),
   replace(`((?:${alt(HEADER_NAMES)})${WS}*[:=]${WS}*(?:(?:${alt(SCHEMES)})${WS}+)?)${TOKEN}`, 'i', (_whole, head) => `${head}${MASK}`),
+  replace(`((?:${nameAlt(FIELD_NAMES)})${WS}*[:=]${WS}*)${FIELD_VALUE}`, 'i', (_whole, head) => `${head}${MASK}`),
   replace(
-    `(["']${GAP_STAR}(?:${alt(JSON_NAMES)})${GAP_STAR}["']${WS}*[:=]${WS}*["']?${GAP_STAR}(?:(?:${alt(SCHEMES)})${WS}+)?)${JSON_VALUE}`,
+    `(["']${GAP_STAR}(?:${nameAlt(JSON_NAMES)})${GAP_STAR}["']${WS}*[:=]${WS}*["']?${GAP_STAR}(?:(?:${alt(SCHEMES)})${WS}+)?)${JSON_VALUE}`,
     'i',
     (_whole, head) => `${head}${MASK}`
   ),
-  replace(`(?<![A-Za-z0-9_-])${literal('eyJ')}${GAP_STAR}${segment()}${GAP_STAR}\\.${GAP_STAR}${segment()}${GAP_STAR}\\.${GAP_STAR}${segment()}`, '', () => MASK),
+  maskJwts,
   count(run('[A-Za-z0-9+/=_-]'), 48),
+  replace(`${NOT_IN_WORD}${literal('arn:aws')}${GAP_STAR}(?:-[a-z]+)*${GAP_STAR}:${GAP_STAR}(?=(${ARN_CLASS}+(?:[\\x01\\x02]+${ARN_CLASS}+)*))\\1`, '', () => MASK),
+  replace(`(?<![0-9])(?<![0-9A-Fa-f]{4}-)(?:[0-9][\\x01\\x02]*){11}[0-9](?![0-9])`, '', () => MASK),
 ];
+
+function maskShapes(text) {
+  return SHAPES.reduce((current, shape) => (typeof shape === 'function' ? shape(current) : current.replace(shape[0], shape[1])), text);
+}
 
 // What an endpoint that echoes a request may quote of one secret: the string
 // itself, percent-encoded (a query string, a form body), JSON-escaped, and with
@@ -346,19 +428,63 @@ function removalForms(secret) {
         return `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
       })
       .join('');
-  const json = JSON.stringify(secret).slice(1, -1);
+  // JSON.stringify writes a control character as \u00xx in lower case, the
+  // platform's encoder in upper case.
+  const json = JSON.stringify(secret)
+    .slice(1, -1)
+    .replace(/\\(u[0-9a-f]{4}|[\s\S])/g, (escape) => (escape[1] === 'u' ? `\\u${escape.slice(2).toUpperCase()}` : escape));
   return [secret, percent(secret, '+'), percent(secret, '%20'), json, secret.split('/').join('\\/'), json.split('/').join('\\/')];
 }
 
+function usableSecrets(secrets) {
+  return (Array.isArray(secrets) ? secrets : []).filter((secret) => typeof secret === 'string' && Buffer.byteLength(secret) >= MIN_SECRET_BYTES);
+}
+
+// A key sent in a Basic credential or a token a gateway echoed is the key's
+// base64, as the whole value or inside a longer one (`user:key`), so the
+// encoding of the key depends on the byte it starts at. The characters that do
+// not depend on the bytes around it are the same at each of the three starts;
+// they are masked with the three characters before them (the rest of their
+// group) and everything after them up to the end of the token.
+const BASE64_FIRST = [0, 2, 3];
+
+function base64Core(secret, offset, urlSafe) {
+  const bytes = Buffer.concat([Buffer.from('x'.repeat(offset)), Buffer.from(secret, 'utf8')]);
+  let encoded = bytes.toString('base64').replace(/=+$/, '');
+  if (urlSafe) encoded = encoded.replace(/\+/g, '-').replace(/\//g, '_');
+  const first = BASE64_FIRST[offset];
+  const last = bytes.length % 3 === 0 ? encoded.length : encoded.length - 1;
+  return last > first ? encoded.slice(first, last) : null;
+}
+
+function base64Cores(secret) {
+  const cores = [];
+  for (let offset = 0; offset <= 2; offset += 1) {
+    for (const urlSafe of [false, true]) {
+      const core = base64Core(secret, offset, urlSafe);
+      if (core !== null && core.length >= MIN_ENCODED_CHARS) cores.push(core);
+    }
+  }
+  return cores;
+}
+
+function removeEncoded(text, usable) {
+  const cores = [...new Set(usable.flatMap(base64Cores))];
+  if (cores.length === 0) return text;
+  return text.replace(new RegExp(`[A-Za-z0-9+/_-]{0,3}(?:${cores.map(literal).join('|')})[A-Za-z0-9+/_-]*={0,2}`, 'g'), MASK);
+}
+
 function removeKnown(text, secrets) {
+  const usable = usableSecrets(secrets);
+  if (usable.length === 0) return text;
   const forms = [];
-  for (const secret of Array.isArray(secrets) ? secrets : []) {
-    if (typeof secret !== 'string' || Buffer.byteLength(secret) < MIN_SECRET_BYTES) continue;
+  for (const secret of usable) {
+    if (secret.trim() === '') continue;
     for (const form of removalForms(secret)) if (!forms.includes(form)) forms.push(form);
   }
-  if (forms.length === 0) return text;
   forms.sort((a, b) => Buffer.byteLength(b) - Buffer.byteLength(a));
-  return text.replace(new RegExp(forms.map(literal).join('|'), 'g'), MASK);
+  const byValue = forms.length === 0 ? text : text.replace(new RegExp(forms.map(literal).join('|'), 'g'), MASK);
+  return removeEncoded(byValue, usable);
 }
 
 function cutBytes(text, max) {
@@ -375,7 +501,7 @@ function cutBytes(text, max) {
 }
 
 function finish(text) {
-  const oneLine = text.split(GAP).join(' ').split(' ').filter(Boolean).join(' ');
+  const oneLine = text.split(GAP).join(' ').split(REMOVED).join('').split(' ').filter(Boolean).join(' ');
   return cutBytes(oneLine, MESSAGE_MAX_BYTES).trim();
 }
 
@@ -389,7 +515,7 @@ function scrub(message, redact, secrets) {
   const own = typeof redact === 'function' ? redact : (text) => text;
   try {
     const known = readBounded(own(message));
-    const text = finish(SHAPES.reduce((current, [regex, replacement]) => current.replace(regex, replacement), removeKnown(gaps(strip(known)), secrets)));
+    const text = finish(maskShapes(removeKnown(gaps(strip(known)), secrets)));
     return own(text);
   } catch {
     return '';
