@@ -561,12 +561,6 @@ d.yml"
     printf 'a note the first run added\n' >> .sre-agent-memory/NOTES.md
     billing_refusal
     ;;
-  provider_billing_daemon)
-    # A process of the agent's account left behind, with every descriptor closed so the run ends.
-    tool_event read
-    setsid sleep 60 </dev/null >/dev/null 2>&1 &
-    billing_refusal
-    ;;
   provider_billing_plantsub)
     # Only a read in the stream, while the tree holds a repository with a filter
     # driver inside the path a submodule of the base keeps: what a proof that
