@@ -2,6 +2,18 @@
 
 Versions follow semantic versioning. The major tag of the current major (`v1`, `v2`, and so on) moves to every release of that major; a breaking change bumps the major, and its entry says what to change in your workflow.
 
+## v2.6.1
+
+The words the runner reports about a failed run are scrubbed the same way everywhere, and the runner reads fewer things as a refusal that are not one.
+
+What an operator gets. The failure's `evidence.agent_errors` (each error event of the run) and `evidence.agent_stderr` (the tail of what the process printed) now go through the scrubber that the provider block and `failure.detail` already went through. Before, they were only stripped of the secrets this runner holds, as stored, so a held key a gateway echoed across a line break, percent-encoded or JSON-escaped, an Amazon resource name and a bare account id could reach the report there. Now each error is scrubbed and cut at 1,000 bytes, and the stderr tail is scrubbed, read from its end and cut at 1,000 bytes; as a result `agent_stderr` is one line, where it used to keep the process's line breaks.
+
+- The scrubber follows the platform's corrected rules, and the fixture that pins both (`tests/fixture/provider_messages.json`, now 134 cases) moved with it. A line break inside a percent escape of a secret's name (`?api%<line break>5Fkey=`) no longer lets the value through. An invalid byte or a U+FFFD leaves a gap, like an invisible character, where it used to be dropped, so it cannot glue a key to the word before it. A run of combining marks that follows an ASCII character, a space or a gap is removed, so a mark inside a key cannot hide it (a decomposed accent on an ASCII letter loses the accent: `cre` plus U+0301 plus `dito` reads `credito`; a precomposed letter, and a mark after a letter of another script, are untouched). A twelve digit number is left alone only when it is the last group of a whole UUID: `abcd-123456789012` and `1234-123456789012` are account ids and are masked.
+- Two classifier rules are tighter. HTTP 403 is `auth` only when its words carry an authentication word (an invalid or missing key, unauthorized, permission, `forbidden` for a key, account, token or credentials) and no content policy or safety word; a 403 with none, a bare `forbidden`, a region that is not supported and a content policy block are not refusals and stay `agent_exit`. HTTP 401 is still `auth` with no words. A missing model on an HTTP 400 needs the model id right before `does not exist` (``The model `gpt-9` does not exist``), and the codes `not_found_error`, `model_not_found`, `unknown model` and `model not found` match as whole tokens, so `Unsupported parameter for this model: 'x' does not exist` and the code `model_not_found_in_tools` are no longer read as a missing model.
+- A secret the runner holds that is shorter than 8 bytes (a placeholder provider key such as `none`) is no longer removed from the lines and messages the runner writes. It used to blank every `none` in them, and the provider key variables are the one place a person is likely to set such a value.
+
+What a customer must change on upgrade: nothing. The report's shape is unchanged; a failed run's `evidence.agent_errors` and `evidence.agent_stderr` carry less, and a 403 that is not about a key is reported as `agent_exit` where v2.6.0 reported `provider_refused`.
+
 ## v2.6.0
 
 The runner tells SRE Agent when your AI provider refused a request, in the provider's own words, and says which model ran.
